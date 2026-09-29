@@ -1,0 +1,24 @@
+name: Minimal CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Compile Python source
+        run: python -m compileall -q src
+      - name: Parse Work Order schema
+        run: python -m json.tool .agents/protocol/work-order.schema.json > /dev/null
+      - name: Validate example Work Order
+        run: PYTHONPATH=src python -m agent_delivery_loop validate examples/work-orders/WO-2026-001.json

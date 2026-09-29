@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "task_id": "WO-2026-001",
+  "revision": 1,
+  "objective": "Example only: document a small, bounded change after this example is copied into an approved Plan PR.",
+  "out_of_scope": [
+    "This example does not authorize execution by itself.",
+    "Do not deploy or change repository settings."
+  ],
+  "acceptance_criteria": [
+    "The change stays within the paths listed below.",
+    "The Delivery PR reports checks and any remaining issues."
+  ],
+  "allowed_paths": [
+    "docs/**"
+  ],
+  "worker_profile": "claude-code-v1",
+  "skill_ref": ".agents/policies/delivery-skill/SKILL.md",
+  "stop_conditions": [
+    "Stop if the approved task differs from the Work Order content at the Plan PR merge commit.",
+    "Stop if the Claude Code restricted permission mode is unavailable."
+  ],
+  "limits": {
+    "max_turns": 20,
+    "timeout_seconds": 1800,
+    "max_budget_usd": 5.0
+  }
+}
