@@ -34,7 +34,7 @@ class WorkerCompletionContractTests(unittest.TestCase):
                 "subtype": "success",
                 "is_error": False,
                 "session_id": "requested-session",
-                "result": json.dumps(report),
+                "structured_output": report,
             }
         )
 
@@ -79,6 +79,30 @@ class WorkerCompletionContractTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.completion_status, "invalid")
         self.assertEqual(raised.exception.incomplete_items, [self.criteria[0]])
+
+    def test_missing_structured_output_fails_closed(self) -> None:
+        envelope = json.loads(
+            self._envelope(
+                {
+                    "status": "complete",
+                    "criteria": [{"criterion": self.criteria[0], "status": "met"}],
+                    "incomplete_items": [],
+                }
+            )
+        )
+        envelope.pop("structured_output")
+
+        with self.assertRaises(WorkerResultError) as raised:
+            _validated_outcome(
+                json.dumps(envelope),
+                returncode=0,
+                requested_session_id="requested-session",
+                acceptance_criteria=self.criteria,
+                config=self.config,
+                private_paths=(),
+            )
+
+        self.assertEqual(raised.exception.completion_status, "invalid")
 
 
 class MergedPullRequestDiscoveryTests(unittest.TestCase):

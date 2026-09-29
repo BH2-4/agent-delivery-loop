@@ -14,7 +14,7 @@
 - JSON Work Order v1、严格解析器及示例；授权文件必须按 `.agents/work-orders/{task_id}-r{revision}.json` 命名。
 - `agent-run`：显式指定已合并到 `main` 的 Plan PR 和其修改的 Work Order；在该 PR merge commit 上读取 Work Order 与 Skill，固定 SHA-256 和代码基线。
 - 独立 Git worktree、新的 Claude Code Session ID、每次运行独立 HOME；safe/restricted 模式屏蔽用户和项目级自定义项、MCP 与任意代码执行工具，只追加授权的 Delivery Skill。禁用 Session transcript 持久化，只记录 Session ID 与脱敏运行元数据。
-- Worker 必须用结构化完成状态逐项报告每个验收条件；只有 CLI 成功、状态为 `complete`、所有条件为 `met` 且没有未完成事项时才允许提交。`blocked`、`incomplete`、格式错误或状态矛盾都会失败关闭，运行记录仅保存脱敏状态和未完成事项，不保存原始会话输出。
+- Worker 通过 Claude CLI 的 `--json-schema` 结构化输出逐项报告每个验收条件；只有 CLI 成功、状态为 `complete`、所有条件为 `met` 且没有未完成事项时才允许提交。`blocked`、`incomplete`、格式错误或状态矛盾都会失败关闭，运行记录仅保存脱敏状态和未完成事项，不保存原始会话输出。
 - 本机任务互斥锁、允许路径检查、`git diff --check`、本地 Delivery 分支与私有运行记录。
 - `agent-watch --once`：单次扫描已合并 Plan PR；不安装定时任务，不运行守护进程。
 - GitHub App 窄权限发布接口；CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并验证示例 Work Order。CI 不会自动检查每张新 Work Order。

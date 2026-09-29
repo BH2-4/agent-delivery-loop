@@ -18,6 +18,31 @@ from .errors import AgentDeliveryError
 from .work_order import WorkOrder
 
 MIN_CLAUDE_VERSION = (2, 1, 259)
+COMPLETION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["status", "criteria", "incomplete_items"],
+    "properties": {
+        "status": {"type": "string", "enum": ["complete", "blocked", "incomplete"]},
+        "criteria": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["criterion", "status"],
+                "properties": {
+                    "criterion": {"type": "string"},
+                    "status": {"type": "string", "enum": ["met", "unresolved"]},
+                },
+            },
+        },
+        "incomplete_items": {
+            "type": "array",
+            "maxItems": 50,
+            "items": {"type": "string", "minLength": 1, "maxLength": 2000},
+        },
+    },
+}
 AUTH_ENV = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
 PASSTHROUGH_ENV = (
     "PATH",
@@ -176,18 +201,12 @@ def _redact_incomplete_item(value: str, *, secrets: tuple[str, ...], private_pat
 
 
 def _completion_report(
-    result_text: object,
+    report: object,
     acceptance_criteria: list[str],
     *,
     secrets: tuple[str, ...],
     private_paths: tuple[str, ...],
 ) -> tuple[str, list[str]]:
-    if not isinstance(result_text, str):
-        raise WorkerResultError("Claude Code returned an invalid completion report.")
-    try:
-        report = json.loads(result_text)
-    except json.JSONDecodeError:
-        raise WorkerResultError("Claude Code returned an invalid completion report.") from None
     if not isinstance(report, dict) or set(report) != {"status", "criteria", "incomplete_items"}:
         raise WorkerResultError("Claude Code returned an invalid completion report.")
     status = report.get("status")
@@ -247,7 +266,7 @@ def _validated_outcome(
     safe_session_id = session_id if isinstance(session_id, str) and session_id == requested_session_id else None
     try:
         status, incomplete_items = _completion_report(
-            envelope.get("result"),
+            envelope.get("structured_output"),
             acceptance_criteria,
             secrets=(config.auth_value,),
             private_paths=private_paths,
@@ -317,6 +336,8 @@ def _run_claude_in_isolated_home(
         _prompt(order),
         "--output-format",
         "json",
+        "--json-schema",
+        json.dumps(COMPLETION_SCHEMA, separators=(",", ":")),
         "--session-id",
         session_id,
         "--model",
