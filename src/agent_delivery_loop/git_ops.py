@@ -75,6 +75,20 @@ def changed_paths(worktree: Path) -> list[str]:
     return sorted(values)
 
 
+def stage_changes(worktree: Path) -> list[str]:
+    git(worktree, "add", "--all", "--", ".")
+    paths = git(worktree, "diff", "--cached", "--name-only", "-z", "HEAD").stdout
+    staged = sorted(item for item in paths.split("\0") if item)
+    if not staged:
+        raise AgentDeliveryError(
+            "No deliverable changes were staged; ignored or otherwise uncommitted files cannot be reported as a delivery."
+        )
+    whitespace = git(worktree, "diff", "--cached", "--check", "HEAD", check=False)
+    if whitespace.returncode != 0:
+        raise AgentDeliveryError("The proposed changes contain whitespace errors; no commit was created.")
+    return staged
+
+
 def ensure_diff_clean(worktree: Path) -> None:
     result = git(worktree, "diff", "--check", "HEAD", check=False)
     if result.returncode != 0:
@@ -82,11 +96,10 @@ def ensure_diff_clean(worktree: Path) -> None:
 
 
 def commit_changes(worktree: Path, task_identity: str) -> str:
-    git(worktree, "add", "--all", "--", ".")
-    whitespace = git(worktree, "diff", "--cached", "--check", check=False)
+    whitespace = git(worktree, "diff", "--cached", "--check", "HEAD", check=False)
     if whitespace.returncode != 0:
         raise AgentDeliveryError("The proposed changes contain whitespace errors; no commit was created.")
-    diff = git(worktree, "diff", "--cached", "--quiet", check=False)
+    diff = git(worktree, "diff", "--cached", "--quiet", "HEAD", check=False)
     if diff.returncode == 0:
         raise AgentDeliveryError("Claude Code produced no file changes; no Delivery PR was created.")
     if diff.returncode != 1:

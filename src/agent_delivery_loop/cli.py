@@ -20,6 +20,8 @@ def _print_result(result: dict[str, object]) -> None:
         "task_id",
         "revision",
         "session_id",
+        "completion_status",
+        "incomplete_items",
         "plan_merge_sha",
         "work_order_sha256",
         "skill_sha256",

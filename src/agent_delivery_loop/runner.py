@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .claude_worker import ClaudeConfig, preflight, run_claude
+from .claude_worker import ClaudeConfig, WorkerResultError, preflight, run_claude
 from .errors import AgentDeliveryError
 from .git_ops import (
     changed_paths,
@@ -20,6 +20,7 @@ from .git_ops import (
     push_branch_with_app_token,
     repository_remote,
     repository_root,
+    stage_changes,
 )
 from .github import GitHubClient, Repo, parse_plan_pr_ref
 from .github_app import GitHubAppConfig, GitHubAppTokenProvider
@@ -27,8 +28,7 @@ from .store import RunStore, authorization_key, default_state_dir, now_utc, task
 from .work_order import WorkOrder, parse_work_order
 
 
-def _safe_changed_paths(worktree: Path, order: WorkOrder) -> list[str]:
-    paths = changed_paths(worktree)
+def _validate_paths(worktree: Path, order: WorkOrder, paths: list[str]) -> list[str]:
     if not paths:
         raise AgentDeliveryError("Claude Code produced no changes; no Delivery branch was committed.")
     for relative in paths:
@@ -44,6 +44,10 @@ def _safe_changed_paths(worktree: Path, order: WorkOrder) -> list[str]:
         if candidate.is_symlink():
             raise AgentDeliveryError(f"Changed path is a symlink; first-version delivery rejects it: {relative}.")
     return paths
+
+
+def _safe_changed_paths(worktree: Path, order: WorkOrder) -> list[str]:
+    return _validate_paths(worktree, order, changed_paths(worktree))
 
 
 def _delivery_body(
@@ -133,10 +137,12 @@ def execute_plan(
         "provider_host": config.provider_host,
         "provider_route_sha256": config.provider_route_sha256,
         "session_id": None,
+        "completion_status": None,
+        "incomplete_items": [],
         "delivery_branch": branch,
         "changed_paths": [],
         "delivery_pr": None,
-        "result_summary": "The validated changed-path list and run status are retained; raw model output and transcript are not.",
+        "result_summary": "No delivery has been validated yet; raw model output and transcript are not retained.",
         "failure": None,
     }
 
@@ -151,15 +157,18 @@ def execute_plan(
                 raise AgentDeliveryError("The authorized Delivery Skill must be a regular file inside the worktree.") from None
             if skill_path.is_symlink() or not skill_path.is_file() or skill_path.read_bytes() != skill_bytes:
                 raise AgentDeliveryError("The isolated worktree Skill does not match the Skill at the Plan merge commit.")
-            session_id = run_claude(worktree, skill_path, order, runtime_home, config)
-            record["session_id"] = session_id
+            outcome = run_claude(worktree, skill_path, order, runtime_home, config)
+            record["session_id"] = outcome.session_id
+            record["completion_status"] = outcome.completion_status
+            record["incomplete_items"] = outcome.incomplete_items
             record["status"] = "validating"
             store.write(task_identity_key, run_id, record)
-            paths = _safe_changed_paths(worktree, order)
+            _safe_changed_paths(worktree, order)
             ensure_diff_clean(worktree)
-            record["changed_paths"] = paths
-            record["result_summary"] = f"Validated {len(paths)} changed path(s); raw model output and transcript were not retained."
+            paths = _validate_paths(worktree, order, stage_changes(worktree))
             commit_sha = commit_changes(worktree, order.identity)
+            record["changed_paths"] = paths
+            record["result_summary"] = f"Validated {len(paths)} committed path(s); raw model output and transcript were not retained."
             record["delivery_commit"] = commit_sha
             record["status"] = "local_ready"
 
@@ -191,6 +200,11 @@ def execute_plan(
         except Exception as exc:
             record["status"] = "failed"
             record["finished_at"] = now_utc()
+            if isinstance(exc, WorkerResultError):
+                record["completion_status"] = exc.completion_status
+                record["incomplete_items"] = exc.incomplete_items
+                if exc.session_id:
+                    record["session_id"] = exc.session_id
             record["failure"] = str(exc) if isinstance(exc, AgentDeliveryError) else "Unexpected worker failure; raw output was suppressed."
             store.write(task_identity_key, run_id, record)
             if isinstance(exc, AgentDeliveryError):

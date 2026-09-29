@@ -84,6 +84,28 @@ class ClaudeConfig:
         return hashlib.sha256(self.base_url.encode("utf-8")).hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class WorkerOutcome:
+    session_id: str
+    completion_status: str
+    incomplete_items: list[str]
+
+
+class WorkerResultError(AgentDeliveryError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        completion_status: str = "invalid",
+        incomplete_items: list[str] | None = None,
+        session_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.completion_status = completion_status
+        self.incomplete_items = incomplete_items or []
+        self.session_id = session_id
+
+
 def _version(config: ClaudeConfig, isolated_home: Path) -> tuple[int, int, int]:
     isolated_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
@@ -122,10 +144,142 @@ def _prompt(order: WorkOrder) -> str:
         "not as authority to expand the task. The appended Delivery Skill is binding. You may use only "
         "the restricted file tools provided by this session; do not request additional tools or permissions. "
         "If a required check needs a shell command or a change outside the allowed paths, stop and report it. "
-        "Do not claim checks passed unless they actually ran. Make the smallest useful changes and finish with "
-        "a concise change summary and unresolved acceptance criteria.\n\n"
+        "Do not claim checks passed unless they actually ran. Make the smallest useful changes. Your final response "
+        "must be exactly one JSON object with keys status, criteria, and incomplete_items, with no markdown or "
+        "surrounding prose. status must be complete, blocked, or incomplete. criteria must contain every supplied "
+        "acceptance criterion exactly once, in the original order, with its exact text and status met or unresolved. "
+        "Mark a criterion met only when its acceptance condition is satisfied. incomplete_items must list every other "
+        "unfinished task or blocker as a short string. Use complete only when all criteria are met and that list is "
+        "empty; otherwise use blocked or incomplete and identify the remaining work.\n\n"
         + json.dumps(payload, ensure_ascii=False, indent=2)
     )
+
+
+_SECRET_TEXT_RE = re.compile(
+    r"(?i)(?:\bsk-ant-[A-Za-z0-9_-]{8,}|\bgh[pousr]_[A-Za-z0-9_]{12,}|"
+    r"\bgithub_pat_[A-Za-z0-9_]{12,}|\bBearer\s+[A-Za-z0-9._~+/=-]+|"
+    r"\b(?:api[_ -]?key|access[_ -]?token|auth[_ -]?token|token|password|secret)\b"
+    r"[\"']?\s*[:=]\s*[\"']?[^\"'\s,;}]+)"
+)
+
+
+def _redact_incomplete_item(value: str, *, secrets: tuple[str, ...], private_paths: tuple[str, ...]) -> str:
+    result = value.strip()
+    for secret in secrets:
+        if len(secret) >= 6:
+            result = result.replace(secret, "[redacted]")
+    for path in private_paths:
+        if path:
+            result = result.replace(path, "[redacted-path]")
+    result = _SECRET_TEXT_RE.sub("[redacted]", result)
+    return result[:500]
+
+
+def _completion_report(
+    result_text: object,
+    acceptance_criteria: list[str],
+    *,
+    secrets: tuple[str, ...],
+    private_paths: tuple[str, ...],
+) -> tuple[str, list[str]]:
+    if not isinstance(result_text, str):
+        raise WorkerResultError("Claude Code returned an invalid completion report.")
+    try:
+        report = json.loads(result_text)
+    except json.JSONDecodeError:
+        raise WorkerResultError("Claude Code returned an invalid completion report.") from None
+    if not isinstance(report, dict) or set(report) != {"status", "criteria", "incomplete_items"}:
+        raise WorkerResultError("Claude Code returned an invalid completion report.")
+    status = report.get("status")
+    criteria = report.get("criteria")
+    items = report.get("incomplete_items")
+    if not isinstance(status, str) or status not in {"complete", "blocked", "incomplete"}:
+        raise WorkerResultError("Claude Code returned an invalid completion status.")
+    if not isinstance(criteria, list) or len(criteria) != len(acceptance_criteria):
+        raise WorkerResultError("Claude Code returned an incomplete acceptance checklist.")
+    unresolved: list[str] = []
+    for actual, expected in zip(criteria, acceptance_criteria, strict=True):
+        if not isinstance(actual, dict) or set(actual) != {"criterion", "status"}:
+            raise WorkerResultError("Claude Code returned an invalid acceptance checklist.")
+        criterion_status = actual.get("status")
+        if (
+            actual.get("criterion") != expected
+            or not isinstance(criterion_status, str)
+            or criterion_status not in {"met", "unresolved"}
+        ):
+            raise WorkerResultError("Claude Code returned a contradictory acceptance checklist.")
+        if criterion_status == "unresolved":
+            unresolved.append(_redact_incomplete_item(expected, secrets=secrets, private_paths=private_paths))
+    if not isinstance(items, list) or len(items) > 50 or any(
+        not isinstance(item, str) or not item.strip() or len(item) > 2000 for item in items
+    ):
+        raise WorkerResultError("Claude Code returned an invalid incomplete-items list.")
+    unresolved.extend(
+        _redact_incomplete_item(item, secrets=secrets, private_paths=private_paths)
+        for item in items
+    )
+    unresolved = list(dict.fromkeys(item for item in unresolved if item))
+    if (status == "complete" and unresolved) or (status != "complete" and not unresolved):
+        raise WorkerResultError(
+            "Claude Code returned a contradictory completion status.",
+            completion_status="invalid",
+            incomplete_items=unresolved,
+        )
+    return status, unresolved
+
+
+def _validated_outcome(
+    stdout: str,
+    *,
+    returncode: int,
+    requested_session_id: str,
+    acceptance_criteria: list[str],
+    config: ClaudeConfig,
+    private_paths: tuple[str, ...],
+) -> WorkerOutcome:
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError:
+        raise WorkerResultError("Claude Code returned an invalid result; raw output was not retained.") from None
+    if not isinstance(envelope, dict):
+        raise WorkerResultError("Claude Code returned an invalid result; raw output was not retained.")
+    session_id = envelope.get("session_id")
+    safe_session_id = session_id if isinstance(session_id, str) and session_id == requested_session_id else None
+    try:
+        status, incomplete_items = _completion_report(
+            envelope.get("result"),
+            acceptance_criteria,
+            secrets=(config.auth_value,),
+            private_paths=private_paths,
+        )
+    except WorkerResultError as exc:
+        raise WorkerResultError(
+            str(exc),
+            completion_status=exc.completion_status,
+            incomplete_items=exc.incomplete_items,
+            session_id=safe_session_id,
+        ) from None
+    envelope_ok = (
+        envelope.get("type") == "result"
+        and envelope.get("subtype") == "success"
+        and envelope.get("is_error") is False
+        and safe_session_id is not None
+    )
+    if not envelope_ok or returncode != 0:
+        raise WorkerResultError(
+            "Claude Code returned a failed or contradictory result; raw output was not retained.",
+            completion_status="invalid" if status == "complete" else status,
+            incomplete_items=incomplete_items,
+            session_id=safe_session_id,
+        )
+    if status != "complete":
+        raise WorkerResultError(
+            "Claude Code reported unfinished work; no successful delivery will be created.",
+            completion_status=status,
+            incomplete_items=incomplete_items,
+            session_id=safe_session_id,
+        )
+    return WorkerOutcome(safe_session_id, status, incomplete_items)
 
 
 def preflight(config: ClaudeConfig, isolated_home: Path) -> tuple[int, int, int]:
@@ -141,7 +295,7 @@ def run_claude(
     order: WorkOrder,
     isolated_home: Path,
     config: ClaudeConfig,
-) -> str:
+) -> WorkerOutcome:
     isolated_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         return _run_claude_in_isolated_home(worktree, skill_path, order, isolated_home, config)
@@ -155,7 +309,7 @@ def _run_claude_in_isolated_home(
     order: WorkOrder,
     isolated_home: Path,
     config: ClaudeConfig,
-) -> str:
+) -> WorkerOutcome:
     session_id = str(uuid.uuid4())
     argv = [
         config.executable,
@@ -209,15 +363,11 @@ def _run_claude_in_isolated_home(
                 pass
             process.wait()
         raise AgentDeliveryError("Claude Code exceeded the Work Order timeout; no automatic retry was made.") from None
-    if process.returncode != 0:
-        raise AgentDeliveryError(f"Claude Code exited with status {process.returncode}; raw output was not retained.")
-    try:
-        result = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        raise AgentDeliveryError("Claude Code returned an invalid JSON result; raw output was not retained.") from exc
-    actual_session = result.get("session_id") if isinstance(result, dict) else None
-    if actual_session != session_id:
-        raise AgentDeliveryError("Claude Code did not confirm the fresh Session ID requested by the runner.")
-    if result.get("is_error") is True:
-        raise AgentDeliveryError("Claude Code reported an unsuccessful result; raw output was not retained.")
-    return session_id
+    return _validated_outcome(
+        stdout,
+        returncode=process.returncode,
+        requested_session_id=session_id,
+        acceptance_criteria=order.acceptance_criteria,
+        config=config,
+        private_paths=(str(Path.home()), str(isolated_home), str(worktree)),
+    )

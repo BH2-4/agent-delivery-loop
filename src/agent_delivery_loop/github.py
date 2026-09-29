@@ -17,6 +17,8 @@ from .errors import AgentDeliveryError
 
 API_ROOT = "https://api.github.com"
 WORK_ORDER_FILE_RE = re.compile(r"^\.agents/work-orders/WO-[A-Z0-9-]+-r[1-9][0-9]*\.json$")
+MERGED_PR_PAGE_SIZE = 100
+MAX_CLOSED_PR_PAGES = 10
 PLAN_URL_RE = re.compile(
     r"^https://github\.com/(?P<owner>[A-Za-z0-9-]+)/(?P<repo>[A-Za-z0-9_.-]+)/pull/(?P<number>[1-9][0-9]*)/?$"
 )
@@ -168,29 +170,46 @@ class GitHubClient:
         )
 
     def merged_plan_candidates(self, limit: int = 30) -> list[tuple[int, str, str]]:
-        pulls = self.request(
-            "GET",
-            f"/repos/{self.repo.slug}/pulls?state=closed&base=main&sort=updated&direction=desc&per_page=50",
-        )
-        if not isinstance(pulls, list):
-            raise AgentDeliveryError("GitHub did not return the recent pull request list.")
         candidates: list[tuple[int, str, str]] = []
         inspected = 0
-        for pull in pulls:
-            if not isinstance(pull, dict) or not pull.get("merged_at"):
-                continue
-            if inspected >= limit:
-                break
-            inspected += 1
-            number = pull.get("number")
-            base = pull.get("base")
-            if not isinstance(number, int) or not isinstance(base, dict) or base.get("ref") != "main":
-                continue
-            for item in self.pull_files(number):
-                path = item.get("filename")
-                if isinstance(path, str) and WORK_ORDER_FILE_RE.fullmatch(path) and item.get("status") in {"added", "modified"}:
-                    candidates.append((number, path, f"https://github.com/{self.repo.slug}/pull/{number}"))
-        return candidates
+        seen: set[int] = set()
+        for page in range(1, MAX_CLOSED_PR_PAGES + 1):
+            pulls = self.request(
+                "GET",
+                f"/repos/{self.repo.slug}/pulls?state=closed&base=main&sort=updated&direction=desc&per_page={MERGED_PR_PAGE_SIZE}&page={page}",
+            )
+            if not isinstance(pulls, list):
+                raise AgentDeliveryError("GitHub did not return the recent pull request list.")
+            for pull in pulls:
+                if not isinstance(pull, dict) or not pull.get("merged_at"):
+                    continue
+                number = pull.get("number")
+                base = pull.get("base")
+                if (
+                    not isinstance(number, int)
+                    or number in seen
+                    or not isinstance(base, dict)
+                    or base.get("ref") != "main"
+                ):
+                    continue
+                seen.add(number)
+                inspected += 1
+                for item in self.pull_files(number):
+                    path = item.get("filename")
+                    if (
+                        isinstance(path, str)
+                        and WORK_ORDER_FILE_RE.fullmatch(path)
+                        and item.get("status") in {"added", "modified"}
+                    ):
+                        candidates.append((number, path, f"https://github.com/{self.repo.slug}/pull/{number}"))
+                if inspected >= limit:
+                    return candidates
+            if len(pulls) < MERGED_PR_PAGE_SIZE:
+                return candidates
+        raise AgentDeliveryError(
+            f"Discovery reached the {MAX_CLOSED_PR_PAGES * MERGED_PR_PAGE_SIZE}-PR safety limit before checking "
+            f"{limit} merged PRs; rerun after reviewing repository activity. No-task status was not assumed."
+        )
 
     def create_pull_request(self, *, head: str, title: str, body: str) -> str:
         result = self.request(

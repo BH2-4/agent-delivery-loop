@@ -5,7 +5,7 @@
 **English summary:** A GitHub-native, human-authorized delivery loop for CLI coding agents.
 
 > [!IMPORTANT]
-> 当前仓库已有第一版 Python 本机 CLI 与最小 CI，但尚未完成真实 Work Order 端到端试运行。GitHub App 发布、仓库保护规则、自动化 Steward 审查和生产无人值守均未验证；**不要把本项目视为生产可用系统**。
+> 当前仓库已有第一版 Python 本机 CLI 与最小 CI，但尚未完成真实 Work Order 端到端试运行。可以先做受人工监督的试运行：检查本地交付分支后，由人手动推送并创建 Delivery PR。Codex CLI 已修复，可人工启动 Steward 审查。GitHub App、`main` 保护和无人值守发布仍未验证；**不要把本项目视为生产可用系统**。
 
 ## 当前实现状态
 
@@ -14,20 +14,21 @@
 - JSON Work Order v1、严格解析器及示例；授权文件必须按 `.agents/work-orders/{task_id}-r{revision}.json` 命名。
 - `agent-run`：显式指定已合并到 `main` 的 Plan PR 和其修改的 Work Order；在该 PR merge commit 上读取 Work Order 与 Skill，固定 SHA-256 和代码基线。
 - 独立 Git worktree、新的 Claude Code Session ID、每次运行独立 HOME；safe/restricted 模式屏蔽用户和项目级自定义项、MCP 与任意代码执行工具，只追加授权的 Delivery Skill。禁用 Session transcript 持久化，只记录 Session ID 与脱敏运行元数据。
+- Worker 必须用结构化完成状态逐项报告每个验收条件；只有 CLI 成功、状态为 `complete`、所有条件为 `met` 且没有未完成事项时才允许提交。`blocked`、`incomplete`、格式错误或状态矛盾都会失败关闭，运行记录仅保存脱敏状态和未完成事项，不保存原始会话输出。
 - 本机任务互斥锁、允许路径检查、`git diff --check`、本地 Delivery 分支与私有运行记录。
 - `agent-watch --once`：单次扫描已合并 Plan PR；不安装定时任务，不运行守护进程。
-- GitHub App 窄权限发布接口、Python 编译与 Work Order 解析 CI。
+- GitHub App 窄权限发布接口；CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并验证示例 Work Order。CI 不会自动检查每张新 Work Order。
 
 **尚未验证**
 
-- 此仓库代码尚未执行一张真实 Plan PR Work Order；Claude 只检查了本机版本和 CLI 参数，没有实际启动任务。
+- 此仓库代码尚未执行一张真实 Plan PR Work Order；Claude 只检查了本机版本和 CLI 参数，没有实际启动任务。允许先由人检查本地交付分支，再手动推送并创建 Delivery PR；这条手动路径也尚未实际试运行。
 - Claude Code CLI 2.1.284 与 Anthropic 官方当前标记的最新 release v2.1.284 一致（本机与官方版本已核对），但模型路由下的任务执行还未验证。
-- GitHub App 尚未配置；只读检查确认 `main` 未启用 branch protection，且仓库没有 ruleset，因此 `--publish` 不可用。默认只创建本地分支。
+- GitHub App 尚未配置；只读检查确认 `main` 未启用 branch protection，且仓库没有 ruleset，因此 `--publish` 不可用。默认只创建本地分支；人工可在检查后自行推送并创建 Delivery PR。
 - App 私钥隔离没有进行操作系统级实测；restricted CLI 工具边界不等同于独立 OS 用户或沙箱。
 - Claude Code 管理员托管策略可能仍适用，当前执行环境的托管策略尚未审计。
 - Work Order 的 `max_budget_usd` 会传入 Claude CLI，但经当前自定义模型端点的实际费用上限语义尚未验证；首次试运行前应按软限制看待。
 - `agent-watch` 只做手动 `--once`；无跨主机抢单、自动重试或定时器。
-- Codex CLI 当前安装缺少可执行二进制；Codex Steward 审查及自动简报尚无接口实现。Delivery PR 的语义审查需要人工启动 Codex 并报告。
+- Codex CLI 安装问题已修复；Codex Steward 审查及自动简报尚无接口实现。Delivery PR 的语义审查需要人工启动 Codex 并报告。
 - Session ID 会记录，但 transcript 不保存；中断后的 Session 恢复流程尚未设计。
 
 **后续阶段**：真实试运行、GitHub App/仓库规则验证、Issue 进度讨论、Hermes 手机通知、Steward 自动审查，以及跨主机或自动恢复都需另行讨论和验证。
@@ -356,7 +357,9 @@ agent-run --plan-pr https://github.com/OWNER/REPO/pull/123 \
   --work-order-path .agents/work-orders/WO-2026-001-r1.json
 ```
 
-默认执行成功后只留下本地分支及 worktree，不推送 GitHub。Work Order 需要的检查若超出只读/编辑工具边界，Worker 应停止；CI 在 Delivery PR 阶段执行机械检查。可用 `agent-watch --once` 手动扫描最近 30 个已合并 PR 并至多执行一个未处理任务；没有后台轮询。
+默认执行成功后只留下本地分支及 worktree，不推送 GitHub。Work Order 需要的检查若超出只读/编辑工具边界，Worker 应停止；CI 在 Delivery PR 阶段执行机械检查，包括源码编译、聚焦回归检查、schema JSON 解析和示例 Work Order 解析。CI 没有扫描每张新 Work Order。可用 `agent-watch --once` 手动扫描最近 30 个已合并 PR 并至多执行一个未处理任务；发现器每页读取 100 个关闭 PR，最多扫描 10 页（1000 个）。如果到达上限仍无法检查满 30 个已合并 PR，命令会报错而不报告“无任务”。
+
+手动试运行时，执行器完成后先检查命令返回的本地分支和 worktree。确认交付内容后，由人使用自己的 Git/GitHub 身份推送该分支并创建 Delivery PR；个人凭据不传给 Claude Code，也不用于 `--publish`。Codex 审查仍需人工启动。
 
 命令结果给出 `worktree_id`；默认 worktree 位于 `~/.agent-delivery-loop/worktrees/<worktree_id>`，运行记录位于 `~/.agent-delivery-loop/runs/`。可用 `git worktree list` 查看所有本机工作目录；不要把运行记录或完整 Session 内容提交到仓库。
 
@@ -394,15 +397,14 @@ GitHub App 的 `Contents:write` 权限也满足合并 PR 接口的权限要求�
 
 仍未验证或需在首次真实试运行后再讨论：
 
-- Work Order 字段在 v1 已定为当前 schema；
 - Plan PR 与任务 Issue 的关系；
 - `agent-watch` 使用 `launchd`、cron 还是其他本地服务；
 - GitHub App 的精确权限、私钥隔离与仓库规则；
-- 单机运行时最基本的防重入方式；跨主机领取回执与精确重试规则留到首次真实运行之后；
+- 跨主机领取回执与精确重试规则留到首次真实运行之后；
 - 首轮执行的超时和停止边界；自动失败重试暂不实现；
 - Session 中断后的恢复策略与 CLI 版本提升流程；
 - Worker 允许使用哪些现有 Skills、Hooks 和 MCP；
-- 代码修改范围如何进行确定性检查；
+- 首次真实运行后是否需要扩展现有路径范围检查；
 - 哪些检查必须通过才能创建 Delivery PR；
 - Steward 的选择和审查输出格式；
 - Hermes 通知采用何种传输方式以及需要发送哪些最小信息；
@@ -419,7 +421,7 @@ GitHub App 的 `Contents:write` 权限也满足合并 PR 接口的权限要求�
 许可证：待确定；源码公开但暂未授权复用
 ```
 
-当前工作的重点是审查本次实现，然后挑选一张小而真实的 Work Order；GitHub App 发布与自动审查需在权限核实后另行启用。
+当前允许在审查本次实现后，挑选一张小而真实的 Work Order 做人工监督试运行，并由人推送本地交付分支、创建 Delivery PR。GitHub App 发布、`main` 保护和无人值守流程仍需另行配置与验证。
 
 ## 路线图
 
@@ -435,7 +437,7 @@ GitHub App 的 `Contents:write` 权限也满足合并 PR 接口的权限要求�
 
 - [x] 实现手动 `agent-run` 和 `agent-watch --once`；
 - [x] 接入受限配置的 Claude Code CLI；
-- [x] 加入 Python 编译与 Work Order 解析 CI；
+- [x] 加入 Python 编译、聚焦回归、schema 解析与示例 Work Order 解析 CI；
 - [ ] 验证 GitHub App/仓库保护后创建 Delivery PR；
 - [ ] 完成首个真实仓库试运行。
 
@@ -449,7 +451,7 @@ GitHub App 的 `Contents:write` 权限也满足合并 PR 接口的权限要求�
 
 ### 阶段 3：异构执行层
 
-- 接入 Codex CLI；
+- 将 Codex CLI 接入 Worker 执行层；
 - 引入受限的低成本 Worker；
 - 增加能力与信任等级；
 - 评估集中网关和多主机执行；
@@ -481,10 +483,10 @@ GitHub App 的 `Contents:write` 权限也满足合并 PR 接口的权限要求�
 
 ## English summary
 
-Agent Delivery Loop is a GitHub-native, human-authorized delivery loop for CLI coding agents.
+Agent Delivery Loop is a GitHub-native, human-authorized delivery loop for CLI coding agents. Its local Python runner and manual discovery command are implemented.
 
 The initial version focuses on one problem: turning an already-approved requirement into a reviewable pull request through a fixed local Claude Code worker.
 
 GitHub is the source of truth. Merging a Plan PR authorizes execution; merging a separate Delivery PR accepts the implementation. Agents cannot approve their own work, merge changes, or deploy automatically.
 
-The project is currently in the design stage and contains no runnable implementation.
+The project has not yet processed a real Work Order. A supervised manual trial can use a locally created delivery branch that a human reviews, pushes, and turns into a Delivery PR. GitHub App publishing, main branch protection, and unattended delivery remain unverified.

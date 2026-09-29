@@ -2,9 +2,9 @@
 
 ## 当前检查点（2026-09-30）
 
-本轮已在仓库中加入第一版 Python `agent-run`、`agent-watch --once`、Work Order v1、Claude Code 受限启动器和最小 CI。当前仅完成源码编译、示例 Work Order 解析和 Claude CLI 参数核对，**尚未启动真实 Work Order**。
+仓库已有第一版 Python `agent-run`、`agent-watch --once`、Work Order v1、Claude Code 受限启动器和最小 CI。CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并解析示例 Work Order；它不验证每张新 Work Order。**尚未启动真实 Work Order**。
 
-当前主机的 Claude Code 为 2.1.284，与 Anthropic 官方当前标记的最新 release v2.1.284 一致；认证状态正常。Codex CLI 仍缺少可执行二进制。仓库是公开仓库，但只读查询显示 `main` 当前没有 branch protection，且未配置 GitHub App。因此 `--publish` 不能使用，默认执行只提交本地 Delivery 分支。不得为本轮修改仓库保护规则或改用个人 Token 冒充 App 身份。
+当前主机的 Claude Code 为 2.1.284，与 Anthropic 官方当前标记的最新 release v2.1.284 一致；认证状态正常。Codex CLI 安装问题已修复，可人工启动 Steward 审查。仓库是公开仓库，但只读查询显示 `main` 当前没有 branch protection，且未配置 GitHub App。因此 `--publish` 不能使用，默认执行只提交本地 Delivery 分支。当前允许先做人工监督试运行：由人检查本地分支后，手动推送并创建 Delivery PR；GitHub App、`main` 保护与无人值守发布仍未验证。不要把个人 GitHub 凭据传给 Claude Code，也不要用个人 Token 冒充 App 身份。
 
 下方首轮提示词保留为本次引导交付的原始任务范围和审查依据，不表示需要再次交给另一个 Agent 重做。
 
@@ -15,7 +15,8 @@
 - 一个 GitHub 仓库、一台受信任的执行主机、一个固定配置的 Claude Code Worker。
 - Codex / Steward 负责需求整理、Plan PR 和 Delivery PR 审查，向用户报告结论。Plan PR 仍由用户合并授权。
 - `agent-watch` 和 `agent-run` 是仓库实现的本机 Python CLI，不是 GitHub 或 Agent 框架的内置功能。
-- GitHub Actions 只执行确定性的仓库检查；Codex 的语义审查是另一道门。
+- `agent-watch --once` 会分页检查最近 30 个已合并 PR，每页 100 个关闭 PR，最多扫描 1000 个；若安全上限前无法确认范围，会报错而不报告无任务。
+- GitHub Actions 只执行确定性的仓库检查：源码编译、聚焦回归用例、schema JSON 解析和一个示例 Work Order 解析；它不扫描每张新 Work Order。Codex 的语义审查是另一道门。
 - Hermes 通知尚未实现。跨主机领取、自动重试、自动部署不进入首轮。
 - Delivery PR 自动合并的身份与分支规则尚未锁定；在验证前不得实现或宣称可用。
 
@@ -25,13 +26,13 @@
 
 本次由 Codex 按照下方提示词在普通开发分支实现最小链路，并通过普通 PR 交付。此时还没有用该执行器执行 Work Order，因此这次**不是**系统自我运行的证明，也不应伪装成已自动授权、领取或审查。
 
-首轮实现已做到：能根据明确的 Plan PR 引用，读取其合并后的 Work Order，固定任务内容与代码基线，在单机启动一次 Claude Code，并将结果整理为本地分支。`agent-watch` 只提供手动 `--once` 入口。GitHub App 凭据隔离和分支规则未验证，因此不会推送；Codex 审查触发也需人工接入，不用个人 Token 或宽权限模式悄悄代替。
+首轮实现已做到：能根据明确的 Plan PR 引用，读取其合并后的 Work Order，固定任务内容与代码基线，在单机启动一次 Claude Code，并将结果整理为本地分支。`agent-watch` 只提供手动 `--once` 入口。GitHub App 凭据隔离和分支规则未验证，因此执行器不会自动推送；人工检查后可以自行推送本地分支并创建 Delivery PR。推送凭据由人使用，不传给 Claude Code。Codex 审查也由人手动启动。
 
 ### 1. 首次真实交付：小而真实的 Work Order
 
-引导交付审查完成、必需 CLI 和 GitHub 权限可用后，再选一项范围小、能构建验证、不会触及生产部署的仓库改动。用户合并其 Plan PR；`agent-watch --once` 找到任务，`agent-run` 启动 Claude Code，GitHub App 创建 Delivery PR；Actions 给出 CI 结果，Codex 独立审查并给用户简报。
+引导交付审查完成后，再选一项范围小、验收明确、不会触及生产部署的仓库改动。用户合并其 Plan PR；`agent-watch --once` 找到任务，或人工显式调用 `agent-run`；执行器启动 Claude Code 并生成本地交付分支。人检查分支后使用自己的 GitHub 身份手动推送并创建 Delivery PR；Actions 给出确定性 CI 结果，Codex 独立审查并给用户简报。GitHub App 和 `main` 保护仍未验证，不用于这条手动试运行路径。
 
-只有确实经过这些步骤，才能称为“首次真实试运行”。如果 Delivery PR 尚未合并，只能称为“候选交付完成”，不能称为代码已进入 `main`；如果没有部署流程，更不能称为 `deployed`。
+只有真实 Work Order 确实经过这些步骤，才能称为“首次真实试运行”；截至当前，这次试运行尚未发生。如果 Delivery PR 尚未合并，只能称为“候选交付完成”，不能称为代码已进入 `main`；如果没有部署流程，更不能称为 `deployed`。
 
 ## 首轮观察记录
 
