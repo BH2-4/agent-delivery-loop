@@ -66,7 +66,10 @@ def agent_run_main(argv: Sequence[str] | None = None) -> int:
 def agent_watch_main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="agent-watch",
-        description="Scan up to 30 recent merged PRs and discover at most one unprocessed Work Order.",
+        description=(
+            "Scan closed PRs by update time (up to 1000) and inspect up to 30 merged PRs; "
+            "this may not cover the 30 most recently merged PRs. Discover at most one unprocessed Work Order."
+        ),
     )
     parser.add_argument("--once", action="store_true", required=True, help="Perform one discovery pass and exit")
     parser.add_argument("--repo-path", type=Path, default=Path.cwd(), help="Local clone of the target repository")

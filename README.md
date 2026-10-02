@@ -199,7 +199,9 @@ v0 只支持一个固定配置的 Claude Code Worker。它负责：
 
 ### `agent-watch`：本地任务观察器
 
-`agent-watch --once` 是已实现的单次“门铃”，目前只检查最近 30 个已合并 PR：
+`agent-watch --once` 是已实现的单次“门铃”。它按 PR 更新时间降序分页读取关闭 PR，最多检查其中先遇到的 30 个已合并 PR，每页最多 100 个、总计最多 1000 个关闭 PR。若达到 1000 个上限仍未检查满 30 个已合并 PR，命令会报错而不报告“无任务”。
+
+这个排序依据是更新时间，不是合并时间；旧 PR 的后续活动可能改变顺序，因此不能保证覆盖按合并时间最新的 30 个 PR。首次真实 Work Order 试运行应显式指定已合并的 Plan PR 调用 `agent-run`；手动执行路径稳定后，再单独验证 `agent-watch --once`。
 
 - 单次查询 GitHub；
 - 找到已经授权但尚未执行的任务；
@@ -357,7 +359,7 @@ agent-run --plan-pr https://github.com/OWNER/REPO/pull/123 \
   --work-order-path .agents/work-orders/WO-2026-001-r1.json
 ```
 
-默认执行成功后只留下本地分支及 worktree，不推送 GitHub。Work Order 需要的检查若超出只读/编辑工具边界，Worker 应停止；CI 在 Delivery PR 阶段执行机械检查，包括源码编译、聚焦回归检查、schema JSON 解析和示例 Work Order 解析。CI 没有扫描每张新 Work Order。可用 `agent-watch --once` 手动扫描最近 30 个已合并 PR 并至多执行一个未处理任务；发现器每页读取 100 个关闭 PR，最多扫描 10 页（1000 个）。如果到达上限仍无法检查满 30 个已合并 PR，命令会报错而不报告“无任务”。
+默认执行成功后只留下本地分支及 worktree，不推送 GitHub。Work Order 需要的检查若超出只读/编辑工具边界，Worker 应停止；CI 在 Delivery PR 阶段执行机械检查，包括源码编译、聚焦回归检查、schema JSON 解析和示例 Work Order 解析。CI 没有扫描每张新 Work Order。首次真实试运行应显式指定已合并的 Plan PR 调用 `agent-run`。后续可用 `agent-watch --once` 手动发现至多一个未处理任务；它按更新时间降序扫描关闭 PR，最多读取 1000 个，并在其中检查先遇到的 30 个已合并 PR。旧 PR 后续活动可能改变排序，因此扫描范围不保证等同于按合并时间最新的 30 个 PR；达到 1000 个上限仍未检查满 30 个已合并 PR 时会报错，不报告“无任务”。
 
 手动试运行时，执行器完成后先检查命令返回的本地分支和 worktree。确认交付内容后，由人使用自己的 Git/GitHub 身份推送该分支并创建 Delivery PR；个人凭据不传给 Claude Code，也不用于 `--publish`。Codex 审查仍需人工启动。
 

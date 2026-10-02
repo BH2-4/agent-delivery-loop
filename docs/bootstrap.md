@@ -15,7 +15,7 @@
 - 一个 GitHub 仓库、一台受信任的执行主机、一个固定配置的 Claude Code Worker。
 - Codex / Steward 负责需求整理、Plan PR 和 Delivery PR 审查，向用户报告结论。Plan PR 仍由用户合并授权。
 - `agent-watch` 和 `agent-run` 是仓库实现的本机 Python CLI，不是 GitHub 或 Agent 框架的内置功能。
-- `agent-watch --once` 会分页检查最近 30 个已合并 PR，每页 100 个关闭 PR，最多扫描 1000 个；若安全上限前无法确认范围，会报错而不报告无任务。
+- `agent-watch --once` 按 PR 更新时间降序分页读取关闭 PR，最多读取 1000 个，并检查其中先遇到的 30 个已合并 PR。旧 PR 后续活动可能改变排序，因此不保证覆盖按合并时间最新的 30 个 PR；达到扫描上限仍未检查满 30 个已合并 PR 时会报错，不报告“无任务”。
 - GitHub Actions 只执行确定性的仓库检查：源码编译、聚焦回归用例、schema JSON 解析和一个示例 Work Order 解析；它不扫描每张新 Work Order。Codex 的语义审查是另一道门。
 - Hermes 通知尚未实现。跨主机领取、自动重试、自动部署不进入首轮。
 - Delivery PR 自动合并的身份与分支规则尚未锁定；在验证前不得实现或宣称可用。
@@ -30,7 +30,7 @@
 
 ### 1. 首次真实交付：小而真实的 Work Order
 
-引导交付审查完成后，再选一项范围小、验收明确、不会触及生产部署的仓库改动。用户合并其 Plan PR；`agent-watch --once` 找到任务，或人工显式调用 `agent-run`；执行器启动 Claude Code 并生成本地交付分支。人检查分支后使用自己的 GitHub 身份手动推送并创建 Delivery PR；Actions 给出确定性 CI 结果，Codex 独立审查并给用户简报。GitHub App 和 `main` 保护仍未验证，不用于这条手动试运行路径。
+引导交付审查完成后，再选一项范围小、验收明确、不会触及生产部署的仓库改动。用户合并其 Plan PR；首次真实试运行由人显式指定这个已合并 Plan PR 调用 `agent-run`，执行器启动 Claude Code 并生成本地交付分支。人检查分支后使用自己的 GitHub 身份手动推送并创建 Delivery PR；Actions 给出确定性 CI 结果，Codex 独立审查并给用户简报。手动路径稳定后，再单独验证 `agent-watch --once` 的发现行为。GitHub App 和 `main` 保护仍未验证，不用于这条手动试运行路径。
 
 只有真实 Work Order 确实经过这些步骤，才能称为“首次真实试运行”；截至当前，这次试运行尚未发生。如果 Delivery PR 尚未合并，只能称为“候选交付完成”，不能称为代码已进入 `main`；如果没有部署流程，更不能称为 `deployed`。
 
