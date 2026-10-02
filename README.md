@@ -15,7 +15,8 @@
 - `agent-run`：显式指定已合并到 `main` 的 Plan PR 和其修改的 Work Order；在该 PR merge commit 上读取 Work Order 与 Skill，固定 SHA-256 和代码基线。
 - 独立 Git worktree、新的 Claude Code Session ID、每次运行独立 HOME；safe/restricted 模式屏蔽用户和项目级自定义项、MCP 与任意代码执行工具，只追加授权的 Delivery Skill。禁用 Session transcript 持久化，只记录 Session ID 与脱敏运行元数据。
 - Worker 通过 Claude CLI 的 `--json-schema` 结构化输出逐项报告每个验收条件；只有 CLI 成功、状态为 `complete`、所有条件为 `met` 且没有未完成事项时才允许提交。`blocked`、`incomplete`、格式错误或状态矛盾都会失败关闭，运行记录仅保存脱敏状态和未完成事项，不保存原始会话输出。
-- 本机任务互斥锁、允许路径检查、`git diff --check`、本地 Delivery 分支与私有运行记录。
+- Ctrl+C、超时及 Worker 启动后的异常会终止并等待整个 Worker 进程组；只有确认进程组停止后才清理临时 HOME、写入结束状态并释放单 Worker 锁。无法确认时保留 HOME、写入 `cleanup_failed` 状态并设置本机故障标记，后续任务会停止，等待人工检查。
+- 本机任务互斥锁、提交前允许路径检查、提交内容和父提交快照、最终提交路径复核、`git diff --check`、本地 Delivery 分支与私有运行记录。执行器使用单次 Git 命令配置屏蔽钩子，不改用户全局配置，也不删除用户钩子。
 - `agent-watch --once`：单次扫描已合并 Plan PR；不安装定时任务，不运行守护进程。
 - GitHub App 窄权限发布接口；CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并验证示例 Work Order。CI 不会自动检查每张新 Work Order。
 
@@ -29,7 +30,7 @@
 - Work Order 的 `max_budget_usd` 会传入 Claude CLI，但经当前自定义模型端点的实际费用上限语义尚未验证；首次试运行前应按软限制看待。
 - `agent-watch` 只做手动 `--once`；无跨主机抢单、自动重试或定时器。
 - Codex CLI 安装问题已修复；Codex Steward 审查及自动简报尚无接口实现。Delivery PR 的语义审查需要人工启动 Codex 并报告。
-- Session ID 会记录，但 transcript 不保存；中断后的 Session 恢复流程尚未设计。
+- 临时 Worker 的 Ctrl+C 进程组停止、运行记录、HOME 清理和锁顺序已由不调用模型的本地回归验证；真实 Claude Code CLI 在当前主机与路由下的停止行为尚未验证。Session ID 会记录，但 transcript 不保存；Session 恢复流程尚未设计。
 
 **后续阶段**：真实试运行、GitHub App/仓库规则验证、Issue 进度讨论、Hermes 手机通知、Steward 自动审查，以及跨主机或自动恢复都需另行讨论和验证。
 
@@ -365,7 +366,7 @@ agent-run --plan-pr https://github.com/OWNER/REPO/pull/123 \
 
 命令结果给出 `worktree_id`；默认 worktree 位于 `~/.agent-delivery-loop/worktrees/<worktree_id>`，运行记录位于 `~/.agent-delivery-loop/runs/`。可用 `git worktree list` 查看所有本机工作目录；不要把运行记录或完整 Session 内容提交到仓库。
 
-同一主机使用全局互斥锁保证任一时刻最多一个 Worker 运行，并用任务修订锁避免同一修订并发；`agent-watch` 会跳过已有运行记录的修订。显式手动重新调用 `agent-run` 是用户主动动作；自动失败重试、跨主机领取协议和恢复规则尚未实现。运行记录放在权限受限的本机状态目录；Claude 临时 HOME 在进程退出后删除，Session transcript 不保留。
+同一主机使用全局互斥锁保证任一时刻最多一个 Worker 运行，并用任务修订锁避免同一修订并发；`agent-watch` 会跳过已有运行记录的修订。Ctrl+C 会使命令非零退出，并在确认 Worker 进程组停止、删除临时 HOME 后写入 `cancelled` 状态及结束时间，再释放锁。若无法确认进程组停止，记录为 `cleanup_failed`，保留临时 HOME，并在状态目录的 `locks/worker.cleanup-failed.json` 创建标记（默认状态目录是 `~/.agent-delivery-loop/`）；后续 `agent-run` 和 watcher 执行会拒绝启动。人工确认相关进程已停止后，才可清除此标记。显式手动重新调用 `agent-run` 是用户主动动作；自动失败重试、跨主机领取协议和恢复规则尚未实现。运行记录放在权限受限的本机状态目录；Session transcript 不保留。
 
 GitHub App 发布入口通过 `--publish` 显式请求，并要求安装可选依赖 `python -m pip install -e '.[github-app]'`、设置 App ID、安装 ID、仓库外且仅所有者可读的私钥路径，以及维护者完成验证后分别设置 `AGENT_APP_KEY_ISOLATION_VERIFIED=1` 和 `AGENT_MAIN_PROTECTION_VERIFIED=1`。本次只读检查发现当前 `main` 未启用保护且未配置 App；私钥隔离也尚未验证，因此 `--publish` 当前会被拒绝。不要用个人 `gh` Token 代替 App，也不要传递任何 App 凭据给 Claude。
 

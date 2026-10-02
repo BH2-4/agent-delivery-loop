@@ -36,6 +36,7 @@ class RunStore:
         self.root = root.expanduser().resolve()
         self.runs = self.root / "runs"
         self.locks = self.root / "locks"
+        self.cleanup_failure = self.locks / "worker.cleanup-failed.json"
         self.runs.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.locks.mkdir(parents=True, exist_ok=True, mode=0o700)
         if os.name == "posix":
@@ -52,6 +53,7 @@ class RunStore:
                 fcntl.flock(host_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise AgentDeliveryError("Another Work Order is already running on this host.") from exc
+            self.assert_worker_available()
             task_descriptor = os.open(self.locks / f"{key}.lock", os.O_CREAT | os.O_RDWR, 0o600)
             try:
                 fcntl.flock(task_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -62,6 +64,25 @@ class RunStore:
             if task_descriptor is not None:
                 os.close(task_descriptor)
             os.close(host_descriptor)
+
+    def assert_worker_available(self) -> None:
+        if self.cleanup_failure.exists():
+            raise AgentDeliveryError(
+                "A prior Worker process group could not be confirmed stopped. Inspect the recorded run and "
+                "worker processes before manually clearing the cleanup failure marker."
+            )
+
+    def mark_worker_cleanup_failed(self, run_id: str) -> None:
+        """Block subsequent local runs after an unconfirmed Worker shutdown."""
+        payload = json.dumps(
+            {"run_id": run_id, "recorded_at": now_utc(), "status": "cleanup_failed"},
+            sort_keys=True,
+        ).encode("utf-8") + b"\n"
+        descriptor = os.open(self.cleanup_failure, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
 
     def record_path(self, key: str, run_id: str) -> Path:
         return self.runs / key / f"{run_id}.json"

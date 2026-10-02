@@ -9,6 +9,7 @@ import re
 import shutil
 import signal
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -128,6 +129,18 @@ class WorkerResultError(AgentDeliveryError):
         super().__init__(message)
         self.completion_status = completion_status
         self.incomplete_items = incomplete_items or []
+        self.session_id = session_id
+
+
+class WorkerCancelled(AgentDeliveryError):
+    def __init__(self, *, session_id: str) -> None:
+        super().__init__("Claude Code was cancelled after its process group stopped.")
+        self.session_id = session_id
+
+
+class WorkerCleanupError(AgentDeliveryError):
+    def __init__(self, *, session_id: str, reason: str) -> None:
+        super().__init__(reason)
         self.session_id = session_id
 
 
@@ -316,10 +329,67 @@ def run_claude(
     config: ClaudeConfig,
 ) -> WorkerOutcome:
     isolated_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    preserve_home = False
     try:
         return _run_claude_in_isolated_home(worktree, skill_path, order, isolated_home, config)
+    except WorkerCleanupError:
+        # Keep the HOME available while an unconfirmed worker may still depend on it.
+        preserve_home = True
+        raise
     finally:
-        shutil.rmtree(isolated_home, ignore_errors=True)
+        if not preserve_home:
+            shutil.rmtree(isolated_home, ignore_errors=True)
+
+
+def _process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_process_group(process_group: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while _process_group_exists(process_group):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def _stop_process_group(process: subprocess.Popen[str], *, grace_seconds: float = 3.0) -> bool:
+    """Terminate the whole isolated group, then reap the leader with bounded waits."""
+    process_group = process.pid
+    try:
+        try:
+            os.killpg(process_group, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=grace_seconds)
+        if not _wait_for_process_group(process_group, grace_seconds):
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if not _wait_for_process_group(process_group, grace_seconds):
+                return False
+        stopped = not _process_group_exists(process_group)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+        return stopped
+    except BaseException:
+        return False
 
 
 def _run_claude_in_isolated_home(
@@ -373,22 +443,43 @@ def _run_claude_in_isolated_home(
         raise AgentDeliveryError("Claude Code could not be started.") from exc
     try:
         stdout, _stderr = process.communicate(timeout=order.timeout_seconds)
+        if _process_group_exists(process.pid):
+            if not _stop_process_group(process):
+                raise WorkerCleanupError(
+                    session_id=session_id,
+                    reason="Claude Code exited while child processes remained, and they could not be confirmed stopped.",
+                )
+            raise AgentDeliveryError(
+                "Claude Code left child processes running; they were stopped and no delivery was created."
+            )
+        return _validated_outcome(
+            stdout,
+            returncode=process.returncode,
+            requested_session_id=session_id,
+            acceptance_criteria=order.acceptance_criteria,
+            config=config,
+            private_paths=(str(Path.home()), str(isolated_home), str(worktree)),
+        )
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=5)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
+        if not _stop_process_group(process):
+            raise WorkerCleanupError(
+                session_id=session_id,
+                reason="Claude Code timed out and its process group could not be confirmed stopped.",
+            ) from None
         raise AgentDeliveryError("Claude Code exceeded the Work Order timeout; no automatic retry was made.") from None
-    return _validated_outcome(
-        stdout,
-        returncode=process.returncode,
-        requested_session_id=session_id,
-        acceptance_criteria=order.acceptance_criteria,
-        config=config,
-        private_paths=(str(Path.home()), str(isolated_home), str(worktree)),
-    )
+    except KeyboardInterrupt:
+        if not _stop_process_group(process):
+            raise WorkerCleanupError(
+                session_id=session_id,
+                reason="Cancellation was requested, but Claude Code's process group could not be confirmed stopped.",
+            ) from None
+        raise WorkerCancelled(session_id=session_id) from None
+    except (WorkerCleanupError, AgentDeliveryError):
+        raise
+    except BaseException:
+        if not _stop_process_group(process):
+            raise WorkerCleanupError(
+                session_id=session_id,
+                reason="Claude Code exited after an error, but its process group could not be confirmed stopped.",
+            ) from None
+        raise

@@ -1,8 +1,8 @@
 # 从设计稿走到第一次真实交付
 
-## 当前检查点（2026-09-30）
+## 当前检查点（2026-10-02）
 
-仓库已有第一版 Python `agent-run`、`agent-watch --once`、Work Order v1、Claude Code 受限启动器和最小 CI。CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并解析示例 Work Order；它不验证每张新 Work Order。**尚未启动真实 Work Order**。
+仓库已有第一版 Python `agent-run`、`agent-watch --once`、Work Order v1、Claude Code 受限启动器和最小 CI。CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并解析示例 Work Order；它不验证每张新 Work Order。当前变更增加了 Worker 进程组取消清理与最终提交快照核对，并以不调用模型的临时 Worker 和临时 Git 仓库做两项聚焦回归验证。它们只证明测试替身及本地 Git 路径，不证明真实 Claude Code CLI 在当前主机和模型路由下的停止行为。**尚未启动真实 Work Order**。
 
 当前主机的 Claude Code 为 2.1.284，与 Anthropic 官方当前标记的最新 release v2.1.284 一致；认证状态正常。Codex CLI 安装问题已修复，可人工启动 Steward 审查。仓库是公开仓库，但只读查询显示 `main` 当前没有 branch protection，且未配置 GitHub App。因此 `--publish` 不能使用，默认执行只提交本地 Delivery 分支。当前允许先做人工监督试运行：由人检查本地分支后，手动推送并创建 Delivery PR；GitHub App、`main` 保护与无人值守发布仍未验证。不要把个人 GitHub 凭据传给 Claude Code，也不要用个人 Token 冒充 App 身份。
 
@@ -16,6 +16,8 @@
 - Codex / Steward 负责需求整理、Plan PR 和 Delivery PR 审查，向用户报告结论。Plan PR 仍由用户合并授权。
 - `agent-watch` 和 `agent-run` 是仓库实现的本机 Python CLI，不是 GitHub 或 Agent 框架的内置功能。
 - `agent-watch --once` 按 PR 更新时间降序分页读取关闭 PR，最多读取 1000 个，并检查其中先遇到的 30 个已合并 PR。旧 PR 后续活动可能改变排序，因此不保证覆盖按合并时间最新的 30 个 PR；达到扫描上限仍未检查满 30 个已合并 PR 时会报错，不报告“无任务”。
+- Ctrl+C、超时或启动后的异常会触发整个 Worker 进程组的有界停止流程；确认进程组消失后才清理临时 HOME、记录结束状态和释放锁。无法确认时保留 HOME 并写入本机清理失败标记，后续执行入口会拒绝新任务，需人工确认进程状态后清除标记。
+- 执行器的 Git 命令使用单次 `core.hooksPath` 配置屏蔽钩子，不改用户全局设置或删除钩子；提交前固定暂存树与父提交，提交后核对提交对象并重新计算交付路径。
 - GitHub Actions 只执行确定性的仓库检查：源码编译、聚焦回归用例、schema JSON 解析和一个示例 Work Order 解析；它不扫描每张新 Work Order。Codex 的语义审查是另一道门。
 - Hermes 通知尚未实现。跨主机领取、自动重试、自动部署不进入首轮。
 - Delivery PR 自动合并的身份与分支规则尚未锁定；在验证前不得实现或宣称可用。

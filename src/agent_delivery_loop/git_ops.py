@@ -7,16 +7,30 @@ import re
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from .errors import AgentDeliveryError
 from .github import Repo
 
 
+@dataclass(frozen=True, slots=True)
+class StagedSnapshot:
+    parent_sha: str
+    tree_sha: str
+    paths: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryCommit:
+    commit_sha: str
+    paths: tuple[str, ...]
+
+
 def git(cwd: Path, *args: str, check: bool = True, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
-            ["git", *args],
+            ["git", "-c", f"core.hooksPath={os.devnull}", *args],
             cwd=cwd,
             env=env,
             text=True,
@@ -75,10 +89,10 @@ def changed_paths(worktree: Path) -> list[str]:
     return sorted(values)
 
 
-def stage_changes(worktree: Path) -> list[str]:
+def stage_changes(worktree: Path) -> StagedSnapshot:
     git(worktree, "add", "--all", "--", ".")
-    paths = git(worktree, "diff", "--cached", "--name-only", "-z", "HEAD").stdout
-    staged = sorted(item for item in paths.split("\0") if item)
+    paths = git(worktree, "diff", "--cached", "--no-renames", "--name-only", "-z", "HEAD").stdout
+    staged = tuple(sorted(item for item in paths.split("\0") if item))
     if not staged:
         raise AgentDeliveryError(
             "No deliverable changes were staged; ignored or otherwise uncommitted files cannot be reported as a delivery."
@@ -86,7 +100,9 @@ def stage_changes(worktree: Path) -> list[str]:
     whitespace = git(worktree, "diff", "--cached", "--check", "HEAD", check=False)
     if whitespace.returncode != 0:
         raise AgentDeliveryError("The proposed changes contain whitespace errors; no commit was created.")
-    return staged
+    parent_sha = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    tree_sha = git(worktree, "write-tree").stdout.strip()
+    return StagedSnapshot(parent_sha=parent_sha, tree_sha=tree_sha, paths=staged)
 
 
 def ensure_diff_clean(worktree: Path) -> None:
@@ -95,7 +111,11 @@ def ensure_diff_clean(worktree: Path) -> None:
         raise AgentDeliveryError("The proposed changes contain whitespace errors; no commit was created.")
 
 
-def commit_changes(worktree: Path, task_identity: str) -> str:
+def commit_changes(worktree: Path, task_identity: str, staged: StagedSnapshot) -> DeliveryCommit:
+    parent_sha = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    tree_sha = git(worktree, "write-tree").stdout.strip()
+    if parent_sha != staged.parent_sha or tree_sha != staged.tree_sha:
+        raise AgentDeliveryError("The staged parent or content changed after scope validation; no commit was created.")
     whitespace = git(worktree, "diff", "--cached", "--check", "HEAD", check=False)
     if whitespace.returncode != 0:
         raise AgentDeliveryError("The proposed changes contain whitespace errors; no commit was created.")
@@ -114,7 +134,28 @@ def commit_changes(worktree: Path, task_identity: str) -> str:
         "-m",
         f"Delivery {task_identity}",
     )
-    return git(worktree, "rev-parse", "HEAD").stdout.strip()
+    commit_sha = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    committed_parent = git(worktree, "rev-parse", f"{commit_sha}^").stdout.strip()
+    committed_tree = git(worktree, "rev-parse", f"{commit_sha}^{{tree}}").stdout.strip()
+    if committed_parent != staged.parent_sha or committed_tree != staged.tree_sha:
+        raise AgentDeliveryError(
+            "The created commit does not match the validated parent and content; it was preserved but will not be published."
+        )
+    committed_paths = git(
+        worktree,
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "--no-renames",
+        "-r",
+        "-z",
+        staged.parent_sha,
+        commit_sha,
+    ).stdout
+    paths = tuple(sorted(item for item in committed_paths.split("\0") if item))
+    if not paths:
+        raise AgentDeliveryError("The created commit contains no deliverable paths; it will not be published.")
+    return DeliveryCommit(commit_sha=commit_sha, paths=paths)
 
 
 def push_branch_with_app_token(worktree: Path, repo: Repo, branch: str, token: str) -> None:

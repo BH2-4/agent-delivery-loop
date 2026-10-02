@@ -8,7 +8,14 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .claude_worker import ClaudeConfig, WorkerResultError, preflight, run_claude
+from .claude_worker import (
+    ClaudeConfig,
+    WorkerCancelled,
+    WorkerCleanupError,
+    WorkerResultError,
+    preflight,
+    run_claude,
+)
 from .errors import AgentDeliveryError
 from .git_ops import (
     changed_paths,
@@ -71,6 +78,23 @@ def _delivery_body(
         f"## Changed paths\n\n{files}\n\n"
         "CI and an independent Steward review are pending. This runner does not approve or merge PRs."
     )
+
+
+def _record_cancelled_run(
+    store: RunStore,
+    task_identity_key: str,
+    run_id: str,
+    record: dict[str, Any],
+    *,
+    session_id: str | None,
+    reason: str,
+) -> None:
+    record["status"] = "cancelled"
+    record["finished_at"] = now_utc()
+    record["completion_status"] = "cancelled"
+    record["session_id"] = session_id
+    record["failure"] = reason
+    store.write(task_identity_key, run_id, record)
 
 
 def execute_plan(
@@ -165,8 +189,11 @@ def execute_plan(
             store.write(task_identity_key, run_id, record)
             _safe_changed_paths(worktree, order)
             ensure_diff_clean(worktree)
-            paths = _validate_paths(worktree, order, stage_changes(worktree))
-            commit_sha = commit_changes(worktree, order.identity)
+            staged = stage_changes(worktree)
+            _validate_paths(worktree, order, staged.paths)
+            committed = commit_changes(worktree, order.identity, staged)
+            commit_sha = committed.commit_sha
+            paths = _validate_paths(worktree, order, committed.paths)
             record["changed_paths"] = paths
             record["result_summary"] = f"Validated {len(paths)} committed path(s); raw model output and transcript were not retained."
             record["delivery_commit"] = commit_sha
@@ -197,6 +224,37 @@ def execute_plan(
                 "worktree_id": run_id,
                 "delivery_commit": commit_sha,
             }
+        except WorkerCancelled as exc:
+            _record_cancelled_run(
+                store,
+                task_identity_key,
+                run_id,
+                record,
+                session_id=exc.session_id,
+                reason="Cancellation completed after the Worker process group stopped.",
+            )
+            raise AgentDeliveryError(f"Work Order was cancelled after Worker cleanup. Run ID: {run_id}.") from None
+        except WorkerCleanupError as exc:
+            record["status"] = "cleanup_failed"
+            record["finished_at"] = now_utc()
+            record["completion_status"] = "cleanup_failed"
+            record["session_id"] = exc.session_id
+            record["failure"] = str(exc)
+            store.mark_worker_cleanup_failed(run_id)
+            store.write(task_identity_key, run_id, record)
+            raise AgentDeliveryError(
+                f"Worker cleanup failed; future runs are blocked pending manual inspection. Run ID: {run_id}."
+            ) from None
+        except KeyboardInterrupt:
+            _record_cancelled_run(
+                store,
+                task_identity_key,
+                run_id,
+                record,
+                session_id=None,
+                reason="Run cancelled after the Worker had stopped.",
+            )
+            raise AgentDeliveryError(f"Work Order was cancelled. Run ID: {run_id}.") from None
         except Exception as exc:
             record["status"] = "failed"
             record["finished_at"] = now_utc()
@@ -216,6 +274,7 @@ def watch_once(*, repo_path: Path, publish: bool = False) -> dict[str, Any] | No
     root = repository_root(repo_path.expanduser().resolve())
     repo = repository_remote(root)
     store = RunStore(default_state_dir())
+    store.assert_worker_available()
     client = GitHubClient(repo)
     for number, path, url in client.merged_plan_candidates():
         authorization = client.authorized_plan(number, path, url)
