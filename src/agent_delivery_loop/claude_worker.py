@@ -117,6 +117,14 @@ class WorkerOutcome:
     incomplete_items: list[str]
 
 
+@dataclass(slots=True)
+class WorkerLifecycle:
+    """Explicit process lifecycle shared with the runner for truthful cancellation records."""
+
+    status: str = "not_started"
+    session_id: str | None = None
+
+
 class WorkerResultError(AgentDeliveryError):
     def __init__(
         self,
@@ -136,6 +144,11 @@ class WorkerCancelled(AgentDeliveryError):
     def __init__(self, *, session_id: str) -> None:
         super().__init__("Claude Code was cancelled after its process group stopped.")
         self.session_id = session_id
+
+
+class WorkerStartCancelled(AgentDeliveryError):
+    def __init__(self) -> None:
+        super().__init__("Cancellation was requested before a Claude Worker process was started.")
 
 
 class WorkerCleanupError(AgentDeliveryError):
@@ -327,15 +340,34 @@ def run_claude(
     order: WorkOrder,
     isolated_home: Path,
     config: ClaudeConfig,
+    lifecycle: WorkerLifecycle | None = None,
 ) -> WorkerOutcome:
+    lifecycle = lifecycle or WorkerLifecycle()
     isolated_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     preserve_home = False
     try:
-        return _run_claude_in_isolated_home(worktree, skill_path, order, isolated_home, config)
+        return _run_claude_in_isolated_home(worktree, skill_path, order, isolated_home, config, lifecycle)
+    except WorkerStartCancelled:
+        lifecycle.status = "not_started"
+        lifecycle.session_id = None
+        raise
+    except WorkerCancelled:
+        raise
     except WorkerCleanupError:
         # Keep the HOME available while an unconfirmed worker may still depend on it.
         preserve_home = True
         raise
+    except KeyboardInterrupt:
+        if lifecycle.status == "not_started":
+            raise WorkerStartCancelled() from None
+        if lifecycle.status == "stopped":
+            raise WorkerCancelled(session_id=lifecycle.session_id or "unknown") from None
+        lifecycle.status = "stop_unconfirmed"
+        preserve_home = True
+        raise WorkerCleanupError(
+            session_id=lifecycle.session_id or "unknown",
+            reason="Cancellation escaped the Worker lifecycle while process shutdown was unconfirmed; HOME was retained.",
+        ) from None
     finally:
         if not preserve_home:
             shutil.rmtree(isolated_home, ignore_errors=True)
@@ -392,12 +424,34 @@ def _stop_process_group(process: subprocess.Popen[str], *, grace_seconds: float 
         return False
 
 
+def _raise_cancelled_worker(
+    process: subprocess.Popen[str] | None,
+    lifecycle: WorkerLifecycle,
+    session_id: str,
+) -> None:
+    if process is None:
+        lifecycle.status = "not_started"
+        lifecycle.session_id = None
+        raise WorkerStartCancelled() from None
+    lifecycle.status = "running"
+    lifecycle.session_id = session_id
+    if not _stop_process_group(process):
+        lifecycle.status = "stop_unconfirmed"
+        raise WorkerCleanupError(
+            session_id=session_id,
+            reason="Cancellation was requested, but Claude Code's process group could not be confirmed stopped.",
+        ) from None
+    lifecycle.status = "stopped"
+    raise WorkerCancelled(session_id=session_id) from None
+
+
 def _run_claude_in_isolated_home(
     worktree: Path,
     skill_path: Path,
     order: WorkOrder,
     isolated_home: Path,
     config: ClaudeConfig,
+    lifecycle: WorkerLifecycle,
 ) -> WorkerOutcome:
     session_id = str(uuid.uuid4())
     argv = [
@@ -428,30 +482,59 @@ def _run_claude_in_isolated_home(
         "--append-system-prompt-file",
         str(skill_path),
     ]
+    process: subprocess.Popen[str] | None = None
+    cancel_requested = False
+
+    def defer_sigint(_signum: int, _frame: object) -> None:
+        nonlocal cancel_requested
+        cancel_requested = True
+
     try:
-        process = subprocess.Popen(
-            argv,
-            cwd=worktree,
-            env=config.child_environment(isolated_home),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        raise AgentDeliveryError("Claude Code could not be started.") from exc
-    try:
+        # Defer Ctrl+C only across Popen and process registration. Unlike blocking
+        # SIGINT, this does not pass a blocked signal mask to the new Worker process.
+        launch_error: OSError | None = None
+        previous_handler = signal.getsignal(signal.SIGINT)
+        handler_installed = False
+        try:
+            previous_handler = signal.signal(signal.SIGINT, defer_sigint)
+            handler_installed = True
+            if cancel_requested:
+                _raise_cancelled_worker(None, lifecycle, session_id)
+            try:
+                process = subprocess.Popen(
+                    argv,
+                    cwd=worktree,
+                    env=config.child_environment(isolated_home),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    start_new_session=True,
+                )
+                lifecycle.status = "running"
+                lifecycle.session_id = session_id
+            except OSError as exc:
+                launch_error = exc
+        finally:
+            if handler_installed:
+                signal.signal(signal.SIGINT, previous_handler)
+        if cancel_requested:
+            _raise_cancelled_worker(process, lifecycle, session_id)
+        if process is None:
+            raise AgentDeliveryError("Claude Code could not be started.") from launch_error
         stdout, _stderr = process.communicate(timeout=order.timeout_seconds)
         if _process_group_exists(process.pid):
             if not _stop_process_group(process):
+                lifecycle.status = "stop_unconfirmed"
                 raise WorkerCleanupError(
                     session_id=session_id,
                     reason="Claude Code exited while child processes remained, and they could not be confirmed stopped.",
                 )
+            lifecycle.status = "stopped"
             raise AgentDeliveryError(
                 "Claude Code left child processes running; they were stopped and no delivery was created."
             )
+        lifecycle.status = "stopped"
         return _validated_outcome(
             stdout,
             returncode=process.returncode,
@@ -461,25 +544,28 @@ def _run_claude_in_isolated_home(
             private_paths=(str(Path.home()), str(isolated_home), str(worktree)),
         )
     except subprocess.TimeoutExpired:
+        if process is None:
+            raise AgentDeliveryError("Claude Code could not be started.") from None
         if not _stop_process_group(process):
+            lifecycle.status = "stop_unconfirmed"
             raise WorkerCleanupError(
                 session_id=session_id,
                 reason="Claude Code timed out and its process group could not be confirmed stopped.",
             ) from None
+        lifecycle.status = "stopped"
         raise AgentDeliveryError("Claude Code exceeded the Work Order timeout; no automatic retry was made.") from None
     except KeyboardInterrupt:
-        if not _stop_process_group(process):
-            raise WorkerCleanupError(
-                session_id=session_id,
-                reason="Cancellation was requested, but Claude Code's process group could not be confirmed stopped.",
-            ) from None
-        raise WorkerCancelled(session_id=session_id) from None
+        _raise_cancelled_worker(process, lifecycle, session_id)
     except (WorkerCleanupError, AgentDeliveryError):
         raise
     except BaseException:
+        if process is None:
+            raise
         if not _stop_process_group(process):
+            lifecycle.status = "stop_unconfirmed"
             raise WorkerCleanupError(
                 session_id=session_id,
                 reason="Claude Code exited after an error, but its process group could not be confirmed stopped.",
             ) from None
+        lifecycle.status = "stopped"
         raise

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import time
 import fcntl
@@ -17,8 +18,10 @@ from urllib.parse import parse_qs, urlsplit
 from agent_delivery_loop.claude_worker import (
     ClaudeConfig,
     WorkerCancelled,
+    WorkerLifecycle,
     WorkerResultError,
     _process_group_exists,
+    _stop_process_group,
     _validated_outcome,
     run_claude,
 )
@@ -251,6 +254,121 @@ class DeliveredPathTests(unittest.TestCase):
 
 
 class WorkerCancellationTests(unittest.TestCase):
+    def test_cancel_during_spawn_registration_stops_worker_before_home_record_and_lock_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            skill = worktree / "skill.md"
+            skill.write_text("test skill\n", encoding="utf-8")
+            ready = worktree / "worker-pids"
+            executable = root / "temporary-worker"
+            executable.write_text(
+                f"#!{sys.executable}\n"
+                "import os, subprocess, sys, time\n"
+                "from pathlib import Path\n"
+                "skill = Path(sys.argv[sys.argv.index('--append-system-prompt-file') + 1])\n"
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                "skill.with_name('worker-pids').write_text(f'{os.getpid()} {child.pid} {os.getpgrp()}')\n"
+                "time.sleep(60)\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            isolated_home = root / "private-home"
+            store = RunStore(root / "state")
+            run_id = "run-start-cancel-test"
+            identity = task_key("owner/repo", "WO-2026-001", 1)
+            record: dict[str, object] = {
+                "run_id": run_id,
+                "status": "starting",
+                "finished_at": None,
+                "session_id": None,
+            }
+            order_path = Path(__file__).parents[1] / "examples/work-orders/WO-2026-001.json"
+            order = parse_work_order(order_path.read_bytes())
+            config = ClaudeConfig(
+                executable=str(executable),
+                model="fixed-model",
+                base_url="https://api.example.invalid",
+                provider_host="api.example.invalid",
+                auth_name="ANTHROPIC_AUTH_TOKEN",
+                auth_value="test-secret-token-value",
+            )
+            lifecycle = WorkerLifecycle()
+            original_popen = subprocess.Popen
+            original_write = store.write
+            verified_record_order: list[str] = []
+
+            def spawn_and_queue_interrupt(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+                process = original_popen(*args, **kwargs)  # type: ignore[arg-type]
+                deadline = time.monotonic() + 10
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                if not ready.exists():
+                    _stop_process_group(process)
+                    self.fail("temporary Worker did not reach the process-registration boundary")
+                # run_claude must defer SIGINT here until Popen returns and the
+                # process handle/lifecycle have been registered.
+                os.kill(os.getpid(), signal.SIGINT)
+                return process
+
+            def check_record_write(key: str, current_run_id: str, value: dict[str, object]) -> None:
+                if value.get("status") == "cancelled":
+                    self.assertFalse(isolated_home.exists(), "HOME must be removed only after Worker shutdown")
+                    descriptor = os.open(store.locks / "worker.lock", os.O_CREAT | os.O_RDWR, 0o600)
+                    try:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    finally:
+                        os.close(descriptor)
+                    verified_record_order.append("record_while_locked")
+                original_write(key, current_run_id, value)
+
+            error: AgentDeliveryError | None = None
+            with (
+                patch.object(subprocess, "Popen", new=spawn_and_queue_interrupt),
+                patch.object(store, "write", new=check_record_write),
+            ):
+                try:
+                    with store.claim(identity):
+                        store.write(identity, run_id, record)
+                        try:
+                            run_claude(
+                                worktree,
+                                skill,
+                                order,
+                                isolated_home,
+                                config,
+                                lifecycle=lifecycle,
+                            )
+                        except WorkerCancelled as cancelled:
+                            _record_cancelled_run(
+                                store,
+                                identity,
+                                run_id,
+                                record,
+                                session_id=cancelled.session_id,
+                                reason="Cancellation completed after the Worker process group stopped.",
+                            )
+                            raise AgentDeliveryError(f"Work Order was cancelled. Run ID: {run_id}.") from None
+                except AgentDeliveryError as exc:
+                    error = exc
+
+            self.assertIsNotNone(error)
+            self.assertIn(run_id, str(error))
+            self.assertEqual(lifecycle.status, "stopped")
+            self.assertTrue(lifecycle.session_id)
+            self.assertEqual(verified_record_order, ["record_while_locked"])
+            self.assertFalse(isolated_home.exists())
+            _, _, process_group = map(int, ready.read_text(encoding="utf-8").split())
+            self.assertFalse(_process_group_exists(process_group))
+            stored = json.loads(store.record_path(identity, run_id).read_text(encoding="utf-8"))
+            self.assertEqual(stored["status"], "cancelled")
+            self.assertIsNotNone(stored["finished_at"])
+            self.assertTrue(stored["session_id"])
+            with store.claim(identity):
+                pass
+
     def test_cancel_stops_group_before_home_record_and_lock_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

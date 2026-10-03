@@ -12,7 +12,9 @@ from .claude_worker import (
     ClaudeConfig,
     WorkerCancelled,
     WorkerCleanupError,
+    WorkerLifecycle,
     WorkerResultError,
+    WorkerStartCancelled,
     preflight,
     run_claude,
 )
@@ -97,6 +99,40 @@ def _record_cancelled_run(
     store.write(task_identity_key, run_id, record)
 
 
+def _record_not_started_run(
+    store: RunStore,
+    task_identity_key: str,
+    run_id: str,
+    record: dict[str, Any],
+    *,
+    reason: str,
+) -> None:
+    record["status"] = "not_started"
+    record["finished_at"] = now_utc()
+    record["completion_status"] = "not_started"
+    record["session_id"] = None
+    record["failure"] = reason
+    store.write(task_identity_key, run_id, record)
+
+
+def _record_cleanup_failed_run(
+    store: RunStore,
+    task_identity_key: str,
+    run_id: str,
+    record: dict[str, Any],
+    *,
+    session_id: str | None,
+    reason: str,
+) -> None:
+    record["status"] = "cleanup_failed"
+    record["finished_at"] = now_utc()
+    record["completion_status"] = "cleanup_failed"
+    record["session_id"] = session_id
+    record["failure"] = reason
+    store.mark_worker_cleanup_failed(run_id)
+    store.write(task_identity_key, run_id, record)
+
+
 def execute_plan(
     *,
     repo_path: Path,
@@ -169,6 +205,7 @@ def execute_plan(
         "result_summary": "No delivery has been validated yet; raw model output and transcript are not retained.",
         "failure": None,
     }
+    worker_lifecycle = WorkerLifecycle()
 
     with store.claim(task_identity_key):
         store.write(task_identity_key, run_id, record)
@@ -181,7 +218,14 @@ def execute_plan(
                 raise AgentDeliveryError("The authorized Delivery Skill must be a regular file inside the worktree.") from None
             if skill_path.is_symlink() or not skill_path.is_file() or skill_path.read_bytes() != skill_bytes:
                 raise AgentDeliveryError("The isolated worktree Skill does not match the Skill at the Plan merge commit.")
-            outcome = run_claude(worktree, skill_path, order, runtime_home, config)
+            outcome = run_claude(
+                worktree,
+                skill_path,
+                order,
+                runtime_home,
+                config,
+                lifecycle=worker_lifecycle,
+            )
             record["session_id"] = outcome.session_id
             record["completion_status"] = outcome.completion_status
             record["incomplete_items"] = outcome.incomplete_items
@@ -224,7 +268,18 @@ def execute_plan(
                 "worktree_id": run_id,
                 "delivery_commit": commit_sha,
             }
+        except WorkerStartCancelled as exc:
+            _record_not_started_run(
+                store,
+                task_identity_key,
+                run_id,
+                record,
+                reason=str(exc),
+            )
+            raise AgentDeliveryError(f"Work Order was cancelled before the Worker started. Run ID: {run_id}.") from None
         except WorkerCancelled as exc:
+            worker_lifecycle.status = "stopped"
+            worker_lifecycle.session_id = exc.session_id
             _record_cancelled_run(
                 store,
                 task_identity_key,
@@ -235,26 +290,50 @@ def execute_plan(
             )
             raise AgentDeliveryError(f"Work Order was cancelled after Worker cleanup. Run ID: {run_id}.") from None
         except WorkerCleanupError as exc:
-            record["status"] = "cleanup_failed"
-            record["finished_at"] = now_utc()
-            record["completion_status"] = "cleanup_failed"
-            record["session_id"] = exc.session_id
-            record["failure"] = str(exc)
-            store.mark_worker_cleanup_failed(run_id)
-            store.write(task_identity_key, run_id, record)
-            raise AgentDeliveryError(
-                f"Worker cleanup failed; future runs are blocked pending manual inspection. Run ID: {run_id}."
-            ) from None
-        except KeyboardInterrupt:
-            _record_cancelled_run(
+            worker_lifecycle.status = "stop_unconfirmed"
+            worker_lifecycle.session_id = exc.session_id
+            _record_cleanup_failed_run(
                 store,
                 task_identity_key,
                 run_id,
                 record,
-                session_id=None,
-                reason="Run cancelled after the Worker had stopped.",
+                session_id=exc.session_id,
+                reason=str(exc),
             )
-            raise AgentDeliveryError(f"Work Order was cancelled. Run ID: {run_id}.") from None
+            raise AgentDeliveryError(
+                f"Worker cleanup failed; future runs are blocked pending manual inspection. Run ID: {run_id}."
+            ) from None
+        except KeyboardInterrupt:
+            if worker_lifecycle.status == "not_started":
+                _record_not_started_run(
+                    store,
+                    task_identity_key,
+                    run_id,
+                    record,
+                    reason="Cancellation occurred before the Worker started.",
+                )
+                raise AgentDeliveryError(f"Work Order was cancelled before the Worker started. Run ID: {run_id}.") from None
+            if worker_lifecycle.status == "stopped":
+                _record_cancelled_run(
+                    store,
+                    task_identity_key,
+                    run_id,
+                    record,
+                    session_id=worker_lifecycle.session_id,
+                    reason="Run cancelled after the Worker process group was confirmed stopped.",
+                )
+                raise AgentDeliveryError(f"Work Order was cancelled after Worker cleanup. Run ID: {run_id}.") from None
+            _record_cleanup_failed_run(
+                store,
+                task_identity_key,
+                run_id,
+                record,
+                session_id=worker_lifecycle.session_id,
+                reason="Worker stop was not confirmed after cancellation; manual inspection is required.",
+            )
+            raise AgentDeliveryError(
+                f"Worker stop was not confirmed; future runs are blocked pending manual inspection. Run ID: {run_id}."
+            ) from None
         except Exception as exc:
             record["status"] = "failed"
             record["finished_at"] = now_utc()

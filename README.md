@@ -15,7 +15,7 @@
 - `agent-run`：显式指定已合并到 `main` 的 Plan PR 和其修改的 Work Order；在该 PR merge commit 上读取 Work Order 与 Skill，固定 SHA-256 和代码基线。
 - 独立 Git worktree、新的 Claude Code Session ID、每次运行独立 HOME；safe/restricted 模式屏蔽用户和项目级自定义项、MCP 与任意代码执行工具，只追加授权的 Delivery Skill。禁用 Session transcript 持久化，只记录 Session ID 与脱敏运行元数据。
 - Worker 通过 Claude CLI 的 `--json-schema` 结构化输出逐项报告每个验收条件；只有 CLI 成功、状态为 `complete`、所有条件为 `met` 且没有未完成事项时才允许提交。`blocked`、`incomplete`、格式错误或状态矛盾都会失败关闭，运行记录仅保存脱敏状态和未完成事项，不保存原始会话输出。
-- Ctrl+C、超时及 Worker 启动后的异常会终止并等待整个 Worker 进程组；只有确认进程组停止后才清理临时 HOME、写入结束状态并释放单 Worker 锁。无法确认时保留 HOME、写入 `cleanup_failed` 状态并设置本机故障标记，后续任务会停止，等待人工检查。
+- Ctrl+C、超时及 Worker 启动后的异常会终止并等待整个 Worker 进程组。启动时会短暂延迟处理 Ctrl+C，直到 `Popen` 返回的进程句柄和生命周期状态登记完成，再立即处理取消请求；不会把屏蔽 SIGINT 的信号状态传给新 Worker。只有确认进程组停止后才清理临时 HOME、写入结束状态并释放单 Worker 锁。记录明确区分 Worker 未启动、停止后的取消和停止未确认；最后一种会保留 HOME、写入 `cleanup_failed` 状态并设置本机故障标记，后续任务会停止，等待人工检查。
 - 本机任务互斥锁、提交前允许路径检查、提交内容和父提交快照、最终提交路径复核、`git diff --check`、本地 Delivery 分支与私有运行记录。执行器使用单次 Git 命令配置屏蔽钩子，不改用户全局配置，也不删除用户钩子。
 - `agent-watch --once`：单次扫描已合并 Plan PR；不安装定时任务，不运行守护进程。
 - GitHub App 窄权限发布接口；CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并验证示例 Work Order。CI 不会自动检查每张新 Work Order。
@@ -30,7 +30,7 @@
 - Work Order 的 `max_budget_usd` 会传入 Claude CLI，但经当前自定义模型端点的实际费用上限语义尚未验证；首次试运行前应按软限制看待。
 - `agent-watch` 只做手动 `--once`；无跨主机抢单、自动重试或定时器。
 - Codex CLI 安装问题已修复；Codex Steward 审查及自动简报尚无接口实现。Delivery PR 的语义审查需要人工启动 Codex 并报告。
-- 临时 Worker 的 Ctrl+C 进程组停止、运行记录、HOME 清理和锁顺序已由不调用模型的本地回归验证；真实 Claude Code CLI 在当前主机与路由下的停止行为尚未验证。Session ID 会记录，但 transcript 不保存；Session 恢复流程尚未设计。
+- 临时 Worker 在进程创建/登记边界收到 Ctrl+C 后的进程组停止、运行记录、HOME 清理和锁顺序已由不调用模型的本地回归验证；真实 Claude Code CLI 在当前主机与路由下的启动和停止行为尚未验证。Session ID 会记录，但 transcript 不保存；Session 恢复流程尚未设计。
 
 **后续阶段**：真实试运行、GitHub App/仓库规则验证、Issue 进度讨论、Hermes 手机通知、Steward 自动审查，以及跨主机或自动恢复都需另行讨论和验证。
 
