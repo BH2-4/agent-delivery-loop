@@ -68,7 +68,15 @@ class ExplicitClaudeConfigurationTests(unittest.TestCase):
             settings_path = base / "claude-settings.json"
             selected_secret = "fake-selected-credential"
             settings_path.write_text(
-                json.dumps({"env": {"ANTHROPIC_API_KEY": selected_secret, "UNRELATED": "not-forwarded"}}),
+                json.dumps(
+                    {
+                        "env": {
+                            "ANTHROPIC_API_KEY": selected_secret,
+                            "ANTHROPIC_BASE_URL": "HTTPS://OPEN.BIGMODEL.CN:443/api/anthropic/",
+                            "UNRELATED": "not-forwarded",
+                        }
+                    }
+                ),
                 encoding="utf-8",
             )
             parent_environment = {
@@ -95,7 +103,9 @@ class ExplicitClaudeConfigurationTests(unittest.TestCase):
                 )
                 os.environ["HTTPS_PROXY"] = "https://proxy.invalid/changed"
                 os.environ["ANTHROPIC_AUTH_TOKEN"] = "ambient-new-token"
+                os.environ["ANTHROPIC_BASE_URL"] = "https://another.invalid/api"
                 child_environment = config.child_environment(base / "worker-home")
+                self.assertNotEqual(child_environment["ANTHROPIC_BASE_URL"], os.environ["ANTHROPIC_BASE_URL"])
 
             self.assertEqual(config.model, "glm-5.3")
             self.assertEqual(config.base_url, "https://open.bigmodel.cn/api/anthropic")
@@ -163,6 +173,37 @@ class ExplicitClaudeConfigurationTests(unittest.TestCase):
                         repo_root=repo,
                     )
             self.assertNotIn(str(settings_path), str(raised.exception))
+
+    def test_settings_endpoint_must_exist_and_match_host_port_and_api_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repo = base / "repository"
+            repo.mkdir()
+            settings_path = base / "settings.json"
+            mismatched_endpoints = (
+                None,
+                "not a URL",
+                "https://other.example/api/anthropic",
+                "https://open.bigmodel.cn:8443/api/anthropic",
+                "https://open.bigmodel.cn/api/other",
+            )
+            with patch("agent_delivery_loop.claude_worker.shutil.which", return_value="/fake/claude"):
+                for source_url in mismatched_endpoints:
+                    with self.subTest(source_url=source_url):
+                        auth_env = {"ANTHROPIC_API_KEY": "fake-endpoint-bound-credential"}
+                        if source_url is not None:
+                            auth_env["ANTHROPIC_BASE_URL"] = source_url
+                        settings_path.write_text(json.dumps({"env": auth_env}), encoding="utf-8")
+                        with self.assertRaisesRegex(AgentDeliveryError, "do not match the explicit endpoint") as raised:
+                            ClaudeConfig.from_explicit(
+                                model="glm-5.3",
+                                base_url="https://open.bigmodel.cn/api/anthropic",
+                                effort="max",
+                                auth_config=settings_path,
+                                repo_root=repo,
+                            )
+                        self.assertNotIn(str(settings_path), str(raised.exception))
+                        self.assertNotIn("fake-endpoint-bound-credential", str(raised.exception))
 
     def test_effort_capability_check_requires_plain_help_to_advertise_level_without_auth(self) -> None:
         config = ClaudeConfig(

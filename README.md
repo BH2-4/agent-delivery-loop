@@ -13,7 +13,7 @@
 
 - JSON Work Order v1、严格解析器及示例；授权文件必须按 `.agents/work-orders/{task_id}-r{revision}.json` 命名。
 - `agent-run`：显式指定已合并到 `main` 的 Plan PR 和其修改的 Work Order；在该 PR merge commit 上读取 Work Order 与 Skill，固定 SHA-256 和代码基线。
-- `agent-run` 和 `agent-watch --once` 都要求显式提供 `--model`、`--base-url`、`--effort` 与 `--auth-config`。认证仅从所指定 Claude settings JSON 的 `env` 中读取 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY`、`CLAUDE_CODE_OAUTH_TOKEN` 之一；必须恰好出现一个受支持的认证项，且其值是非空字符串。即使其他候选项的值为空，也视为冲突。settings 文件必须是目标仓库外的普通文件，读取后只把所选认证值放入 Worker 环境，不复制配置文件或其余 `env` 字段。
+- `agent-run` 和 `agent-watch --once` 都要求显式提供 `--model`、`--base-url`、`--effort` 与 `--auth-config`。认证仅从所指定 Claude settings JSON 的 `env` 中读取 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY`、`CLAUDE_CODE_OAUTH_TOKEN` 之一；必须恰好出现一个受支持的认证项，且其值是非空字符串。即使其他候选项的值为空，也视为冲突。settings 的 `env.ANTHROPIC_BASE_URL` 也必须存在、有效，并与显式 `--base-url` 指向同一端点。若 CC Switch 当前供应商与本次目标不同，应停止并由用户另行明确认证来源；执行器不会自动切换设置或创建 Worker 专用认证文件。settings 文件必须是目标仓库外的普通文件，读取后只把所选认证值放入 Worker 环境，不复制配置文件或其余 `env` 字段。
 - Claude 配置使用不可变快照；父环境中的旧模型、路由、认证和 effort 设置不会覆盖显式选项。Worker 启动前以不带认证值的普通 `--help` 检查当前 CLI 是否列出所选 `--effort` 级别，不支持时停止。
 - 独立 Git worktree、新的 Claude Code Session ID、每次运行独立 HOME；safe/restricted 模式屏蔽用户和项目级自定义项、MCP 与任意代码执行工具，只追加授权的 Delivery Skill。禁用 Session transcript 持久化，只记录 Session ID 与脱敏运行元数据。
 - Worker 通过 Claude CLI 的 `--json-schema` 结构化输出逐项报告每个验收条件；只有 CLI 成功、状态为 `complete`、所有条件为 `met` 且没有未完成事项时才允许提交。`blocked`、`incomplete`、格式错误或状态矛盾都会失败关闭，运行记录仅保存脱敏状态和未完成事项，不保存原始会话输出。
@@ -353,7 +353,7 @@ CCSwitch 可以继续作为个人 Claude Code 环境中的模型与能力实验�
 
 ## 本机手动操作
 
-需要 Python 3.11+、Git、Claude Code CLI 2.1.259+。模型、端点、effort 和 settings 文件由每条命令的显式参数决定；CC Switch 配置保持原样。settings JSON 必须位于目标仓库之外，程序只选择其中 `env` 下恰好一个受支持的 Claude 认证项，不读取父 shell 的认证变量，也不会把认证文件复制到 Worker HOME。CLI 只检查账号配置格式，不证明账号有效或端点可用。Work Order 必须来自目标仓库中已合并的 Plan PR，示例文件本身不构成授权。
+需要 Python 3.11+、Git、Claude Code CLI 2.1.259+。模型、端点、effort 和 settings 文件由每条命令的显式参数决定；CC Switch 配置保持原样。settings JSON 必须位于目标仓库之外，`env` 中所选认证项必须是唯一受支持的认证项且其值为非空字符串；同一对象里的 `ANTHROPIC_BASE_URL` 必须有效并与显式 `--base-url` 一致。若当前 CC Switch 供应商与目标不一致，应停止并由用户另行明确来源；不要自动改配置，也不要创建 Worker 专用认证文件。程序不读取父 shell 的认证变量，也不会把认证文件复制到 Worker HOME。CLI 只检查账号配置格式，不证明账号有效或端点可用。Work Order 必须来自目标仓库中已合并的 Plan PR，示例文件本身不构成授权。
 
 ```sh
 python3 -m venv .venv

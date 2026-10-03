@@ -25,6 +25,7 @@ from .work_order import WorkOrder
 MIN_CLAUDE_VERSION = (2, 1, 259)
 MAX_CLAUDE_SETTINGS_BYTES = 1024 * 1024
 SUPPORTED_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+EndpointIdentity = tuple[str, str, int, str]
 COMPLETION_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -96,30 +97,11 @@ class ClaudeConfig:
         model = model.strip()
         if not model or len(model) > 160 or _has_control_characters(model):
             raise AgentDeliveryError("The requested Claude model is invalid.")
-        if not isinstance(base_url, str) or _has_control_characters(base_url):
-            raise AgentDeliveryError("The requested Claude base URL is invalid.")
-        base_url = base_url.strip()
         try:
-            parsed = urlsplit(base_url)
-            hostname = parsed.hostname
-            _ = parsed.port
-        except ValueError:
+            endpoint = _endpoint_identity(base_url)
+        except (TypeError, ValueError):
             raise AgentDeliveryError("The requested Claude base URL is invalid.") from None
-        if (
-            parsed.scheme not in {"https", "http"}
-            or not hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-            or "?" in base_url
-            or "#" in base_url
-            or any(character.isspace() for character in base_url)
-            or (parsed.scheme == "http" and hostname.casefold() not in {"localhost", "127.0.0.1", "::1"})
-        ):
-            raise AgentDeliveryError(
-                "The Claude base URL must be a credential-free HTTPS URL or a loopback HTTP URL."
-            )
+        base_url = base_url.strip()
         if effort not in SUPPORTED_EFFORTS:
             raise AgentDeliveryError("The requested Claude effort level is not supported by this runner.")
 
@@ -130,12 +112,16 @@ class ClaudeConfig:
         if not executable:
             raise AgentDeliveryError("Claude Code CLI is not available on PATH.")
         target_repo_root = repo_root.resolve(strict=True)
-        auth_value, auth_name = _read_claude_auth(auth_config, target_repo_root)
+        auth_value, auth_name = _read_claude_auth(
+            auth_config,
+            target_repo_root,
+            expected_endpoint=endpoint,
+        )
         return cls(
             executable=executable,
             model=model,
             base_url=base_url,
-            provider_host=hostname,
+            provider_host=endpoint[1],
             auth_name=auth_name,
             auth_value=auth_value,
             effort=effort,
@@ -162,6 +148,41 @@ def _has_control_characters(value: str) -> bool:
     return any(unicodedata.category(character) == "Cc" for character in value)
 
 
+def _endpoint_identity(value: object) -> EndpointIdentity:
+    if not isinstance(value, str) or _has_control_characters(value):
+        raise ValueError("invalid endpoint")
+    value = value.strip()
+    if not value or any(character.isspace() for character in value):
+        raise ValueError("invalid endpoint")
+    try:
+        parsed = urlsplit(value)
+        scheme = parsed.scheme.casefold()
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise ValueError("invalid endpoint") from None
+    if (
+        scheme not in {"https", "http"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or "?" in value
+        or "#" in value
+        or parsed.netloc.endswith(":")
+        or (scheme == "http" and hostname.casefold() not in {"localhost", "127.0.0.1", "::1"})
+    ):
+        raise ValueError("invalid endpoint")
+    default_port = 443 if scheme == "https" else 80
+    return (
+        scheme,
+        hostname.casefold(),
+        port if port is not None else default_port,
+        parsed.path.rstrip("/") or "/",
+    )
+
+
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -171,7 +192,12 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
-def _read_claude_auth(auth_config: Path, repo_root: Path) -> tuple[str, str]:
+def _read_claude_auth(
+    auth_config: Path,
+    repo_root: Path,
+    *,
+    expected_endpoint: EndpointIdentity,
+) -> tuple[str, str]:
     try:
         requested_path = Path(auth_config).expanduser().absolute()
         if stat.S_ISLNK(requested_path.lstat().st_mode):
@@ -225,9 +251,12 @@ def _read_claude_auth(auth_config: Path, repo_root: Path) -> tuple[str, str]:
             or _has_control_characters(auth_value)
         ):
             raise ValueError
+        source_endpoint = _endpoint_identity(auth_env.get("ANTHROPIC_BASE_URL"))
+        if source_endpoint != expected_endpoint:
+            raise ValueError
         return auth_value, auth_name
     except (OSError, UnicodeError, ValueError, TypeError, RecursionError, json.JSONDecodeError):
-        raise AgentDeliveryError("Claude settings are invalid or do not contain exactly one usable credential.") from None
+        raise AgentDeliveryError("Claude settings are invalid or do not match the explicit endpoint.") from None
 
 
 @dataclass(frozen=True, slots=True)

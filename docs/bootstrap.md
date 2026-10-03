@@ -16,7 +16,7 @@
 - Codex / Steward 负责需求整理、Plan PR 和 Delivery PR 审查，向用户报告结论。Plan PR 仍由用户合并授权。
 - `agent-watch` 和 `agent-run` 是仓库实现的本机 Python CLI，不是 GitHub 或 Agent 框架的内置功能。
 - `agent-watch --once` 按 PR 更新时间降序分页读取关闭 PR，最多读取 1000 个，并检查其中先遇到的 30 个已合并 PR。旧 PR 后续活动可能改变排序，因此不保证覆盖按合并时间最新的 30 个 PR；达到扫描上限仍未检查满 30 个已合并 PR 时会报错，不报告“无任务”。
-- `agent-run` 与 `agent-watch --once` 都要求显式提供 `--model`、`--base-url`、`--effort`、`--auth-config`。认证只从所指定 Claude settings JSON 的 `env` 对象读取一个受支持且非空的认证项；配置文件必须在目标仓库之外，且不会被复制到 Worker HOME。CC Switch 配置保持原样，父环境中的模型、路由、effort 和认证变量不会进入 Worker。
+- `agent-run` 与 `agent-watch --once` 都要求显式提供 `--model`、`--base-url`、`--effort`、`--auth-config`。认证只从所指定 Claude settings JSON 的 `env` 对象读取一个受支持且非空的认证项；同一对象中的 `ANTHROPIC_BASE_URL` 还必须有效并与显式端点一致。若当前 CC Switch 供应商与本次目标不同，应停止并由用户另行明确来源；不自动切换设置，也不创建 Worker 专用认证文件。配置文件必须在目标仓库之外，且不会被复制到 Worker HOME。CC Switch 配置保持原样，父环境中的模型、路由、effort 和认证变量不会进入 Worker。
 - CLI 在创建 Worker 前通过不带认证值的 `--version` 和普通 `--help` 检查版本及所请求 effort；如果当前 CLI 没有在帮助中列出该 effort，则停止，不尝试模型请求或降级。
 - 创建 Worker 前必须成功持久化并回读验证未确认安全结束的运行记录。Ctrl+C、超时和异常会尝试有界停止进程组；进入创建阶段后，即使 `Popen` 未返回句柄，也不能据此判定 Worker 未启动。无法确认时保留 HOME 与门禁，后续更新失败、再次取消或执行器退出释放锁不会授权下一次启动。只有明确未启动或已确认停止才允许清理 HOME、保存安全状态。启动登记及停止/HOME 清理关键区延迟 SIGINT，不向 Worker 传递阻塞信号掩码，取消后不继续正常交付。
 - 执行器的 Git 命令使用单次 `core.hooksPath` 配置屏蔽钩子，不改用户全局设置或删除钩子；提交前固定暂存树与父提交，提交后核对提交对象并重新计算交付路径。
