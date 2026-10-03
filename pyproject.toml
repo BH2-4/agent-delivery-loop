@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-delivery-loop"
+version = "0.1.0"
+description = "A local, GitHub-authorized delivery loop for CLI coding agents"
+requires-python = ">=3.11"
+
+[project.optional-dependencies]
+github-app = ["PyJWT[crypto]>=2.10,<3"]
+
+[project.scripts]
+agent-run = "agent_delivery_loop.cli:agent_run_main"
+agent-watch = "agent_delivery_loop.cli:agent_watch_main"
+agent-delivery = "agent_delivery_loop.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
