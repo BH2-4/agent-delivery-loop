@@ -164,6 +164,7 @@ def _endpoint_identity(value: object) -> EndpointIdentity:
     if (
         scheme not in {"https", "http"}
         or not hostname
+        or not hostname.isascii()
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
@@ -171,15 +172,17 @@ def _endpoint_identity(value: object) -> EndpointIdentity:
         or "?" in value
         or "#" in value
         or parsed.netloc.endswith(":")
-        or (scheme == "http" and hostname.casefold() not in {"localhost", "127.0.0.1", "::1"})
+        or parsed.path.endswith("//")
+        or (scheme == "http" and hostname.lower() not in {"localhost", "127.0.0.1", "::1"})
     ):
         raise ValueError("invalid endpoint")
     default_port = 443 if scheme == "https" else 80
+    path = parsed.path[:-1] if parsed.path.endswith("/") else parsed.path
     return (
         scheme,
-        hostname.casefold(),
+        hostname.lower(),
         port if port is not None else default_port,
-        parsed.path.rstrip("/") or "/",
+        path or "/",
     )
 
 

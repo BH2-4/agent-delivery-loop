@@ -186,6 +186,8 @@ class ExplicitClaudeConfigurationTests(unittest.TestCase):
                 "https://other.example/api/anthropic",
                 "https://open.bigmodel.cn:8443/api/anthropic",
                 "https://open.bigmodel.cn/api/other",
+                "https://open.bigmodel.cn/api/anthropic////",
+                "https://faß.de/api/anthropic",
             )
             with patch("agent_delivery_loop.claude_worker.shutil.which", return_value="/fake/claude"):
                 for source_url in mismatched_endpoints:
@@ -203,6 +205,33 @@ class ExplicitClaudeConfigurationTests(unittest.TestCase):
                                 repo_root=repo,
                             )
                         self.assertNotIn(str(settings_path), str(raised.exception))
+                        self.assertNotIn("fake-endpoint-bound-credential", str(raised.exception))
+
+                settings_path.write_text(
+                    json.dumps(
+                        {
+                            "env": {
+                                "ANTHROPIC_API_KEY": "fake-endpoint-bound-credential",
+                                "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic/",
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                for explicit_url in (
+                    "https://faß.de/api/anthropic",
+                    "https://open.bigmodel.cn/api/anthropic////",
+                ):
+                    with self.subTest(explicit_url=explicit_url):
+                        with self.assertRaisesRegex(AgentDeliveryError, "requested Claude base URL is invalid") as raised:
+                            ClaudeConfig.from_explicit(
+                                model="glm-5.3",
+                                base_url=explicit_url,
+                                effort="max",
+                                auth_config=settings_path,
+                                repo_root=repo,
+                            )
+                        self.assertNotIn(explicit_url, str(raised.exception))
                         self.assertNotIn("fake-endpoint-bound-credential", str(raised.exception))
 
     def test_effort_capability_check_requires_plain_help_to_advertise_level_without_auth(self) -> None:
