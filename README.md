@@ -13,6 +13,8 @@
 
 - JSON Work Order v1、严格解析器及示例；授权文件必须按 `.agents/work-orders/{task_id}-r{revision}.json` 命名。
 - `agent-run`：显式指定已合并到 `main` 的 Plan PR 和其修改的 Work Order；在该 PR merge commit 上读取 Work Order 与 Skill，固定 SHA-256 和代码基线。
+- `agent-run` 和 `agent-watch --once` 都要求显式提供 `--model`、`--base-url`、`--effort` 与 `--auth-config`。认证仅从所指定 Claude settings JSON 的 `env` 中读取 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY`、`CLAUDE_CODE_OAUTH_TOKEN` 之一；必须恰好出现一个受支持的认证项，且其值是非空字符串。即使其他候选项的值为空，也视为冲突。settings 的 `env.ANTHROPIC_BASE_URL` 也必须存在、有效，并与显式 `--base-url` 指向同一端点。若 CC Switch 当前供应商与本次目标不同，应停止并由用户另行明确认证来源；执行器不会自动切换设置或创建 Worker 专用认证文件。settings 文件必须是目标仓库外的普通文件，读取后只把所选认证值放入 Worker 环境，不复制配置文件或其余 `env` 字段。
+- Claude 配置使用不可变快照；父环境中的旧模型、路由、认证和 effort 设置不会覆盖显式选项。Worker 启动前以不带认证值的普通 `--help` 检查当前 CLI 是否列出所选 `--effort` 级别，不支持时停止。
 - 独立 Git worktree、新的 Claude Code Session ID、每次运行独立 HOME；safe/restricted 模式屏蔽用户和项目级自定义项、MCP 与任意代码执行工具，只追加授权的 Delivery Skill。禁用 Session transcript 持久化，只记录 Session ID 与脱敏运行元数据。
 - Worker 通过 Claude CLI 的 `--json-schema` 结构化输出逐项报告每个验收条件；只有 CLI 成功、状态为 `complete`、所有条件为 `met` 且没有未完成事项时才允许提交。`blocked`、`incomplete`、格式错误或状态矛盾都会失败关闭，运行记录仅保存脱敏状态和未完成事项，不保存原始会话输出。
 - Worker 创建前，先在现有运行记录中持久化并回读验证 `worker_status: start_unconfirmed`，作为“尚未确认安全结束”的门禁；领取任务时检查全部运行记录。Ctrl+C、超时和异常会尝试有界停止 Worker 进程组，但不保证每次都能确认停止。进入创建阶段后，未取得进程句柄也按停止未确认处理，保留 HOME 和门禁；后续状态写入失败或再次取消，启动前记录仍会阻止新任务。只有明确未启动或已确认停止，才可清理 HOME 并写入安全状态。启动登记和停止/HOME 清理关键区短暂延迟 Ctrl+C，取消不会被吞掉后继续交付。记录不可读、格式损坏或缺少安全字段时失败关闭；不自动恢复或清除阻断。
@@ -22,8 +24,8 @@
 
 **尚未验证**
 
-- 此仓库代码尚未执行一张真实 Plan PR Work Order；Claude 只检查了本机版本和 CLI 参数，没有实际启动任务。允许先由人检查本地交付分支，再手动推送并创建 Delivery PR；这条手动路径也尚未实际试运行。
-- Claude Code CLI 2.1.284 与 Anthropic 官方当前标记的最新 release v2.1.284 一致（本机与官方版本已核对），但模型路由下的任务执行还未验证。
+- 此仓库代码尚未执行一张真实 Plan PR Work Order；Claude CLI 与当前 GLM 路由均没有通过本仓库启动真实 Session。允许先由人检查本地交付分支，再手动推送并创建 Delivery PR；这条手动路径也尚未实际试运行。
+- 当前记录的本机 Claude Code CLI 版本为 2.1.288。账号认证有效性、GLM-5.3 路由及 Worker 启动均未验证；没有发起真实模型请求。
 - GitHub App 尚未配置；只读检查确认 `main` 未启用 branch protection，且仓库没有 ruleset，因此 `--publish` 不可用。默认只创建本地分支；人工可在检查后自行推送并创建 Delivery PR。
 - App 私钥隔离没有进行操作系统级实测；restricted CLI 工具边界不等同于独立 OS 用户或沙箱。
 - Claude Code 管理员托管策略可能仍适用，当前执行环境的托管策略尚未审计。
@@ -67,7 +69,9 @@ Agent Delivery Loop 的第一阶段只解决一个明确目标：
    无论未来由何种入口触发，都只能请求执行一个已经授权的确定任务引用。当前手动命令形式为：
 
    ```text
-   agent-run --plan-pr <merged-plan-pr> --work-order-path <authorized-work-order.json>
+   agent-run --plan-pr <merged-plan-pr> --work-order-path <authorized-work-order.json> \
+     --model glm-5.3 --base-url https://open.bigmodel.cn/api/anthropic --effort max \
+     --auth-config /path/outside/repository/claude-settings.json
    ```
 
    `agent-run` 已有实现；执行前会再次核实 PR 已合入 `main`，而不是信任用户传入的 PR 状态。
@@ -349,28 +353,57 @@ CCSwitch 可以继续作为个人 Claude Code 环境中的模型与能力实验�
 
 ## 本机手动操作
 
-需要 Python 3.11+、Git、Claude Code CLI 2.1.259+。设置 `ANTHROPIC_MODEL`，并且只设置以下认证方式之一：`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY` 或 `CLAUDE_CODE_OAUTH_TOKEN`；可用 `ANTHROPIC_BASE_URL` 固定兼容端点。启动时会把本次模型与端点配置复制到子进程环境，执行期间不切换路由。Work Order 必须来自目标仓库中已合并的 Plan PR，示例文件本身不构成授权。
+需要 Python 3.11+、Git、Claude Code CLI 2.1.259+。模型、端点、effort 和 settings 文件由每条命令的显式参数决定；CC Switch 配置保持原样。settings JSON 必须位于目标仓库之外，`env` 中所选认证项必须是唯一受支持的认证项且其值为非空字符串；同一对象里的 `ANTHROPIC_BASE_URL` 必须有效并与显式 `--base-url` 一致。若当前 CC Switch 供应商与目标不一致，应停止并由用户另行明确来源；不要自动改配置，也不要创建 Worker 专用认证文件。程序不读取父 shell 的认证变量，也不会把认证文件复制到 Worker HOME。CLI 只检查账号配置格式，不证明账号有效或端点可用。Work Order 必须来自目标仓库中已合并的 Plan PR，示例文件本身不构成授权。
 
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -e .
+```
+
+当前源码应在审查并合并后，从准确的完整合并 SHA 构建普通 wheel；不要用 editable install。以干净 checkout 为例：
+
+```sh
+(
+  set -e
+  build_root="$(mktemp -d)"
+  build_dir="$build_root/source"
+  wheel_dir="$build_root/wheel"
+  mkdir "$wheel_dir"
+  git worktree add --detach "$build_dir" <reviewed-full-merge-sha>
+  cd "$build_dir"
+  git rev-parse HEAD
+  python -m pip wheel --no-deps --wheel-dir "$wheel_dir" .
+  wheel_path="$wheel_dir/agent_delivery_loop-0.1.0-py3-none-any.whl"
+  shasum -a 256 "$wheel_path"
+  python -m pip install --force-reinstall --no-deps "$wheel_path"
+)
+```
+
+将 `git rev-parse HEAD` 的完整值记录为安装源码 SHA，将 `shasum` 输出记录为 wheel SHA-256。当前已安装的普通 wheel 不随源码目录更新；本轮不替换它。首次真实试运行须使用审查并合并后的构建。
+
+```sh
 agent-delivery validate examples/work-orders/WO-2026-001.json
 agent-run --plan-pr https://github.com/OWNER/REPO/pull/123 \
-  --work-order-path .agents/work-orders/WO-2026-001-r1.json
+  --work-order-path .agents/work-orders/WO-2026-001-r1.json \
+  --model glm-5.3 \
+  --base-url https://open.bigmodel.cn/api/anthropic \
+  --effort max \
+  --auth-config /path/outside/repository/claude-settings.json
 ```
 
 默认执行成功后只留下本地分支及 worktree，不推送 GitHub。Work Order 需要的检查若超出只读/编辑工具边界，Worker 应停止；CI 在 Delivery PR 阶段执行机械检查，包括源码编译、聚焦回归检查、schema JSON 解析和示例 Work Order 解析。CI 没有扫描每张新 Work Order。首次真实试运行应显式指定已合并的 Plan PR 调用 `agent-run`。后续可用 `agent-watch --once` 手动发现至多一个未处理任务；它按更新时间降序扫描关闭 PR，最多读取 1000 个，并在其中检查先遇到的 30 个已合并 PR。旧 PR 后续活动可能改变排序，因此扫描范围不保证等同于按合并时间最新的 30 个 PR；达到 1000 个上限仍未检查满 30 个已合并 PR 时会报错，不报告“无任务”。
 
-手动试运行时，执行器完成后先检查命令返回的本地分支和 worktree。确认交付内容后，由人使用自己的 Git/GitHub 身份推送该分支并创建 Delivery PR；个人凭据不传给 Claude Code，也不用于 `--publish`。Codex 审查仍需人工启动。
+手动运行 `agent-watch --once` 时同样必须提供上述四个配置参数，例如 `agent-watch --once --model glm-5.3 --base-url https://open.bigmodel.cn/api/anthropic --effort max --auth-config /path/outside/repository/claude-settings.json`。执行器完成后先检查命令返回的本地分支和 worktree。确认交付内容后，由人使用自己的 Git/GitHub 身份推送该分支并创建 Delivery PR；个人凭据不传给 Claude Code，也不用于 `--publish`。Codex 审查仍需人工启动。
 
 命令结果给出 `worktree_id`；默认 worktree 位于 `~/.agent-delivery-loop/worktrees/<worktree_id>`，运行记录位于 `~/.agent-delivery-loop/runs/`。可用 `git worktree list` 查看所有本机工作目录；不要把运行记录或完整 Session 内容提交到仓库。
 
 同一状态目录使用主机互斥锁和任务修订锁；领取前会扫描全部运行记录，不能仅凭锁已释放判断 Worker 已停止。启动前的 `start_unconfirmed` 会持续阻断后续任务，直到明确未启动或已确认停止并成功保存安全状态。无法确认停止时保留 HOME，尽可能保存 `cleanup_failed` / `stop_unconfirmed`，不写安全结束时间；若这次更新失败，原有启动门禁仍然有效。Ctrl+C 非零退出；确认进程组停止后才清理 HOME、记录 `cancelled` / `stopped`。旧故障标记仍会阻断，但新运行不再创建重复标记。具体安全状态及故障处理见 [引导交付说明](docs/bootstrap.md#运行记录的安全门禁)。显式重跑只允许在门禁通过后进行，不会绕过未确认运行；不实现自动恢复、清除阻断或重试。运行记录保持私有、脱敏，Session transcript 不保留。
 
-GitHub App 发布入口通过 `--publish` 显式请求，并要求安装可选依赖 `python -m pip install -e '.[github-app]'`、设置 App ID、安装 ID、仓库外且仅所有者可读的私钥路径，以及维护者完成验证后分别设置 `AGENT_APP_KEY_ISOLATION_VERIFIED=1` 和 `AGENT_MAIN_PROTECTION_VERIFIED=1`。本次只读检查发现当前 `main` 未启用保护且未配置 App；私钥隔离也尚未验证，因此 `--publish` 当前会被拒绝。不要用个人 `gh` Token 代替 App，也不要传递任何 App 凭据给 Claude。
+GitHub App 发布入口通过 `--publish` 显式请求，并要求安装可选依赖 `python -m pip install '.[github-app]'`、设置 App ID、安装 ID、仓库外且仅所有者可读的私钥路径，以及维护者完成验证后分别设置 `AGENT_APP_KEY_ISOLATION_VERIFIED=1` 和 `AGENT_MAIN_PROTECTION_VERIFIED=1`。本次只读检查发现当前 `main` 未启用保护且未配置 App；私钥隔离也尚未验证，因此 `--publish` 当前会被拒绝。不要用个人 `gh` Token 代替 App，也不要传递任何 App 凭据给 Claude。
 
-失败时命令返回非零并写入脱敏状态；不要手动改写运行记录或直接重用失败 worktree。先检查状态 JSON 和 worktree，再由人决定是否显式重新调用同一授权任务或创建新修订。所有变更仍需独立 Codex 审查和 CI；本仓库不自动批准、合并或部署。
+Worker 已确认退出但没有完成任务时，保留交付成果与脱敏运行记录。返修需要另行明确授权，并由人以新 Session 接入；只有目标、验收条件或允许路径发生变化时才要求新 Work Order 修订。Session ID 只用于关联记录，不能恢复完整对话。当前没有续修命令；`agent-run` 从所授权的 Plan merge commit 创建新工作分支，不会接手原 Delivery 分支。若无法确认 Worker 已停止，则继续遵守上方安全门禁，保留 HOME、worktree 和阻断状态，不尝试返修。
+
+失败时命令返回非零并写入脱敏状态；不要手动改写运行记录或直接重用失败 worktree。先检查状态 JSON 和 worktree，再由人决定是否创建新修订。所有变更仍需独立 Codex 审查和 CI；本仓库不自动批准、合并或部署。首次真实 Work Order 试运行尚未发生。
 
 ## 安全边界
 

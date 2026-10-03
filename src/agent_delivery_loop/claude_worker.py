@@ -8,8 +8,10 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import time
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -21,6 +23,9 @@ from .errors import AgentDeliveryError
 from .work_order import WorkOrder
 
 MIN_CLAUDE_VERSION = (2, 1, 259)
+MAX_CLAUDE_SETTINGS_BYTES = 1024 * 1024
+SUPPORTED_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+EndpointIdentity = tuple[str, str, int, str]
 COMPLETION_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -72,44 +77,189 @@ class ClaudeConfig:
     provider_host: str
     auth_name: str
     auth_value: str = field(repr=False)
+    effort: str
+    target_repo_root: Path = field(repr=False)
+    passthrough_environment: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+    auth_source: str = "claude_settings"
 
     @classmethod
-    def from_environment(cls) -> ClaudeConfig:
-        executable = shutil.which("claude")
+    def from_explicit(
+        cls,
+        *,
+        model: str,
+        base_url: str,
+        effort: str,
+        auth_config: Path,
+        repo_root: Path,
+    ) -> ClaudeConfig:
+        if not isinstance(model, str):
+            raise AgentDeliveryError("The requested Claude model is invalid.")
+        model = model.strip()
+        if not model or len(model) > 160 or _has_control_characters(model):
+            raise AgentDeliveryError("The requested Claude model is invalid.")
+        try:
+            endpoint = _endpoint_identity(base_url)
+        except (TypeError, ValueError):
+            raise AgentDeliveryError("The requested Claude base URL is invalid.") from None
+        base_url = base_url.strip()
+        if effort not in SUPPORTED_EFFORTS:
+            raise AgentDeliveryError("The requested Claude effort level is not supported by this runner.")
+
+        passthrough_environment = tuple(
+            (name, os.environ[name]) for name in PASSTHROUGH_ENV if os.environ.get(name)
+        )
+        executable = shutil.which("claude", path=dict(passthrough_environment).get("PATH", ""))
         if not executable:
             raise AgentDeliveryError("Claude Code CLI is not available on PATH.")
-        model = os.environ.get("ANTHROPIC_MODEL", "").strip()
-        if not model or len(model) > 160:
-            raise AgentDeliveryError("Set ANTHROPIC_MODEL to the fixed model route before running a Work Order.")
-        auth = [name for name in AUTH_ENV if os.environ.get(name)]
-        if len(auth) != 1:
-            raise AgentDeliveryError("Configure exactly one Claude Code authentication environment variable.")
-        base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").strip()
-        parsed = urlsplit(base_url)
-        if (
-            parsed.scheme not in {"https", "http"}
-            or not parsed.hostname
-            or parsed.username
-            or parsed.password
-            or parsed.query
-            or parsed.fragment
-            or (parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"})
-        ):
-            raise AgentDeliveryError("ANTHROPIC_BASE_URL must be a credential-free HTTPS URL or a loopback HTTP URL.")
-        return cls(executable, model, base_url, parsed.hostname, auth[0], os.environ[auth[0]])
+        target_repo_root = repo_root.resolve(strict=True)
+        auth_value, auth_name = _read_claude_auth(
+            auth_config,
+            target_repo_root,
+            expected_endpoint=endpoint,
+        )
+        return cls(
+            executable=executable,
+            model=model,
+            base_url=base_url,
+            provider_host=endpoint[1],
+            auth_name=auth_name,
+            auth_value=auth_value,
+            effort=effort,
+            target_repo_root=target_repo_root,
+            passthrough_environment=passthrough_environment,
+        )
 
-    def child_environment(self, isolated_home: Path) -> dict[str, str]:
-        environment = {name: os.environ[name] for name in PASSTHROUGH_ENV if os.environ.get(name)}
+    def child_environment(self, isolated_home: Path, *, include_auth: bool = True) -> dict[str, str]:
+        environment = dict(self.passthrough_environment)
         environment["HOME"] = str(isolated_home)
         environment["CLAUDE_CONFIG_DIR"] = str(isolated_home / ".claude")
         environment["ANTHROPIC_MODEL"] = self.model
         environment["ANTHROPIC_BASE_URL"] = self.base_url
-        environment[self.auth_name] = self.auth_value
+        if include_auth:
+            environment[self.auth_name] = self.auth_value
         return environment
 
     @property
     def provider_route_sha256(self) -> str:
         return hashlib.sha256(self.base_url.encode("utf-8")).hexdigest()
+
+
+def _has_control_characters(value: str) -> bool:
+    return any(unicodedata.category(character) == "Cc" for character in value)
+
+
+def _endpoint_identity(value: object) -> EndpointIdentity:
+    if not isinstance(value, str) or _has_control_characters(value):
+        raise ValueError("invalid endpoint")
+    value = value.strip()
+    if not value or any(character.isspace() for character in value):
+        raise ValueError("invalid endpoint")
+    try:
+        parsed = urlsplit(value)
+        scheme = parsed.scheme.casefold()
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise ValueError("invalid endpoint") from None
+    if (
+        scheme not in {"https", "http"}
+        or not hostname
+        or not hostname.isascii()
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or "?" in value
+        or "#" in value
+        or parsed.netloc.endswith(":")
+        or parsed.path.endswith("//")
+        or (scheme == "http" and hostname.lower() not in {"localhost", "127.0.0.1", "::1"})
+    ):
+        raise ValueError("invalid endpoint")
+    default_port = 443 if scheme == "https" else 80
+    path = parsed.path[:-1] if parsed.path.endswith("/") else parsed.path
+    return (
+        scheme,
+        hostname.lower(),
+        port if port is not None else default_port,
+        path or "/",
+    )
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _read_claude_auth(
+    auth_config: Path,
+    repo_root: Path,
+    *,
+    expected_endpoint: EndpointIdentity,
+) -> tuple[str, str]:
+    try:
+        requested_path = Path(auth_config).expanduser().absolute()
+        if stat.S_ISLNK(requested_path.lstat().st_mode):
+            raise ValueError
+        settings_path = requested_path.resolve(strict=True)
+    except ValueError:
+        raise AgentDeliveryError("Claude settings must be a readable regular file outside the target repository.") from None
+    except (OSError, RuntimeError, TypeError):
+        raise AgentDeliveryError("Claude settings must be a readable regular file outside the target repository.") from None
+    try:
+        settings_path.relative_to(repo_root)
+    except ValueError:
+        pass
+    else:
+        raise AgentDeliveryError("Claude settings must be a readable regular file outside the target repository.")
+
+    try:
+        before_open = settings_path.stat()
+        if not stat.S_ISREG(before_open.st_mode) or before_open.st_size > MAX_CLAUDE_SETTINGS_BYTES:
+            raise ValueError
+        descriptor = os.open(
+            settings_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_size > MAX_CLAUDE_SETTINGS_BYTES
+                or (opened.st_dev, opened.st_ino) != (before_open.st_dev, before_open.st_ino)
+            ):
+                raise ValueError
+            with os.fdopen(descriptor, "rb", closefd=False) as settings_file:
+                raw_settings = settings_file.read(MAX_CLAUDE_SETTINGS_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        if len(raw_settings) > MAX_CLAUDE_SETTINGS_BYTES:
+            raise ValueError
+        settings = json.loads(raw_settings, object_pairs_hook=_unique_json_object)
+        if not isinstance(settings, dict) or not isinstance(settings.get("env"), dict):
+            raise ValueError
+        auth_env = settings["env"]
+        candidates = [name for name in AUTH_ENV if name in auth_env]
+        if len(candidates) != 1:
+            raise ValueError
+        auth_name = candidates[0]
+        auth_value = auth_env[auth_name]
+        if (
+            not isinstance(auth_value, str)
+            or not auth_value.strip()
+            or _has_control_characters(auth_value)
+        ):
+            raise ValueError
+        source_endpoint = _endpoint_identity(auth_env.get("ANTHROPIC_BASE_URL"))
+        if source_endpoint != expected_endpoint:
+            raise ValueError
+        return auth_value, auth_name
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError, json.JSONDecodeError):
+        raise AgentDeliveryError("Claude settings are invalid or do not match the explicit endpoint.") from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,7 +333,7 @@ def _version(config: ClaudeConfig, isolated_home: Path) -> tuple[int, int, int]:
     try:
         result = subprocess.run(
             [config.executable, "--version"],
-            env=config.child_environment(isolated_home),
+            env=config.child_environment(isolated_home, include_auth=False),
             capture_output=True,
             text=True,
             timeout=20,
@@ -198,6 +348,36 @@ def _version(config: ClaudeConfig, isolated_home: Path) -> tuple[int, int, int]:
     if version < MIN_CLAUDE_VERSION:
         raise AgentDeliveryError("Claude Code 2.1.259 or newer is required for the restricted worker profile.")
     return version  # type: ignore[return-value]
+
+
+def _check_effort_support(config: ClaudeConfig, isolated_home: Path) -> None:
+    try:
+        result = subprocess.run(
+            [config.executable, "--help"],
+            env=config.child_environment(isolated_home, include_auth=False),
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise AgentDeliveryError("Claude Code capability check failed.") from None
+    if result.returncode:
+        raise AgentDeliveryError("Claude Code capability check failed.")
+
+    lines = (result.stdout + "\n" + result.stderr).splitlines()
+    for index, line in enumerate(lines):
+        if not re.search(r"(?<!\S)--effort(?:\s|=|$)", line):
+            continue
+        option_help = [line]
+        for continuation in lines[index + 1 : index + 4]:
+            if continuation.strip() and (not continuation[:1].isspace() or "--" in continuation):
+                break
+            option_help.append(continuation)
+        supported_levels = set(re.findall(r"\b(?:low|medium|high|xhigh|max)\b", " ".join(option_help)))
+        if config.effort in supported_levels:
+            return
+    raise AgentDeliveryError("This Claude Code CLI does not advertise the requested effort level.")
 
 
 def _prompt(order: WorkOrder) -> str:
@@ -238,7 +418,7 @@ _SECRET_TEXT_RE = re.compile(
 def _redact_incomplete_item(value: str, *, secrets: tuple[str, ...], private_paths: tuple[str, ...]) -> str:
     result = value.strip()
     for secret in secrets:
-        if len(secret) >= 6:
+        if secret:
             result = result.replace(secret, "[redacted]")
     for path in private_paths:
         if path:
@@ -350,7 +530,9 @@ def _validated_outcome(
 
 def preflight(config: ClaudeConfig, isolated_home: Path) -> tuple[int, int, int]:
     try:
-        return _version(config, isolated_home)
+        version = _version(config, isolated_home)
+        _check_effort_support(config, isolated_home)
+        return version
     finally:
         shutil.rmtree(isolated_home, ignore_errors=True)
 
@@ -512,6 +694,8 @@ def _run_claude_in_isolated_home(
         session_id,
         "--model",
         config.model,
+        "--effort",
+        config.effort,
         "--restricted",
         "--safe-mode",
         "--strict-mcp-config",

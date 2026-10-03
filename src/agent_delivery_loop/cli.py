@@ -8,7 +8,9 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from .claude_worker import ClaudeConfig, SUPPORTED_EFFORTS
 from .errors import AgentDeliveryError
+from .git_ops import repository_root
 from .runner import execute_plan, watch_once
 from .work_order import parse_work_order
 
@@ -27,6 +29,9 @@ def _print_result(result: dict[str, object]) -> None:
         "skill_sha256",
         "claude_code_version",
         "requested_model",
+        "requested_effort",
+        "auth_source",
+        "auth_env_name",
         "delivery_branch",
         "delivery_commit",
         "delivery_pr",
@@ -34,6 +39,25 @@ def _print_result(result: dict[str, object]) -> None:
         "worktree_id",
     )
     print(json.dumps({key: result.get(key) for key in fields}, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def _add_worker_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--model", required=True, help="Explicit Claude model identifier")
+    parser.add_argument("--base-url", required=True, help="Explicit Claude API base URL")
+    parser.add_argument("--effort", required=True, choices=SUPPORTED_EFFORTS, help="Explicit Claude effort level")
+    parser.add_argument("--auth-config", required=True, type=Path, help="Claude settings JSON containing env credentials")
+
+
+def _worker_config(args: argparse.Namespace) -> tuple[Path, ClaudeConfig]:
+    root = repository_root(args.repo_path.expanduser().resolve())
+    config = ClaudeConfig.from_explicit(
+        model=args.model,
+        base_url=args.base_url,
+        effort=args.effort,
+        auth_config=args.auth_config,
+        repo_root=root,
+    )
+    return root, config
 
 
 def _report_error(exc: Exception) -> int:
@@ -48,13 +72,16 @@ def agent_run_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--work-order-path", required=True, help="Work Order path changed by that Plan PR")
     parser.add_argument("--repo-path", type=Path, default=Path.cwd(), help="Local clone of the target repository")
     parser.add_argument("--publish", action="store_true", help="Use a verified GitHub App to push and open a Delivery PR")
+    _add_worker_arguments(parser)
     args = parser.parse_args(argv)
     try:
+        repo_root, worker_config = _worker_config(args)
         _print_result(
             execute_plan(
-                repo_path=args.repo_path,
+                repo_path=repo_root,
                 plan_pr=args.plan_pr,
                 work_order_path=args.work_order_path,
+                worker_config=worker_config,
                 publish=args.publish,
             )
         )
@@ -74,9 +101,11 @@ def agent_watch_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true", required=True, help="Perform one discovery pass and exit")
     parser.add_argument("--repo-path", type=Path, default=Path.cwd(), help="Local clone of the target repository")
     parser.add_argument("--publish", action="store_true", help="Require a verified GitHub App and open a Delivery PR")
+    _add_worker_arguments(parser)
     args = parser.parse_args(argv)
     try:
-        result = watch_once(repo_path=args.repo_path, publish=args.publish)
+        repo_root, worker_config = _worker_config(args)
+        result = watch_once(repo_path=repo_root, worker_config=worker_config, publish=args.publish)
         if result is None:
             print("No eligible merged Work Order was found.")
         else:
