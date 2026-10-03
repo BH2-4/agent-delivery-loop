@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "task_id": "WO-PILOT-001",
+  "revision": 1,
+  "objective": "新增 docs/glossary.md，用通俗中文帮助 GitHub 新手理解本项目的五个核心概念及人工交付流程。",
+  "out_of_scope": [
+    "不修改执行器、CI、README、ADR、Work Order 或 Delivery Skill。",
+    "不配置 GitHub App、凭据、仓库保护或定时任务。",
+    "不推送、创建 PR、合并、部署或切换模型。",
+    "不宣称本项目已生产可用或已经完成真实端到端验证。"
+  ],
+  "acceptance_criteria": [
+    "新增 UTF-8 Markdown 文件 docs/glossary.md，标题为 Agent Delivery Loop 新手术语表。",
+    "分别解释 Work Order、Plan PR、Delivery PR、CI 和 Session；每项包含通俗解释及一个与本项目相关的例子。",
+    "说明人工流程：讨论需求、创建并由用户合并 Plan PR、人工启动 agent-run、Claude 在新 Session 中工作、生成本地交付分支、人工推送并创建 Delivery PR、CI 检查和 Codex 审查、人工决定是否合并。",
+    "明确合并 Plan PR 只授予执行资格，不会自动启动本机；CI 不能替代语义审查；合并 Delivery PR 不等于部署上线。",
+    "交付变更只包含 docs/glossary.md，且不包含凭据、本机私有路径或未经验证的成功声明。"
+  ],
+  "allowed_paths": [
+    "docs/glossary.md"
+  ],
+  "worker_profile": "claude-code-v1",
+  "skill_ref": ".agents/policies/delivery-skill/SKILL.md",
+  "stop_conditions": [
+    "授权内容不明确，或目标文件已经存在且需要覆盖。",
+    "完成任务需要修改允许范围之外的文件。",
+    "完成任务需要调用受限工具之外的能力或提升权限。",
+    "完成文档需要读取、输出或提交凭据及其他私密信息。"
+  ],
+  "limits": {
+    "max_turns": 12,
+    "timeout_seconds": 900,
+    "max_budget_usd": 3.0
+  }
+}
