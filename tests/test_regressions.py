@@ -10,15 +10,17 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from contextlib import redirect_stderr
+from contextlib import ExitStack, contextmanager, redirect_stderr
 from io import StringIO
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
 from agent_delivery_loop.claude_worker import (
     ClaudeConfig,
     WorkerCancelled,
     WorkerLifecycle,
+    WorkerOutcome,
     WorkerResultError,
     _process_group_exists,
     _stop_process_group,
@@ -29,8 +31,8 @@ from agent_delivery_loop.cli import _report_error
 from agent_delivery_loop.errors import AgentDeliveryError
 from agent_delivery_loop.github import GitHubClient, Repo
 from agent_delivery_loop.git_ops import commit_changes, stage_changes
-from agent_delivery_loop.runner import _record_cancelled_run, _safe_changed_paths
-from agent_delivery_loop.store import RunStore, task_key
+from agent_delivery_loop.runner import _record_cancelled_run, _safe_changed_paths, execute_plan
+from agent_delivery_loop.store import RunStateError, RunStore, task_key
 from agent_delivery_loop.work_order import parse_work_order
 
 
@@ -279,8 +281,10 @@ class WorkerCancellationTests(unittest.TestCase):
             run_id = "run-start-cancel-test"
             identity = task_key("owner/repo", "WO-2026-001", 1)
             record: dict[str, object] = {
+                "schema_version": 1,
                 "run_id": run_id,
                 "status": "starting",
+                "worker_status": "start_unconfirmed",
                 "finished_at": None,
                 "session_id": None,
             }
@@ -394,8 +398,10 @@ class WorkerCancellationTests(unittest.TestCase):
             run_id = "run-cancel-test"
             identity = task_key("owner/repo", "WO-2026-001", 1)
             record: dict[str, object] = {
+                "schema_version": 1,
                 "run_id": run_id,
                 "status": "starting",
+                "worker_status": "start_unconfirmed",
                 "finished_at": None,
                 "session_id": None,
             }
@@ -475,6 +481,188 @@ class WorkerCancellationTests(unittest.TestCase):
             self.assertIn(run_id, stderr.getvalue())
             with store.claim(identity):
                 pass
+
+
+class WorkerSafetyGateTests(unittest.TestCase):
+    @contextmanager
+    def _runner_fixture(self, root: Path):
+        """Exercise the runner with authorization/Git stubs and no Claude executable."""
+        repo = Repo("owner", "repo")
+        order_path = ".agents/work-orders/WO-2026-001-r1.json"
+        raw = (Path(__file__).parents[1] / "examples/work-orders/WO-2026-001.json").read_bytes()
+        skill_bytes = b"temporary test skill\n"
+        order = parse_work_order(raw)
+        authorization = SimpleNamespace(merge_sha="a" * 40, order_bytes=raw, order_path=order_path)
+        client = Mock()
+        client.authorized_plan.return_value = authorization
+        client.content.return_value = skill_bytes
+        config = ClaudeConfig(str(root / "never-executed-claude"), "fixed-model", "https://api.example.invalid",
+                              "api.example.invalid", "ANTHROPIC_AUTH_TOKEN", "test-secret-token-value")
+
+        def make_worktree(_repo, destination, _branch, _sha):
+            skill = destination / order.skill_ref
+            skill.parent.mkdir(parents=True)
+            skill.write_bytes(skill_bytes)
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {"AGENT_STATE_DIR": str(root / "state")}))
+            for name, replacement in (
+                ("repository_root", Mock(return_value=root)),
+                ("repository_remote", Mock(return_value=repo)),
+                ("GitHubClient", Mock(return_value=client)),
+                ("ClaudeConfig.from_environment", Mock(return_value=config)),
+                ("preflight", Mock(return_value=(2, 1, 284))),
+                ("ensure_plan_is_on_main", Mock()),
+                ("create_worktree", make_worktree),
+            ):
+                stack.enter_context(patch(f"agent_delivery_loop.runner.{name}", replacement))
+            commit = stack.enter_context(patch("agent_delivery_loop.runner.commit_changes"))
+            yield RunStore(root / "state"), commit, {
+                "repo_path": root, "plan_pr": "owner/repo#123", "work_order_path": order_path,
+            }
+
+    def _stored_run(self, store):
+        paths = list(store.runs.glob("*/*.json"))
+        self.assertEqual(len(paths), 1)
+        return json.loads(paths[0].read_text(encoding="utf-8"))
+
+    def _assert_next_run_blocked(self, store):
+        # A fresh store and different task simulate executor exit and a new attempt.
+        with self.assertRaises(RunStateError):
+            with RunStore(store.root).claim(task_key("owner/repo", "WO-DIFFERENT", 1)):
+                self.fail("Unconfirmed prior Worker must block all subsequent tasks")
+
+    def test_creation_exception_before_handle_retains_gate_and_home(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original_popen = subprocess.Popen
+            children = []
+            with self._runner_fixture(root) as (store, commit, args):
+                def create_then_raise(*_args, **_kwargs):
+                    with self.assertRaises(RunStateError):
+                        RunStore(store.root).assert_worker_available()
+                    children.append(original_popen(
+                        [sys.executable, "-c", "import time; time.sleep(60)"], **_kwargs,
+                    ))
+                    raise OSError("Injected failure after child creation, before handle return")
+
+                try:
+                    with patch.object(subprocess, "Popen", new=create_then_raise):
+                        with self.assertRaisesRegex(AgentDeliveryError, "cleanup failed"):
+                            execute_plan(**args)
+                    record = self._stored_run(store)
+                    self.assertEqual(record["worker_status"], "stop_unconfirmed")
+                    self.assertEqual(record["status"], "cleanup_failed")
+                    self.assertIsNone(record["finished_at"])
+                    self.assertIsNone(children[0].poll())
+                    self.assertTrue((store.root / "runtime" / record["run_id"]).is_dir())
+                    self._assert_next_run_blocked(store)
+                    commit.assert_not_called()
+                finally:
+                    for process in children:
+                        self.assertTrue(_stop_process_group(process))
+                # Even a known test child stopping must not automatically clear the record.
+                self._assert_next_run_blocked(store)
+
+    def test_unconfirmed_stop_update_failure_or_interrupt_preserves_start_gate(self):
+        for failure in (OSError("Injected write failure"), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                original_popen, original_replace = subprocess.Popen, os.replace
+                children = []
+                with self._runner_fixture(root) as (store, commit, args):
+                    def launch(*_args, **_kwargs):
+                        child = original_popen(
+                            [sys.executable, "-c", "import time; time.sleep(60)"], **_kwargs,
+                        )
+                        children.append(child)
+                        return child
+
+                    def replace(source, destination):
+                        if Path(destination).exists():
+                            raise failure
+                        return original_replace(source, destination)
+
+                    try:
+                        with (
+                            patch.object(subprocess, "Popen", new=launch),
+                            patch.object(original_popen, "communicate", side_effect=KeyboardInterrupt),
+                            patch("agent_delivery_loop.claude_worker._stop_process_group", return_value=False),
+                            patch("agent_delivery_loop.store.os.replace", new=replace),
+                        ):
+                            with self.assertRaises((RunStateError, KeyboardInterrupt)):
+                                execute_plan(**args)
+                        record = self._stored_run(store)
+                        self.assertEqual(record["worker_status"], "start_unconfirmed")
+                        self.assertEqual(record["status"], "starting")
+                        self.assertTrue((store.root / "runtime" / record["run_id"]).is_dir())
+                        self.assertFalse(store.cleanup_failure.exists())
+                        self._assert_next_run_blocked(store)
+                        commit.assert_not_called()
+                    finally:
+                        for process in children:
+                            self.assertTrue(_stop_process_group(process))
+
+    def test_unreadable_invalid_or_unpersisted_state_never_launches(self):
+        for failure in ("invalid", "unreadable", "write", "readback"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                with self._runner_fixture(Path(temporary)) as (store, commit, args):
+                    with ExitStack() as stack:
+                        launch = stack.enter_context(patch.object(subprocess, "Popen"))
+                        if failure == "invalid":
+                            directory = store.runs / "prior-task"
+                            directory.mkdir()
+                            (directory / "prior.json").write_text('{"worker_status":', encoding="utf-8")
+                        elif failure == "unreadable":
+                            original_iterdir = Path.iterdir
+
+                            def iterdir(path):
+                                if path == store.runs:
+                                    raise PermissionError("Injected state read failure")
+                                return original_iterdir(path)
+
+                            stack.enter_context(patch.object(Path, "iterdir", new=iterdir))
+                        elif failure == "write":
+                            stack.enter_context(patch("agent_delivery_loop.store.os.replace", side_effect=OSError))
+                        else:
+                            stack.enter_context(patch.object(RunStore, "_read_record", side_effect=OSError))
+                        with self.assertRaises(RunStateError):
+                            execute_plan(**args)
+                        launch.assert_not_called()
+                        commit.assert_not_called()
+
+    def test_sigint_during_home_cleanup_aborts_successful_delivery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original_popen = subprocess.Popen
+            with self._runner_fixture(root) as (store, commit, args):
+                def launch(*_args, **kwargs):
+                    return original_popen([sys.executable, "-c", "pass"], **kwargs)
+
+                def complete(_stdout, **kwargs):
+                    return WorkerOutcome(kwargs["requested_session_id"], "complete", [])
+
+                from agent_delivery_loop import claude_worker
+                original_rmtree = claude_worker.shutil.rmtree
+
+                def interrupt_cleanup(path, *cleanup_args, **cleanup_kwargs):
+                    os.kill(os.getpid(), signal.SIGINT)
+                    return original_rmtree(path, *cleanup_args, **cleanup_kwargs)
+
+                with (
+                    patch.object(subprocess, "Popen", new=launch),
+                    patch.object(claude_worker, "_validated_outcome", new=complete),
+                    patch.object(claude_worker.shutil, "rmtree", new=interrupt_cleanup),
+                ):
+                    with self.assertRaisesRegex(AgentDeliveryError, "cancelled"):
+                        execute_plan(**args)
+                record = self._stored_run(store)
+                self.assertEqual(record["worker_status"], "stopped")
+                self.assertEqual(record["status"], "cancelled")
+                self.assertFalse((store.root / "runtime" / record["run_id"]).exists())
+                commit.assert_not_called()
+                with RunStore(store.root).claim("next-task"):
+                    pass
 
 
 if __name__ == "__main__":

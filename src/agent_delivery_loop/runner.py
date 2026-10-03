@@ -33,7 +33,7 @@ from .git_ops import (
 )
 from .github import GitHubClient, Repo, parse_plan_pr_ref
 from .github_app import GitHubAppConfig, GitHubAppTokenProvider
-from .store import RunStore, authorization_key, default_state_dir, now_utc, task_key
+from .store import RunStateError, RunStore, authorization_key, default_state_dir, now_utc, task_key
 from .work_order import WorkOrder, parse_work_order
 
 
@@ -92,6 +92,7 @@ def _record_cancelled_run(
     reason: str,
 ) -> None:
     record["status"] = "cancelled"
+    record["worker_status"] = "stopped"
     record["finished_at"] = now_utc()
     record["completion_status"] = "cancelled"
     record["session_id"] = session_id
@@ -108,6 +109,7 @@ def _record_not_started_run(
     reason: str,
 ) -> None:
     record["status"] = "not_started"
+    record["worker_status"] = "not_started"
     record["finished_at"] = now_utc()
     record["completion_status"] = "not_started"
     record["session_id"] = None
@@ -125,11 +127,11 @@ def _record_cleanup_failed_run(
     reason: str,
 ) -> None:
     record["status"] = "cleanup_failed"
-    record["finished_at"] = now_utc()
+    record["worker_status"] = "stop_unconfirmed"
+    record["finished_at"] = None
     record["completion_status"] = "cleanup_failed"
     record["session_id"] = session_id
     record["failure"] = reason
-    store.mark_worker_cleanup_failed(run_id)
     store.write(task_identity_key, run_id, record)
 
 
@@ -156,6 +158,7 @@ def execute_plan(
 
     config = ClaudeConfig.from_environment()
     store = RunStore(default_state_dir())
+    store.assert_worker_available()
     run_id = str(uuid.uuid4())
     runtime_home = store.root / "runtime" / run_id
     version = preflight(config, runtime_home)
@@ -182,6 +185,7 @@ def execute_plan(
         "task_id": order.task_id,
         "revision": order.revision,
         "status": "starting",
+        "worker_status": "start_unconfirmed",
         "started_at": now_utc(),
         "finished_at": None,
         "repository": plan_repo.slug,
@@ -208,6 +212,8 @@ def execute_plan(
     worker_lifecycle = WorkerLifecycle()
 
     with store.claim(task_identity_key):
+        # This durable, read-back-verified record is the gate BEFORE any Worker
+        # creation. A later failed/interrupted update cannot release it.
         store.write(task_identity_key, run_id, record)
         try:
             create_worktree(root, worktree, branch, authorization.merge_sha)
@@ -230,6 +236,7 @@ def execute_plan(
             record["completion_status"] = outcome.completion_status
             record["incomplete_items"] = outcome.incomplete_items
             record["status"] = "validating"
+            record["worker_status"] = "stopped"
             store.write(task_identity_key, run_id, record)
             _safe_changed_paths(worktree, order)
             ensure_diff_clean(worktree)
@@ -334,8 +341,20 @@ def execute_plan(
             raise AgentDeliveryError(
                 f"Worker stop was not confirmed; future runs are blocked pending manual inspection. Run ID: {run_id}."
             ) from None
+        except RunStateError:
+            # Do not try to repair or overwrite a failed safety-state update.
+            raise
         except Exception as exc:
+            if worker_lifecycle.status not in {"not_started", "stopped"}:
+                _record_cleanup_failed_run(
+                    store, task_identity_key, run_id, record,
+                    session_id=worker_lifecycle.session_id,
+                    reason="An error escaped while Worker safety was unconfirmed; stop trials and obtain manual safety review.",
+                )
+                raise AgentDeliveryError(f"Worker safety is unconfirmed; future runs remain blocked. Run ID: {run_id}.") from None
             record["status"] = "failed"
+            record["worker_status"] = worker_lifecycle.status
+            record["session_id"] = worker_lifecycle.session_id
             record["finished_at"] = now_utc()
             if isinstance(exc, WorkerResultError):
                 record["completion_status"] = exc.completion_status

@@ -11,8 +11,10 @@ import signal
 import subprocess
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterator
 from urllib.parse import urlsplit
 
 from .errors import AgentDeliveryError
@@ -123,6 +125,25 @@ class WorkerLifecycle:
 
     status: str = "not_started"
     session_id: str | None = None
+
+
+@dataclass(slots=True)
+class _DeferredSIGINT:
+    requested: bool = False
+
+    def handle(self, _signum: int, _frame: object) -> None:
+        self.requested = True
+
+
+@contextmanager
+def _defer_sigint() -> Iterator[_DeferredSIGINT]:
+    """Delay repeated Ctrl+C in a critical section without blocking child signals."""
+    cancellation = _DeferredSIGINT()
+    previous_handler = signal.signal(signal.SIGINT, cancellation.handle)
+    try:
+        yield cancellation
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
 
 
 class WorkerResultError(AgentDeliveryError):
@@ -344,7 +365,6 @@ def run_claude(
 ) -> WorkerOutcome:
     lifecycle = lifecycle or WorkerLifecycle()
     isolated_home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    preserve_home = False
     try:
         return _run_claude_in_isolated_home(worktree, skill_path, order, isolated_home, config, lifecycle)
     except WorkerStartCancelled:
@@ -354,8 +374,6 @@ def run_claude(
     except WorkerCancelled:
         raise
     except WorkerCleanupError:
-        # Keep the HOME available while an unconfirmed worker may still depend on it.
-        preserve_home = True
         raise
     except KeyboardInterrupt:
         if lifecycle.status == "not_started":
@@ -363,14 +381,28 @@ def run_claude(
         if lifecycle.status == "stopped":
             raise WorkerCancelled(session_id=lifecycle.session_id or "unknown") from None
         lifecycle.status = "stop_unconfirmed"
-        preserve_home = True
         raise WorkerCleanupError(
             session_id=lifecycle.session_id or "unknown",
             reason="Cancellation escaped the Worker lifecycle while process shutdown was unconfirmed; HOME was retained.",
         ) from None
     finally:
-        if not preserve_home:
-            shutil.rmtree(isolated_home, ignore_errors=True)
+        # Safety follows the lifecycle, even if another interrupt preempts an
+        # exception handler. Never infer a safe end from a missing Popen handle.
+        with _defer_sigint() as cancellation:
+            if lifecycle.status in {"not_started", "stopped"}:
+                try:
+                    shutil.rmtree(isolated_home)
+                except OSError:
+                    raise AgentDeliveryError("Worker safety was confirmed, but temporary HOME cleanup failed.") from None
+        if cancellation.requested:
+            if lifecycle.status == "not_started":
+                raise WorkerStartCancelled() from None
+            if lifecycle.status == "stopped":
+                raise WorkerCancelled(session_id=lifecycle.session_id or "unknown") from None
+            raise WorkerCleanupError(
+                session_id=lifecycle.session_id or "unknown",
+                reason="Cancellation repeated while Worker shutdown was unconfirmed; HOME and the safety gate were retained.",
+            ) from None
 
 
 def _process_group_exists(process_group: int) -> bool:
@@ -394,6 +426,13 @@ def _wait_for_process_group(process_group: int, timeout: float) -> bool:
 
 def _stop_process_group(process: subprocess.Popen[str], *, grace_seconds: float = 3.0) -> bool:
     """Terminate the whole isolated group, then reap the leader with bounded waits."""
+    # Callers always abort delivery after invoking this cleanup. Repeated SIGINT
+    # must not interrupt stopping/reaping and does not resume normal delivery.
+    with _defer_sigint():
+        return _stop_process_group_critical(process, grace_seconds=grace_seconds)
+
+
+def _stop_process_group_critical(process: subprocess.Popen[str], *, grace_seconds: float) -> bool:
     process_group = process.pid
     try:
         try:
@@ -430,6 +469,13 @@ def _raise_cancelled_worker(
     session_id: str,
 ) -> None:
     if process is None:
+        if lifecycle.status != "not_started":
+            lifecycle.status = "stop_unconfirmed"
+            lifecycle.session_id = session_id
+            raise WorkerCleanupError(
+                session_id=session_id,
+                reason="Worker creation was entered without obtaining a process handle; its stop cannot be confirmed.",
+            ) from None
         lifecycle.status = "not_started"
         lifecycle.session_id = None
         raise WorkerStartCancelled() from None
@@ -483,45 +529,28 @@ def _run_claude_in_isolated_home(
         str(skill_path),
     ]
     process: subprocess.Popen[str] | None = None
-    cancel_requested = False
-
-    def defer_sigint(_signum: int, _frame: object) -> None:
-        nonlocal cancel_requested
-        cancel_requested = True
-
     try:
         # Defer Ctrl+C only across Popen and process registration. Unlike blocking
         # SIGINT, this does not pass a blocked signal mask to the new Worker process.
-        launch_error: OSError | None = None
-        previous_handler = signal.getsignal(signal.SIGINT)
-        handler_installed = False
-        try:
-            previous_handler = signal.signal(signal.SIGINT, defer_sigint)
-            handler_installed = True
-            if cancel_requested:
+        with _defer_sigint() as cancellation:
+            if cancellation.requested:
                 _raise_cancelled_worker(None, lifecycle, session_id)
-            try:
-                process = subprocess.Popen(
-                    argv,
-                    cwd=worktree,
-                    env=config.child_environment(isolated_home),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    start_new_session=True,
-                )
-                lifecycle.status = "running"
-                lifecycle.session_id = session_id
-            except OSError as exc:
-                launch_error = exc
-        finally:
-            if handler_installed:
-                signal.signal(signal.SIGINT, previous_handler)
-        if cancel_requested:
+            environment = config.child_environment(isolated_home)
+            lifecycle.session_id = session_id
+            lifecycle.status = "start_unconfirmed"
+            process = subprocess.Popen(
+                argv,
+                cwd=worktree,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            lifecycle.status = "running"
+        if cancellation.requested:
             _raise_cancelled_worker(process, lifecycle, session_id)
-        if process is None:
-            raise AgentDeliveryError("Claude Code could not be started.") from launch_error
         stdout, _stderr = process.communicate(timeout=order.timeout_seconds)
         if _process_group_exists(process.pid):
             if not _stop_process_group(process):
@@ -545,7 +574,11 @@ def _run_claude_in_isolated_home(
         )
     except subprocess.TimeoutExpired:
         if process is None:
-            raise AgentDeliveryError("Claude Code could not be started.") from None
+            lifecycle.status = "stop_unconfirmed"
+            raise WorkerCleanupError(
+                session_id=session_id,
+                reason="Worker creation timed out before returning a process handle; its stop cannot be confirmed.",
+            ) from None
         if not _stop_process_group(process):
             lifecycle.status = "stop_unconfirmed"
             raise WorkerCleanupError(
@@ -560,7 +593,13 @@ def _run_claude_in_isolated_home(
         raise
     except BaseException:
         if process is None:
-            raise
+            if lifecycle.status == "not_started":
+                raise
+            lifecycle.status = "stop_unconfirmed"
+            raise WorkerCleanupError(
+                session_id=session_id,
+                reason="Worker creation raised before returning a process handle; HOME and the safety gate must be retained.",
+            ) from None
         if not _stop_process_group(process):
             lifecycle.status = "stop_unconfirmed"
             raise WorkerCleanupError(

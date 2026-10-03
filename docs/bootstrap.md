@@ -1,8 +1,8 @@
 # 从设计稿走到第一次真实交付
 
-## 当前检查点（2026-10-02）
+## 当前检查点（2026-10-03）
 
-仓库已有第一版 Python `agent-run`、`agent-watch --once`、Work Order v1、Claude Code 受限启动器和最小 CI。CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并解析示例 Work Order；它不验证每张新 Work Order。当前变更增加了 Worker 进程组取消清理与最终提交快照核对，并以不调用模型的临时 Worker 和临时 Git 仓库做两项聚焦回归验证。它们只证明测试替身及本地 Git 路径，不证明真实 Claude Code CLI 在当前主机和模型路由下的停止行为。**尚未启动真实 Work Order**。
+仓库已有第一版 Python `agent-run`、`agent-watch --once`、Work Order v1、Claude Code 受限启动器和最小 CI。CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并解析示例 Work Order；它不验证每张新 Work Order。当前变更将 Worker 安全门禁移到启动前的持久化运行记录，保留进程组停止与最终提交快照核对。临时子进程及故障注入覆盖创建阶段未返回句柄的异常、停止未确认后的记录更新失败/再次取消、门禁读写错误和清理期间取消；已有临时 Git 回归核对提交快照。这些仅证明受控替身、状态机制与本地 Git 路径，不证明真实 Claude Code CLI 的端到端执行或停止行为。**尚未启动真实 Work Order**。
 
 当前主机的 Claude Code 为 2.1.284，与 Anthropic 官方当前标记的最新 release v2.1.284 一致；认证状态正常。Codex CLI 安装问题已修复，可人工启动 Steward 审查。仓库是公开仓库，但只读查询显示 `main` 当前没有 branch protection，且未配置 GitHub App。因此 `--publish` 不能使用，默认执行只提交本地 Delivery 分支。当前允许先做人工监督试运行：由人检查本地分支后，手动推送并创建 Delivery PR；GitHub App、`main` 保护与无人值守发布仍未验证。不要把个人 GitHub 凭据传给 Claude Code，也不要用个人 Token 冒充 App 身份。
 
@@ -16,11 +16,26 @@
 - Codex / Steward 负责需求整理、Plan PR 和 Delivery PR 审查，向用户报告结论。Plan PR 仍由用户合并授权。
 - `agent-watch` 和 `agent-run` 是仓库实现的本机 Python CLI，不是 GitHub 或 Agent 框架的内置功能。
 - `agent-watch --once` 按 PR 更新时间降序分页读取关闭 PR，最多读取 1000 个，并检查其中先遇到的 30 个已合并 PR。旧 PR 后续活动可能改变排序，因此不保证覆盖按合并时间最新的 30 个 PR；达到扫描上限仍未检查满 30 个已合并 PR 时会报错，不报告“无任务”。
-- Ctrl+C、超时或启动后的异常会触发整个 Worker 进程组的有界停止流程。启动时短暂延迟处理 Ctrl+C，直到 `Popen` 返回的进程句柄和生命周期状态登记完成，再立即处理取消请求；不会把屏蔽 SIGINT 的信号状态传给新 Worker。确认进程组消失后才清理临时 HOME、记录结束状态和释放锁。运行记录区分 Worker 未启动、停止后的取消和停止未确认。无法确认时保留 HOME 并写入本机清理失败标记，后续执行入口会拒绝新任务，需人工确认进程状态后清除标记。
+- 创建 Worker 前必须成功持久化并回读验证未确认安全结束的运行记录。Ctrl+C、超时和异常会尝试有界停止进程组；进入创建阶段后，即使 `Popen` 未返回句柄，也不能据此判定 Worker 未启动。无法确认时保留 HOME 与门禁，后续更新失败、再次取消或执行器退出释放锁不会授权下一次启动。只有明确未启动或已确认停止才允许清理 HOME、保存安全状态。启动登记及停止/HOME 清理关键区延迟 SIGINT，不向 Worker 传递阻塞信号掩码，取消后不继续正常交付。
 - 执行器的 Git 命令使用单次 `core.hooksPath` 配置屏蔽钩子，不改用户全局设置或删除钩子；提交前固定暂存树与父提交，提交后核对提交对象并重新计算交付路径。
 - GitHub Actions 只执行确定性的仓库检查：源码编译、聚焦回归用例、schema JSON 解析和一个示例 Work Order 解析；它不扫描每张新 Work Order。Codex 的语义审查是另一道门。
 - Hermes 通知尚未实现。跨主机领取、自动重试、自动部署不进入首轮。
 - Delivery PR 自动合并的身份与分支规则尚未锁定；在验证前不得实现或宣称可用。
+
+## 运行记录的安全门禁
+
+现有私有运行记录是新运行唯一的安全状态来源，新增字段 `worker_status`，不另建故障标记。写入使用原子替换、文件及目录同步，并回读核对；领取任务持锁后扫描全部记录。记录读取失败、JSON 损坏、字段重复、缺少安全字段或状态矛盾均阻止启动。旧版记录缺少此字段，或仍存在旧故障标记时，也需要人工审查，不自动迁移或清除。
+
+| Worker 状态 | 含义与门禁 |
+| --- | --- |
+| `start_unconfirmed` | 启动前已保存“尚未确认安全结束”；阻止后续任务，即使执行器随后退出。 |
+| `running` / `stop_unconfirmed` | 正在运行或无法确认是否仍在运行；阻止后续任务。 |
+| `not_started` | 明确未进入创建阶段；仅与 `not_started` 或 `failed` 运行状态相配时允许后续任务。 |
+| `stopped` | 已启动且确认进程组停止；仅与 `validating`、`local_ready`、`delivery_pr_open`、`cancelled` 或 `failed` 相配时允许后续任务。 |
+
+不能确认停止时尽可能写入 `cleanup_failed` / `stop_unconfirmed`，`finished_at` 保持空值；更新失败时仍保留启动前记录，并继续阻断。实际进入创建函数后发生异常而未取得句柄，保守归为停止未确认；即使某次创建可能事实上没有成功，也不会自动放行。年龄、超时或某个 PID 不存在均不能解除门禁。
+
+出现未确认运行、记录损坏或持久化故障，**停止继续试运行**。保留运行记录、临时 HOME 和 worktree，记录运行 ID，由维护者检查进程及其后代和状态存储，取得独立安全确认后再单独制定、审查恢复方案。当前没有恢复/清除命令；不要删除或改写记录、删除旧标记、换用 `AGENT_STATE_DIR` 或重跑任务绕过门禁。本轮不验证或执行人工恢复。
 
 ## 两次交付
 
