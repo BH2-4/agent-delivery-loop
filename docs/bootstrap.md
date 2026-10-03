@@ -4,7 +4,7 @@
 
 仓库已有第一版 Python `agent-run`、`agent-watch --once`、Work Order v1、Claude Code 受限启动器和最小 CI。CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并解析示例 Work Order；它不验证每张新 Work Order。当前变更将 Worker 安全门禁移到启动前的持久化运行记录，保留进程组停止与最终提交快照核对。临时子进程及故障注入覆盖创建阶段未返回句柄的异常、停止未确认后的记录更新失败/再次取消、门禁读写错误和清理期间取消；已有临时 Git 回归核对提交快照。这些仅证明受控替身、状态机制与本地 Git 路径，不证明真实 Claude Code CLI 的端到端执行或停止行为。**尚未启动真实 Work Order**。
 
-当前主机的 Claude Code 为 2.1.284，与 Anthropic 官方当前标记的最新 release v2.1.284 一致；认证状态正常。Codex CLI 安装问题已修复，可人工启动 Steward 审查。仓库是公开仓库，但只读查询显示 `main` 当前没有 branch protection，且未配置 GitHub App。因此 `--publish` 不能使用，默认执行只提交本地 Delivery 分支。当前允许先做人工监督试运行：由人检查本地分支后，手动推送并创建 Delivery PR；GitHub App、`main` 保护与无人值守发布仍未验证。不要把个人 GitHub 凭据传给 Claude Code，也不要用个人 Token 冒充 App 身份。
+当前记录的本机 Claude Code CLI 版本为 2.1.288。账号认证有效性、GLM-5.3 路由和 Worker 启动均未验证。Codex CLI 安装问题已修复，可人工启动 Steward 审查。仓库是公开仓库，但只读查询显示 `main` 当前没有 branch protection，且未配置 GitHub App。因此 `--publish` 不能使用，默认执行只提交本地 Delivery 分支。当前允许先做人工监督试运行：由人检查本地分支后，手动推送并创建 Delivery PR；GitHub App、`main` 保护与无人值守发布仍未验证。不要把个人 GitHub 凭据传给 Claude Code，也不要用个人 Token 冒充 App 身份。
 
 下方首轮提示词保留为本次引导交付的原始任务范围和审查依据，不表示需要再次交给另一个 Agent 重做。
 
@@ -16,11 +16,32 @@
 - Codex / Steward 负责需求整理、Plan PR 和 Delivery PR 审查，向用户报告结论。Plan PR 仍由用户合并授权。
 - `agent-watch` 和 `agent-run` 是仓库实现的本机 Python CLI，不是 GitHub 或 Agent 框架的内置功能。
 - `agent-watch --once` 按 PR 更新时间降序分页读取关闭 PR，最多读取 1000 个，并检查其中先遇到的 30 个已合并 PR。旧 PR 后续活动可能改变排序，因此不保证覆盖按合并时间最新的 30 个 PR；达到扫描上限仍未检查满 30 个已合并 PR 时会报错，不报告“无任务”。
+- `agent-run` 与 `agent-watch --once` 都要求显式提供 `--model`、`--base-url`、`--effort`、`--auth-config`。认证只从所指定 Claude settings JSON 的 `env` 对象读取一个受支持且非空的认证项；配置文件必须在目标仓库之外，且不会被复制到 Worker HOME。CC Switch 配置保持原样，父环境中的模型、路由、effort 和认证变量不会进入 Worker。
+- CLI 在创建 Worker 前通过不带认证值的 `--version` 和普通 `--help` 检查版本及所请求 effort；如果当前 CLI 没有在帮助中列出该 effort，则停止，不尝试模型请求或降级。
 - 创建 Worker 前必须成功持久化并回读验证未确认安全结束的运行记录。Ctrl+C、超时和异常会尝试有界停止进程组；进入创建阶段后，即使 `Popen` 未返回句柄，也不能据此判定 Worker 未启动。无法确认时保留 HOME 与门禁，后续更新失败、再次取消或执行器退出释放锁不会授权下一次启动。只有明确未启动或已确认停止才允许清理 HOME、保存安全状态。启动登记及停止/HOME 清理关键区延迟 SIGINT，不向 Worker 传递阻塞信号掩码，取消后不继续正常交付。
 - 执行器的 Git 命令使用单次 `core.hooksPath` 配置屏蔽钩子，不改用户全局设置或删除钩子；提交前固定暂存树与父提交，提交后核对提交对象并重新计算交付路径。
 - GitHub Actions 只执行确定性的仓库检查：源码编译、聚焦回归用例、schema JSON 解析和一个示例 Work Order 解析；它不扫描每张新 Work Order。Codex 的语义审查是另一道门。
 - Hermes 通知尚未实现。跨主机领取、自动重试、自动部署不进入首轮。
 - Delivery PR 自动合并的身份与分支规则尚未锁定；在验证前不得实现或宣称可用。
+
+显式配置的人工命令示例：
+
+```sh
+agent-run --plan-pr https://github.com/OWNER/REPO/pull/123 \
+  --work-order-path .agents/work-orders/WO-2026-001-r1.json \
+  --model glm-5.3 \
+  --base-url https://open.bigmodel.cn/api/anthropic \
+  --effort max \
+  --auth-config /path/outside/repository/claude-settings.json
+
+agent-watch --once \
+  --model glm-5.3 \
+  --base-url https://open.bigmodel.cn/api/anthropic \
+  --effort max \
+  --auth-config /path/outside/repository/claude-settings.json
+```
+
+审查并合并后，使用该准确完整 SHA 的干净 checkout 重建普通 wheel。用 `git rev-parse HEAD` 记录完整源码 SHA，用 wheel 文件的 `shasum -a 256` 输出记录 wheel SHA-256；构建失败时停止，不继续安装。当前已安装的普通 wheel 不随源码修改更新；本轮不替换它。首次真实试运行须安装审查合并后的构建。
 
 ## 运行记录的安全门禁
 
@@ -50,6 +71,8 @@
 引导交付审查完成后，再选一项范围小、验收明确、不会触及生产部署的仓库改动。用户合并其 Plan PR；首次真实试运行由人显式指定这个已合并 Plan PR 调用 `agent-run`，执行器启动 Claude Code 并生成本地交付分支。人检查分支后使用自己的 GitHub 身份手动推送并创建 Delivery PR；Actions 给出确定性 CI 结果，Codex 独立审查并给用户简报。手动路径稳定后，再单独验证 `agent-watch --once` 的发现行为。GitHub App 和 `main` 保护仍未验证，不用于这条手动试运行路径。
 
 只有真实 Work Order 确实经过这些步骤，才能称为“首次真实试运行”；截至当前，这次试运行尚未发生。如果 Delivery PR 尚未合并，只能称为“候选交付完成”，不能称为代码已进入 `main`；如果没有部署流程，更不能称为 `deployed`。
+
+Worker 已确认退出但任务未完成时，保留成果与脱敏运行记录。返修需要另行明确授权，并由人以新 Session 接入；只有目标、验收条件或允许路径发生变化时才要求新 Work Order 修订。Session ID 不能恢复完整对话。当前没有续修命令；`agent-run` 从所授权的 Plan merge commit 创建新工作分支，不会接手原 Delivery 分支。无法确认 Worker 已停止时，继续保留 HOME、worktree 和安全门禁，不进入返修流程。
 
 ## 首轮观察记录
 

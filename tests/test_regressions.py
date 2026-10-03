@@ -17,23 +17,218 @@ from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
 from agent_delivery_loop.claude_worker import (
+    AUTH_ENV,
     ClaudeConfig,
     WorkerCancelled,
     WorkerLifecycle,
     WorkerOutcome,
     WorkerResultError,
+    _check_effort_support,
     _process_group_exists,
     _stop_process_group,
     _validated_outcome,
     run_claude,
 )
-from agent_delivery_loop.cli import _report_error
+from agent_delivery_loop.cli import _report_error, agent_run_main, agent_watch_main
 from agent_delivery_loop.errors import AgentDeliveryError
 from agent_delivery_loop.github import GitHubClient, Repo
 from agent_delivery_loop.git_ops import commit_changes, stage_changes
 from agent_delivery_loop.runner import _record_cancelled_run, _safe_changed_paths, execute_plan
 from agent_delivery_loop.store import RunStateError, RunStore, task_key
 from agent_delivery_loop.work_order import parse_work_order
+
+
+class ExplicitClaudeConfigurationTests(unittest.TestCase):
+    def test_run_and_watch_require_the_same_explicit_worker_options(self) -> None:
+        calls = (
+            (agent_run_main, ["--plan-pr", "owner/repo#1", "--work-order-path", "example.json"]),
+            (agent_watch_main, ["--once"]),
+        )
+        for command, command_args in calls:
+            with self.subTest(command=command.__name__):
+                stderr = StringIO()
+                with redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                    command(
+                        command_args
+                        + [
+                            "--model", "glm-5.3",
+                            "--base-url", "https://open.bigmodel.cn/api/anthropic",
+                            "--effort", "max",
+                        ]
+                    )
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("--auth-config", stderr.getvalue())
+                self.assertNotIn("/private/", stderr.getvalue())
+
+    def test_explicit_values_and_child_environment_use_one_frozen_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repo = base / "repository"
+            repo.mkdir()
+            settings_path = base / "claude-settings.json"
+            selected_secret = "fake-selected-credential"
+            settings_path.write_text(
+                json.dumps({"env": {"ANTHROPIC_API_KEY": selected_secret, "UNRELATED": "not-forwarded"}}),
+                encoding="utf-8",
+            )
+            parent_environment = {
+                "PATH": "/snapshot/bin",
+                "HTTPS_PROXY": "https://proxy.invalid/initial",
+                "SSL_CERT_FILE": "/snapshot/cert.pem",
+                "ANTHROPIC_AUTH_TOKEN": "ambient-old-token",
+                "ANTHROPIC_API_KEY": "ambient-other-token",
+                "CLAUDE_CODE_OAUTH_TOKEN": "ambient-oauth-token",
+                "CLAUDE_CODE_EFFORT_LEVEL": "low",
+                "ANTHROPIC_MODEL": "ambient-model",
+                "ANTHROPIC_BASE_URL": "https://ambient.invalid",
+                "REASONING_MODEL": "ambient-reasoning-model",
+            }
+            with patch.dict(os.environ, parent_environment, clear=True), patch(
+                "agent_delivery_loop.claude_worker.shutil.which", return_value="/fake/claude"
+            ):
+                config = ClaudeConfig.from_explicit(
+                    model="glm-5.3",
+                    base_url="https://open.bigmodel.cn/api/anthropic",
+                    effort="max",
+                    auth_config=settings_path,
+                    repo_root=repo,
+                )
+                os.environ["HTTPS_PROXY"] = "https://proxy.invalid/changed"
+                os.environ["ANTHROPIC_AUTH_TOKEN"] = "ambient-new-token"
+                child_environment = config.child_environment(base / "worker-home")
+
+            self.assertEqual(config.model, "glm-5.3")
+            self.assertEqual(config.base_url, "https://open.bigmodel.cn/api/anthropic")
+            self.assertEqual(config.effort, "max")
+            self.assertEqual(config.auth_name, "ANTHROPIC_API_KEY")
+            self.assertEqual(child_environment["ANTHROPIC_API_KEY"], selected_secret)
+            self.assertEqual(child_environment["ANTHROPIC_MODEL"], "glm-5.3")
+            self.assertEqual(child_environment["ANTHROPIC_BASE_URL"], "https://open.bigmodel.cn/api/anthropic")
+            self.assertEqual(child_environment["HTTPS_PROXY"], "https://proxy.invalid/initial")
+            self.assertEqual(child_environment["SSL_CERT_FILE"], "/snapshot/cert.pem")
+            self.assertEqual(child_environment["PATH"], "/snapshot/bin")
+            self.assertEqual(
+                [name for name in AUTH_ENV if name in child_environment],
+                ["ANTHROPIC_API_KEY"],
+            )
+            self.assertNotIn("UNRELATED", child_environment)
+            self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", child_environment)
+            self.assertNotIn("REASONING_MODEL", child_environment)
+            self.assertNotIn(str(settings_path), repr(config))
+            self.assertNotIn(selected_secret, repr(config))
+            self.assertNotIn("snapshot/bin", repr(config))
+
+    def test_settings_fail_closed_for_bad_json_duplicates_missing_or_multiple_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repo = base / "repository"
+            repo.mkdir()
+            settings_path = base / "settings.json"
+            invalid_settings = (
+                "not-json",
+                '{"env":{"ANTHROPIC_API_KEY":"first","ANTHROPIC_API_KEY":"second"}}',
+                json.dumps({"env": {"ANTHROPIC_API_KEY": "fake-one", "ANTHROPIC_AUTH_TOKEN": "fake-two"}}),
+                json.dumps({"env": {"UNRELATED": "fake-token"}}),
+                json.dumps({"env": {"ANTHROPIC_API_KEY": 22}}),
+                json.dumps({"env": {"ANTHROPIC_API_KEY": "  "}}),
+            )
+            with patch("agent_delivery_loop.claude_worker.shutil.which", return_value="/fake/claude"):
+                for raw_settings in invalid_settings:
+                    with self.subTest(settings=raw_settings[:20]):
+                        settings_path.write_text(raw_settings, encoding="utf-8")
+                        with self.assertRaises(AgentDeliveryError) as raised:
+                            ClaudeConfig.from_explicit(
+                                model="glm-5.3",
+                                base_url="https://open.bigmodel.cn/api/anthropic",
+                                effort="max",
+                                auth_config=settings_path,
+                                repo_root=repo,
+                            )
+                        self.assertNotIn(str(settings_path), str(raised.exception))
+                        self.assertNotIn("fake-", str(raised.exception))
+
+    def test_settings_inside_target_repository_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary) / "repository"
+            repo.mkdir()
+            settings_path = repo / "claude-settings.json"
+            settings_path.write_text(json.dumps({"env": {"ANTHROPIC_API_KEY": "fake-token"}}), encoding="utf-8")
+            with patch("agent_delivery_loop.claude_worker.shutil.which", return_value="/fake/claude"):
+                with self.assertRaisesRegex(AgentDeliveryError, "outside the target repository") as raised:
+                    ClaudeConfig.from_explicit(
+                        model="glm-5.3",
+                        base_url="https://open.bigmodel.cn/api/anthropic",
+                        effort="max",
+                        auth_config=settings_path,
+                        repo_root=repo,
+                    )
+            self.assertNotIn(str(settings_path), str(raised.exception))
+
+    def test_effort_capability_check_requires_plain_help_to_advertise_level_without_auth(self) -> None:
+        config = ClaudeConfig(
+            executable="/fake/claude",
+            model="glm-5.3",
+            base_url="https://open.bigmodel.cn/api/anthropic",
+            provider_host="open.bigmodel.cn",
+            auth_name="ANTHROPIC_API_KEY",
+            auth_value="fake-token",
+            effort="max",
+            target_repo_root=Path("/private/repository"),
+        )
+        help_result = SimpleNamespace(
+            returncode=0,
+            stdout="  --effort <level> Effort for the current session (low, medium, high, max)\n",
+            stderr="",
+        )
+        with patch("agent_delivery_loop.claude_worker.subprocess.run", return_value=help_result) as run:
+            _check_effort_support(config, Path("/private/home"))
+        self.assertNotIn(config.auth_name, run.call_args.kwargs["env"])
+
+        unsupported_help = SimpleNamespace(
+            returncode=0,
+            stdout="  --effort <level> Effort for the current session (low, medium, high)\n",
+            stderr="",
+        )
+        with patch("agent_delivery_loop.claude_worker.subprocess.run", return_value=unsupported_help):
+            with self.assertRaisesRegex(AgentDeliveryError, "does not advertise"):
+                _check_effort_support(config, Path("/private/home"))
+
+    def test_worker_argv_contains_effort_and_selected_auth_stays_only_in_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            skill = worktree / "skill.md"
+            skill.write_text("test skill\n", encoding="utf-8")
+            order = parse_work_order((Path(__file__).parents[1] / "examples/work-orders/WO-2026-001.json").read_bytes())
+            config = ClaudeConfig(
+                executable="/fake/claude",
+                model="glm-5.3",
+                base_url="https://open.bigmodel.cn/api/anthropic",
+                provider_host="open.bigmodel.cn",
+                auth_name="ANTHROPIC_API_KEY",
+                auth_value="fake-worker-credential",
+                effort="max",
+                target_repo_root=root,
+                passthrough_environment=(("PATH", "/frozen/path"),),
+            )
+            process = SimpleNamespace(pid=12345, returncode=0, communicate=Mock(return_value=("{}", "")))
+            outcome = WorkerOutcome("requested-session", "complete", [])
+            isolated_home = root / "isolated-home"
+            with (
+                patch("agent_delivery_loop.claude_worker.subprocess.Popen", return_value=process) as popen,
+                patch("agent_delivery_loop.claude_worker._process_group_exists", return_value=False),
+                patch("agent_delivery_loop.claude_worker._validated_outcome", return_value=outcome),
+            ):
+                run_claude(worktree, skill, order, isolated_home, config)
+
+            argv, options = popen.call_args.args[0], popen.call_args.kwargs
+            self.assertEqual(argv[argv.index("--effort") + 1], "max")
+            self.assertNotIn("fake-worker-credential", argv)
+            self.assertEqual(options["env"]["ANTHROPIC_API_KEY"], "fake-worker-credential")
+            self.assertEqual(options["env"]["PATH"], "/frozen/path")
+            self.assertNotIn("ANTHROPIC_AUTH_TOKEN", options["env"])
+            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", options["env"])
 
 
 class WorkerCompletionContractTests(unittest.TestCase):
@@ -45,6 +240,8 @@ class WorkerCompletionContractTests(unittest.TestCase):
             provider_host="api.example.invalid",
             auth_name="ANTHROPIC_AUTH_TOKEN",
             auth_value="test-secret-token-value",
+            effort="max",
+            target_repo_root=Path("/private/worker-repo"),
         )
         self.criteria = ["Create the requested file"]
 
@@ -124,6 +321,33 @@ class WorkerCompletionContractTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.completion_status, "invalid")
+
+    def test_short_selected_credential_is_redacted_from_incomplete_items(self) -> None:
+        config = ClaudeConfig(
+            executable="claude",
+            model="fixed-model",
+            base_url="https://api.example.invalid",
+            provider_host="api.example.invalid",
+            auth_name="ANTHROPIC_API_KEY",
+            auth_value="tiny",
+            effort="max",
+            target_repo_root=Path("/private/worker-repo"),
+        )
+        report = {
+            "status": "blocked",
+            "criteria": [{"criterion": self.criteria[0], "status": "met"}],
+            "incomplete_items": ["credential=tiny"],
+        }
+        with self.assertRaises(WorkerResultError) as raised:
+            _validated_outcome(
+                self._envelope(report),
+                returncode=0,
+                requested_session_id="requested-session",
+                acceptance_criteria=self.criteria,
+                config=config,
+                private_paths=(),
+            )
+        self.assertEqual(raised.exception.incomplete_items, ["credential=[redacted]"])
 
 
 class MergedPullRequestDiscoveryTests(unittest.TestCase):
@@ -297,6 +521,8 @@ class WorkerCancellationTests(unittest.TestCase):
                 provider_host="api.example.invalid",
                 auth_name="ANTHROPIC_AUTH_TOKEN",
                 auth_value="test-secret-token-value",
+                effort="max",
+                target_repo_root=root,
             )
             lifecycle = WorkerLifecycle()
             original_popen = subprocess.Popen
@@ -414,6 +640,8 @@ class WorkerCancellationTests(unittest.TestCase):
                 provider_host="api.example.invalid",
                 auth_name="ANTHROPIC_AUTH_TOKEN",
                 auth_value="test-secret-token-value",
+                effort="max",
+                target_repo_root=root,
             )
             original_write = store.write
             verified_record_order: list[str] = []
@@ -496,8 +724,16 @@ class WorkerSafetyGateTests(unittest.TestCase):
         client = Mock()
         client.authorized_plan.return_value = authorization
         client.content.return_value = skill_bytes
-        config = ClaudeConfig(str(root / "never-executed-claude"), "fixed-model", "https://api.example.invalid",
-                              "api.example.invalid", "ANTHROPIC_AUTH_TOKEN", "test-secret-token-value")
+        config = ClaudeConfig(
+            executable=str(root / "never-executed-claude"),
+            model="fixed-model",
+            base_url="https://api.example.invalid",
+            provider_host="api.example.invalid",
+            auth_name="ANTHROPIC_AUTH_TOKEN",
+            auth_value="test-secret-token-value",
+            effort="max",
+            target_repo_root=root,
+        )
 
         def make_worktree(_repo, destination, _branch, _sha):
             skill = destination / order.skill_ref
@@ -510,7 +746,6 @@ class WorkerSafetyGateTests(unittest.TestCase):
                 ("repository_root", Mock(return_value=root)),
                 ("repository_remote", Mock(return_value=repo)),
                 ("GitHubClient", Mock(return_value=client)),
-                ("ClaudeConfig.from_environment", Mock(return_value=config)),
                 ("preflight", Mock(return_value=(2, 1, 284))),
                 ("ensure_plan_is_on_main", Mock()),
                 ("create_worktree", make_worktree),
@@ -518,7 +753,10 @@ class WorkerSafetyGateTests(unittest.TestCase):
                 stack.enter_context(patch(f"agent_delivery_loop.runner.{name}", replacement))
             commit = stack.enter_context(patch("agent_delivery_loop.runner.commit_changes"))
             yield RunStore(root / "state"), commit, {
-                "repo_path": root, "plan_pr": "owner/repo#123", "work_order_path": order_path,
+                "repo_path": root,
+                "plan_pr": "owner/repo#123",
+                "work_order_path": order_path,
+                "worker_config": config,
             }
 
     def _stored_run(self, store):
@@ -552,6 +790,10 @@ class WorkerSafetyGateTests(unittest.TestCase):
                             execute_plan(**args)
                     record = self._stored_run(store)
                     self.assertEqual(record["worker_status"], "stop_unconfirmed")
+                    self.assertEqual(record["requested_effort"], "max")
+                    self.assertEqual(record["auth_source"], "claude_settings")
+                    self.assertEqual(record["auth_env_name"], "ANTHROPIC_AUTH_TOKEN")
+                    self.assertNotIn("test-secret-token-value", json.dumps(record))
                     self.assertEqual(record["status"], "cleanup_failed")
                     self.assertIsNone(record["finished_at"])
                     self.assertIsNone(children[0].poll())

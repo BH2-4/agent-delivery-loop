@@ -135,14 +135,25 @@ def _record_cleanup_failed_run(
     store.write(task_identity_key, run_id, record)
 
 
+def _validate_worker_config_root(root: Path, config: ClaudeConfig) -> None:
+    try:
+        config_root = config.target_repo_root.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise AgentDeliveryError("Explicit Claude configuration was not bound to this repository.") from None
+    if config_root != root.resolve(strict=True):
+        raise AgentDeliveryError("Explicit Claude configuration was not bound to this repository.")
+
+
 def execute_plan(
     *,
     repo_path: Path,
     plan_pr: str,
     work_order_path: str,
+    worker_config: ClaudeConfig,
     publish: bool = False,
 ) -> dict[str, Any]:
     root = repository_root(repo_path.expanduser().resolve())
+    _validate_worker_config_root(root, worker_config)
     local_repo = repository_remote(root)
     plan_repo, number, plan_url = parse_plan_pr_ref(plan_pr)
     if local_repo.slug.casefold() != plan_repo.slug.casefold():
@@ -154,9 +165,9 @@ def execute_plan(
         if app_config is None:
             raise AgentDeliveryError("App publishing was requested but no verified GitHub App configuration is present.")
         if importlib.util.find_spec("jwt") is None:
-            raise AgentDeliveryError("Install the optional dependency with `pip install -e '.[github-app]'` before publishing.")
+            raise AgentDeliveryError("Install the optional dependency with `pip install '.[github-app]'` before publishing.")
 
-    config = ClaudeConfig.from_environment()
+    config = worker_config
     store = RunStore(default_state_dir())
     store.assert_worker_available()
     run_id = str(uuid.uuid4())
@@ -198,6 +209,9 @@ def execute_plan(
         "worker_profile": order.worker_profile,
         "claude_code_version": ".".join(map(str, version)),
         "requested_model": config.model,
+        "requested_effort": config.effort,
+        "auth_source": config.auth_source,
+        "auth_env_name": config.auth_name,
         "provider_host": config.provider_host,
         "provider_route_sha256": config.provider_route_sha256,
         "session_id": None,
@@ -368,8 +382,14 @@ def execute_plan(
             raise AgentDeliveryError(record["failure"]) from None
 
 
-def watch_once(*, repo_path: Path, publish: bool = False) -> dict[str, Any] | None:
+def watch_once(
+    *,
+    repo_path: Path,
+    worker_config: ClaudeConfig,
+    publish: bool = False,
+) -> dict[str, Any] | None:
     root = repository_root(repo_path.expanduser().resolve())
+    _validate_worker_config_root(root, worker_config)
     repo = repository_remote(root)
     store = RunStore(default_state_dir())
     store.assert_worker_available()
@@ -384,6 +404,7 @@ def watch_once(*, repo_path: Path, publish: bool = False) -> dict[str, Any] | No
             repo_path=root,
             plan_pr=url,
             work_order_path=path,
+            worker_config=worker_config,
             publish=publish,
         )
     return None
