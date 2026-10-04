@@ -2,7 +2,7 @@
   "schema_version": 1,
   "task_id": "WO-RUNBOOK-002",
   "revision": 1,
-  "objective": "仅新增一个文件 docs/evidence-and-reliability-notes.md：用简体中文写给仓库使用者，说明两项新能力——(1) Work Order 的可选 review_evidence 字段如何声明固定版本审查证据（path/ref/purpose 约束、随 Plan PR 授权固定）；(2) 只读 GitHub 查询的分类重试语义与 verify-review 回执复核用途。内容必须与资料包内附带的本轮实现源码和 ADR-0005 一致：具体字段名、命令名（check-evidence、run-review、verify-review、deliver）、重试上限（两次有界重试、限流预算内等待一次）等都要能在所附证据中找到对应。结尾必须明确本轮为限次个人 gh 实验且列出未验证项。",
+  "objective": "仅新增一个文件 docs/evidence-and-reliability-notes.md：用简体中文写给仓库使用者，说明两项新能力——(1) Work Order 的可选 review_evidence 字段如何声明固定版本审查证据（path/ref/purpose 约束、随 Plan PR 授权固定）；(2) 只读 GitHub 查询的分类重试语义与 verify-review 回执复核用途。内容必须与资料包内附带的本轮实现源码和 ADR-0005 一致：具体字段名、命令名（check-evidence、verify-review、deliver）、重试上限（两次有界重试、限流预算内等待一次）等都要能在所附证据中找到对应。结尾必须明确本轮为限次个人 gh 实验且列出未验证项。",
   "out_of_scope": [
     "不修改任何 Python 源码、测试、CI、打包或 .agents/ 下任何文件",
     "不修改既有文档（README、docs/ 全部现有文件）",
