@@ -20,7 +20,7 @@ PYTHONPATH=src .venv/bin/python -m agent_delivery_loop prepare-review \
   --output-dir '/path/outside/repository-and-worker-state/new-review-bundle'
 ```
 
-这不是执行任务的命令，不接受模型认证参数或 `--publish`。使用无 Token 的 GitHub 公共读取，重新确认计划已合并至同仓库 `main`；Work Order 和 Skill 来自固定合并提交，并与运行记录摘要核对。所需提交对象须已在本机存在；缺少时停止，由操作者先同步，不自动 fetch、切换分支或修改 Git 状态。
+这不是执行任务的命令，不接受模型认证参数或 `--publish`。使用无 Token 的 GitHub 公共读取，重新确认计划已合并至同仓库 `main`；Work Order 和 Skill 来自固定合并提交，并与运行记录摘要核对。所需提交对象须已在本机存在；缺少时停止，由操作者先同步，不自动 fetch、切换分支或修改 Git 状态。执行器的全部 Git 读取（提交身份、祖先、文件树、路径与差异）统一按 `core.useReplaceRefs=false` 忽略对象替换：标注的 SHA 始终读取原始对象，不读取 `refs/replace/*` 指向的替换对象；本工具不修改用户全局 Git 配置，也不删除已有 replace refs。
 
 运行记录须是普通非符号链接文件，有明确的执行 / Session 身份，状态为 `local_ready` 或 `delivery_pr_open`，Worker 为 `stopped`、完成状态为 `complete`、无失败及未完成事项。核对原始提交直接基于 Plan merge、原始记录路径与实际原始提交一致，指定候选是原提交或其后代，且与本机 Delivery 分支 head 一致。原始与最终净变更都必须在允许范围内；不改变原运行记录。
 
