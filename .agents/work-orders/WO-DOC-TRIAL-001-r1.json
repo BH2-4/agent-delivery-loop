@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "task_id": "WO-DOC-TRIAL-001",
+  "revision": 1,
+  "objective": "仅新增一个文件 docs/runbook-single-shot-delivery.md：编写一份简明的中文操作手册，说明 agent-delivery deliver 单次编排入口的用途、前置条件（经审查合并的源码构建普通 wheel、安装回执 install-receipt、已合并的 Plan PR、仓库外认证配置）、命令示例、各阶段门禁（安装核验、授权核对、Worker 真实执行与退出码捕获、独立只读审查回执、对应 head 的必需 CI、条件式合并）以及失败关闭语义。不得声称未验证的能力（如无人值守安全、部署、真实异常停止、GitHub App 线路）。",
+  "out_of_scope": [
+    "不修改任何 Python 源码、测试、CI 配置或打包文件",
+    "不修改 .agents/ 下任何授权、策略或历史工单文件",
+    "不修改 docs/history/ 历史档案与既有文档",
+    "不新增 Work Order 或 Skill",
+    "不执行真实 agent-run、审查 CLI 或 GitHub 写操作"
+  ],
+  "acceptance_criteria": [
+    "仓库中存在且仅存在一个新文件 docs/runbook-single-shot-delivery.md",
+    "内容为简体中文，包含四个小节：前置条件、命令示例、阶段门禁、失败与停止语义",
+    "命令示例包含 --install-receipt、--expected-source-sha、--expected-wheel-sha256、--review-model、--auto-merge 等关键参数",
+    "全文不超过 120 行，不包含任何认证值、本机私有路径或未脱敏会话内容",
+    "明确写出该入口的一次性个人 gh 实验边界，不宣称无人值守安全已验证"
+  ],
+  "allowed_paths": ["docs/runbook-single-shot-delivery.md"],
+  "worker_profile": "claude-code-v1",
+  "skill_ref": ".agents/policies/delivery-skill/SKILL.md",
+  "stop_conditions": [
+    "验收需要执行 shell 命令或超出文件读写工具的能力时停止并报告 blocked",
+    "需要修改 allowed_paths 之外任何文件时停止",
+    "对授权内容或门禁语义不确定时停止，不猜测"
+  ],
+  "limits": {"max_turns": 24, "timeout_seconds": 900, "max_budget_usd": 5}
+}
