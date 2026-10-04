@@ -122,6 +122,24 @@ class ReviewCliProcessTests(unittest.TestCase):
         self.assertIn("time limit", str(raised.exception))
         assert_review_processes_settled()
 
+    def test_exit_zero_without_result_blocks_review_but_not_the_gate(self) -> None:
+        silent = self.codex.with_name("silent-codex")
+        silent.write_text(
+            "#!" + sys.executable + "\nimport sys\n"
+            "if '--version' in sys.argv[1:]:\n    print('FakeCodex 1.0')\n    sys.exit(0)\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+        silent.chmod(0o700)
+        with self.assertRaises(AgentDeliveryError) as raised:
+            run_review_process(
+                bundle_dir=self.bundle, timeout_seconds=60, review_model="m",
+                review_effort="high", codex_binary=str(silent),
+            )
+        self.assertIn("review input", str(raised.exception).lower())
+        # The stop was confirmed before the result was read, so later reviews stay allowed.
+        assert_review_processes_settled()
+
     def test_unconfirmed_stop_blocks_later_reviews(self) -> None:
         reviews = self.state / "reviews"
         reviews.mkdir(parents=True)
@@ -166,9 +184,11 @@ class InstallVerificationTests(unittest.TestCase):
     def test_matching_receipt_with_site_packages_origin_passes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             receipt, _, source_sha, wheel_sha = self._environment(Path(temporary))
-            verified = verify_installation(
-                receipt_path=receipt, expected_source_sha=source_sha, expected_wheel_sha256=wheel_sha
-            )
+            inside = Path(temporary) / "venv" / "lib" / "python3" / "site-packages" / "agent_delivery_loop" / "orchestrator.py"
+            with patch("agent_delivery_loop.orchestrator.__file__", str(inside)):
+                verified = verify_installation(
+                    receipt_path=receipt, expected_source_sha=source_sha, expected_wheel_sha256=wheel_sha
+                )
             self.assertTrue(verified["agent_run_entry"].endswith("agent-run"))
 
     def test_mismatched_provenance_and_editable_origin_fail_closed(self) -> None:
@@ -185,6 +205,12 @@ class InstallVerificationTests(unittest.TestCase):
                 verify_installation(
                     receipt_path=receipt, expected_source_sha=source_sha, expected_wheel_sha256=wheel_sha
                 )
+            outside = base / "checkout" / "agent_delivery_loop" / "orchestrator.py"
+            with patch("agent_delivery_loop.orchestrator.__file__", str(outside)):
+                with self.assertRaises(AgentDeliveryError):
+                    verify_installation(
+                        receipt_path=receipt, expected_source_sha=source_sha, expected_wheel_sha256=wheel_sha
+                    )
 
 
 class CiWaitTests(unittest.TestCase):

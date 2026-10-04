@@ -13,6 +13,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .claude_worker import _stop_process_group
 from .errors import AgentDeliveryError
 from .git_ops import git, repository_remote, repository_root
 from .github import GitHubClient, parse_plan_pr_ref
@@ -143,6 +144,9 @@ def verify_installation(*, receipt_path: Path, expected_source_sha: str, expecte
     site_packages = (venv_bin.parent / "lib").resolve()
     if site_packages not in origin.parents:
         raise AgentDeliveryError("Installed package resolves outside the virtual environment; editable installs are not allowed.")
+    # The orchestrator itself must run from that same installed tree, not a source checkout.
+    if site_packages not in Path(__file__).resolve().parents:
+        raise AgentDeliveryError("The orchestrator is not running from the recorded installed environment.")
     return {
         "source_sha": receipt["source_sha"],
         "wheel_sha256": receipt["wheel_sha256"],
@@ -167,12 +171,17 @@ def _spawn_agent_run(
         env.update({"HTTPS_PROXY": proxy, "HTTP_PROXY": proxy, "https_proxy": proxy, "http_proxy": proxy})
     try:
         with open(stdout_path, "wb") as captured:
-            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=captured, stderr=subprocess.STDOUT, env=env)
+            process = subprocess.Popen(
+                argv, stdin=subprocess.DEVNULL, stdout=captured, stderr=subprocess.STDOUT,
+                env=env, start_new_session=True,
+            )
             try:
                 exit_code = process.wait(timeout=timeout_seconds)
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=30)
+                if not _stop_process_group(process):
+                    raise AgentDeliveryError(
+                        "The spawned agent-run exceeded its time limit and its process group could not be confirmed stopped; runs are blocked."
+                    )
                 raise AgentDeliveryError("The spawned agent-run exceeded its time limit and was stopped; no delivery continued.")
     except OSError as exc:
         raise AgentDeliveryError("The installed agent-run entry could not be started.") from exc
@@ -400,7 +409,7 @@ def deliver(
                 raise AgentDeliveryError("Merged PR head is not reachable from the fetched main; verify on GitHub.")
             merge["main_contains_head"] = True
         result = orchestration.finish(
-            "completed" if merged else "awaiting_user_merge",
+            "completed" if merge["merged"] else "awaiting_user_merge",
             delivery_pr={"number": pr_number, "url": pr_url, "head": delivery_commit},
             merge=merge, auto_merge_requested=auto_merge,
         )

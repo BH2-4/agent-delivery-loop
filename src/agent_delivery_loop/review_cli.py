@@ -11,7 +11,7 @@ from typing import Any
 
 from .claude_worker import _process_group_exists, _stop_process_group
 from .errors import AgentDeliveryError
-from .review_handoff import MAX_CONTEXT_BYTES, _read_bytes, _read_json
+from .review_handoff import MAX_CONTEXT_BYTES, _read_bytes, _read_json, _unique_object
 from .store import default_state_dir, now_utc
 
 MIN_REVIEW_TIMEOUT_SECONDS = 60
@@ -59,7 +59,8 @@ def _write_record(path: Path, record: dict[str, Any]) -> None:
 
 
 def _read_record(path: Path) -> dict[str, Any]:
-    record = json.loads(path.read_text(encoding="utf-8"))
+    raw = _read_bytes(path, 64 * 1024)
+    record = json.loads(raw, object_pairs_hook=_unique_object)
     if not isinstance(record, dict) or record.get("review_id") != path.stem:
         raise ValueError("Invalid review record")
     return record
@@ -77,17 +78,16 @@ def assert_review_processes_settled() -> None:
                 raise ReviewGateError(
                     "A prior review CLI process was not confirmed stopped; new reviews are blocked pending manual review."
                 )
-    except (OSError, ValueError) as exc:
-        if isinstance(exc, ReviewGateError):
-            raise
+    except (OSError, ValueError, AgentDeliveryError) as exc:
         raise ReviewGateError("Review process records are unreadable; new reviews are blocked.") from exc
 
 
 def _codex_version(binary: str) -> str:
+    scrubbed = {key: value for key, value in os.environ.items() if key not in CREDENTIAL_ENV_NAMES}
     try:
         result = subprocess.run(
             [binary, "--version"], text=True, capture_output=True, timeout=30, check=False,
-            env={**os.environ}, stdin=subprocess.DEVNULL,
+            env=scrubbed, stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise AgentDeliveryError("The review CLI could not be started for a version probe.") from exc
@@ -209,13 +209,15 @@ def run_review_process(
         record.update({"stop_status": "stop_unconfirmed", "failure": "Review CLI exited but its group may still run.", "finished_at": None})
         _write_record(record_path, record)
         raise AgentDeliveryError("The review CLI exited but its process group may still be running; reviews are blocked.")
+    # Stop confirmation is independent of result readability: persist it first so
+    # an unreadable result cannot leave a permanent start_unconfirmed gate behind.
     record.update({"stop_status": "confirmed_stopped", "exit_code": exit_code, "finished_at": now_utc()})
     if exit_code != 0:
         record["failure"] = "The review CLI returned a non-zero exit code."
         _write_record(record_path, record)
         raise AgentDeliveryError(f"The review CLI exited with code {exit_code}; no review was accepted.")
-    result = _read_json(result_path)
     _write_record(record_path, record)
+    result = _read_json(result_path)
     return {
         "review_id": review_id,
         "codex_version": version,
