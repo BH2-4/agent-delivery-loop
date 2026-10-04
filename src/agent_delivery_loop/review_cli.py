@@ -78,6 +78,8 @@ def assert_review_processes_settled() -> None:
                 raise ReviewGateError(
                     "A prior review CLI process was not confirmed stopped; new reviews are blocked pending manual review."
                 )
+    except ReviewGateError:
+        raise
     except (OSError, ValueError, AgentDeliveryError) as exc:
         raise ReviewGateError("Review process records are unreadable; new reviews are blocked.") from exc
 

@@ -150,8 +150,9 @@ class ReviewCliProcessTests(unittest.TestCase):
             }),
             encoding="utf-8",
         )
-        with self.assertRaises(ReviewGateError):
+        with self.assertRaises(ReviewGateError) as raised:
             assert_review_processes_settled()
+        self.assertIn("not confirmed stopped", str(raised.exception))
 
 
 class InstallVerificationTests(unittest.TestCase):
