@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "task_id": "WO-PILOT-002",
+  "revision": 1,
+  "objective": "新增 docs/manual-delivery-checklist.md，为 GitHub 新手提供可以逐项勾选的人工交付检查清单。参考授权基线中的 README、docs/bootstrap.md、docs/glossary.md 及相关实现，只编写文档，不实际执行清单中的操作；对历史状态说明与当前实现的差异保持谨慎，不把尚未发生的第二次执行写成成功。",
+  "out_of_scope": [
+    "不修改执行器、测试、CI、README、现有文档、ADR、Work Order 或 Delivery Skill。",
+    "不读取、输出、复制或修改认证文件、凭据、CC Switch 配置及私有运行记录。",
+    "不实际执行清单中的命令；不启动其他 Worker，不重跑旧工单，不切换模型、供应商或认证来源。",
+    "不配置 GitHub App、仓库保护、定时器、多模型路由、跨主机领取或自动重试。",
+    "不推送、创建 PR、合并、部署，或宣称无人值守发布、操作系统级隔离和真实预算硬上限已验证。"
+  ],
+  "acceptance_criteria": [
+    "新增 UTF-8 Markdown 文件 docs/manual-delivery-checklist.md，标题为 Agent Delivery Loop 人工交付检查清单；使用 Markdown 复选框，分为开工前、人工启动、执行结束后、交付审查、失败停止五个阶段。",
+    "开工前清单说明：Plan PR 必须已合并到目标 main；执行器查询并绑定该次合并提交中的工单、修订号、内容摘要和 Skill，而不是从未合并 PR、Issue、评论或浮动文件获得授权；确认已安装执行器的来源和安全门禁允许启动，合并计划不会自动开工。",
+    "人工启动清单说明：明确指定 Plan PR、工单路径、模型、端点、effort 和仓库外认证配置；本轮固定使用 Claude Code、glm-5.3、https://open.bigmodel.cn/api/anthropic 和 max，不修改 CC Switch 或继承旧 shell 路由；认证配置不一致时停止，不自动切换或降级；CLI 预算参数不是当前兼容端点下已验证的扣费硬上限。",
+    "说明每次执行创建全新 Claude Session 和独立工作目录，并将运行 ID 与实际 Session ID 关联；不续接用户交互会话，不保存完整 transcript；模型认证只由执行器受控注入子进程环境，Worker 不读取认证文件，不在文档或报告中输出认证值，个人 gh 和 GitHub App 凭据不传给 Worker。",
+    "执行结束后清单区分 Worker 的结构化 complete 与执行器成功：默认本地交付应同时核对 agent-run 退出码为 0、运行记录 status 为 local_ready 且 worker_status 为 stopped、Session 关联及实际提交内容在允许范围内；命令非零时不能仅凭 complete、已有提交或 local_ready 记录宣称本次执行成功。",
+    "交付审查清单依次说明：人工检查本地成果和 head SHA、人工推送并创建 Delivery PR、CI 检查、Codex／Steward 独立语义审查、用户合并；CI 与审查必须对应同一交付版本，CI 不替代语义审查，合并不等于部署。",
+    "失败停止清单要求非零退出、blocked、incomplete、记录异常或停止未确认时先停止继续试运行，保留成果和记录并报告脱敏信息；不得自动重试、改写或删除记录、换状态目录或仅凭年龄及 PID 绕过门禁；需要返修时另行获得明确授权，当前没有自动续修或恢复命令。",
+    "文档不宣称本次工单已经执行成功；明确清单由用户和外部执行器逐步核验，不要求当前 Worker 在受限工具中运行清单命令或证明自己退出后的状态。若有命令示例，使用清晰的待替换参数，不包含实际凭据或本机私有路径；可链接 README、bootstrap 和 glossary。",
+    "交付变更仅包含 docs/manual-delivery-checklist.md，不包含凭据、本机私有路径、完整会话或未经验证的成功声明。"
+  ],
+  "allowed_paths": [
+    "docs/manual-delivery-checklist.md"
+  ],
+  "worker_profile": "claude-code-v1",
+  "skill_ref": ".agents/policies/delivery-skill/SKILL.md",
+  "stop_conditions": [
+    "授权内容不明确，或目标文件已经存在且需要覆盖。",
+    "完成任务需要修改允许范围之外的文件。",
+    "完成文档需要执行清单命令、调用受限工具之外的能力或提升权限。",
+    "完成文档需要读取、输出或提交认证文件、私有运行记录、凭据或其他私密信息。",
+    "无法从授权基线确定关键操作及安全条件；不得猜测或把未验证行为写成保证。"
+  ],
+  "limits": {
+    "max_turns": 12,
+    "timeout_seconds": 900,
+    "max_budget_usd": 3.0
+  }
+}
