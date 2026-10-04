@@ -34,8 +34,215 @@ from agent_delivery_loop.errors import AgentDeliveryError
 from agent_delivery_loop.github import GitHubClient, Repo
 from agent_delivery_loop.git_ops import DeliveryCommit, StagedSnapshot, commit_changes, git, stage_changes
 from agent_delivery_loop.runner import _record_cancelled_run, _safe_changed_paths, execute_plan
+from agent_delivery_loop.review_cli import ReviewGateError, assert_review_processes_settled, run_review_process
+from agent_delivery_loop.orchestrator import _wait_for_ci, verify_installation
 from agent_delivery_loop.store import RunStateError, RunStore, task_key
 from agent_delivery_loop.work_order import parse_work_order
+
+
+FAKE_CODEX_SCRIPT = """#!{python}
+import json, sys, time
+args = sys.argv[1:]
+if "--version" in args:
+    print("FakeCodex 1.0")
+    sys.exit(0)
+if "--sleep-forever" in args:
+    time.sleep(120)
+    sys.exit(0)
+out = args[args.index("--output-last-message") + 1]
+with open(out, "w") as stream:
+    json.dump({{"verdict": "pass"}}, stream)
+sys.exit(int(args[args.index("--exit-with") + 1]) if "--exit-with" in args else 0)
+"""
+
+
+class ReviewCliProcessTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        base = Path(self._temporary.name)
+        self.state = base / "state"
+        self.bundle = base / "bundle"
+        self.bundle.mkdir()
+        for name in ("context.md", "review.schema.json", "prompt.txt"):
+            (self.bundle / name).write_text(f"{name} content\n", encoding="utf-8")
+        (self.bundle / "request.json").write_text(
+            json.dumps({"base_sha": "0" * 40, "head_sha": "1" * 40, "context_sha256": "2" * 64}), encoding="utf-8"
+        )
+        self.codex = base / "fake-codex"
+        self.codex.write_text(FAKE_CODEX_SCRIPT.format(python=sys.executable), encoding="utf-8")
+        self.codex.chmod(0o700)
+        self.patcher = patch.dict(os.environ, {"AGENT_STATE_DIR": str(self.state)})
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+
+    def test_exit_code_is_captured_and_stop_confirmed(self) -> None:
+        result = run_review_process(
+            bundle_dir=self.bundle, timeout_seconds=60, review_model="fake-model",
+            review_effort="high", codex_binary=str(self.codex),
+        )
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["stop_status"], "confirmed_stopped")
+        self.assertEqual(result["result"], {"verdict": "pass"})
+        assert_review_processes_settled()  # gate stays open after a confirmed stop
+
+    def test_nonzero_exit_is_recorded_and_never_accepted(self) -> None:
+        failing = self.codex.with_name("failing-codex")
+        failing.write_text(
+            FAKE_CODEX_SCRIPT.format(python=sys.executable).replace(
+                'sys.exit(int(args[args.index("--exit-with") + 1]) if "--exit-with" in args else 0)',
+                'sys.exit(3)',
+            ),
+            encoding="utf-8",
+        )
+        failing.chmod(0o700)
+        with self.assertRaises(AgentDeliveryError) as raised:
+            run_review_process(
+                bundle_dir=self.bundle, timeout_seconds=60, review_model="m",
+                review_effort="high", codex_binary=str(failing),
+            )
+        self.assertIn("exited with code 3", str(raised.exception))
+        assert_review_processes_settled()
+
+    def test_timeout_kills_process_group_and_confirms_stop(self) -> None:
+        sleeping = self.codex.with_name("sleeping-codex")
+        sleeping.write_text(
+            "#!" + sys.executable + "\nimport sys, time\n"
+            "if '--version' in sys.argv[1:]:\n    print('FakeCodex 1.0')\n    sys.exit(0)\n"
+            "time.sleep(600)\n",
+            encoding="utf-8",
+        )
+        sleeping.chmod(0o700)
+        with patch("agent_delivery_loop.review_cli.MIN_REVIEW_TIMEOUT_SECONDS", 1):
+            with self.assertRaises(AgentDeliveryError) as raised:
+                run_review_process(
+                    bundle_dir=self.bundle, timeout_seconds=1, review_model="m",
+                    review_effort="high", codex_binary=str(sleeping),
+                )
+        self.assertIn("time limit", str(raised.exception))
+        assert_review_processes_settled()
+
+    def test_exit_zero_without_result_blocks_review_but_not_the_gate(self) -> None:
+        silent = self.codex.with_name("silent-codex")
+        silent.write_text(
+            "#!" + sys.executable + "\nimport sys\n"
+            "if '--version' in sys.argv[1:]:\n    print('FakeCodex 1.0')\n    sys.exit(0)\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+        silent.chmod(0o700)
+        with self.assertRaises(AgentDeliveryError) as raised:
+            run_review_process(
+                bundle_dir=self.bundle, timeout_seconds=60, review_model="m",
+                review_effort="high", codex_binary=str(silent),
+            )
+        self.assertIn("review input", str(raised.exception).lower())
+        # The stop was confirmed before the result was read, so later reviews stay allowed.
+        assert_review_processes_settled()
+
+    def test_unconfirmed_stop_blocks_later_reviews(self) -> None:
+        reviews = self.state / "reviews"
+        reviews.mkdir(parents=True)
+        (reviews / "00000000-0000-0000-0000-000000000000.json").write_text(
+            json.dumps({
+                "review_id": "00000000-0000-0000-0000-000000000000",
+                "stop_status": "stop_unconfirmed",
+            }),
+            encoding="utf-8",
+        )
+        with self.assertRaises(ReviewGateError) as raised:
+            assert_review_processes_settled()
+        self.assertIn("not confirmed stopped", str(raised.exception))
+
+
+class InstallVerificationTests(unittest.TestCase):
+    def _environment(self, base: Path) -> tuple[Path, Path, str, str]:
+        import hashlib
+        venv_bin = base / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        for name in ("agent-run", "agent-delivery"):
+            entry = venv_bin / name
+            entry.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            entry.chmod(0o700)
+        fake_python = venv_bin / "python"
+        fake_python.write_text(
+            "#!/bin/sh\necho '" + str(base / "venv" / "lib" / "python3" / "site-packages" / "agent_delivery_loop" / "__init__.py") + "'\n",
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o700)
+        wheel = base / "approved.whl"
+        wheel.write_bytes(b"wheel-bytes")
+        receipt = base / "receipt.json"
+        receipt.write_text(json.dumps({
+            "schema_version": 1,
+            "source_sha": "a" * 40,
+            "wheel_sha256": hashlib.sha256(b"wheel-bytes").hexdigest(),
+            "venv_bin": str(venv_bin),
+            "wheel_path": str(wheel),
+        }), encoding="utf-8")
+        return receipt, venv_bin, "a" * 40, hashlib.sha256(b"wheel-bytes").hexdigest()
+
+    def test_matching_receipt_with_site_packages_origin_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            receipt, _, source_sha, wheel_sha = self._environment(Path(temporary))
+            inside = Path(temporary) / "venv" / "lib" / "python3" / "site-packages" / "agent_delivery_loop" / "orchestrator.py"
+            with patch("agent_delivery_loop.orchestrator.__file__", str(inside)):
+                verified = verify_installation(
+                    receipt_path=receipt, expected_source_sha=source_sha, expected_wheel_sha256=wheel_sha
+                )
+            self.assertTrue(verified["agent_run_entry"].endswith("agent-run"))
+
+    def test_mismatched_provenance_and_editable_origin_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            receipt, _, source_sha, wheel_sha = self._environment(Path(temporary))
+            with self.assertRaises(AgentDeliveryError):
+                verify_installation(
+                    receipt_path=receipt, expected_source_sha="b" * 40, expected_wheel_sha256=wheel_sha
+                )
+            base = Path(temporary)
+            editable = base / "venv" / "bin" / "python"
+            editable.write_text("#!/bin/sh\necho '" + str(base / "src" / "agent_delivery_loop" / "__init__.py") + "'\n", encoding="utf-8")
+            with self.assertRaises(AgentDeliveryError):
+                verify_installation(
+                    receipt_path=receipt, expected_source_sha=source_sha, expected_wheel_sha256=wheel_sha
+                )
+            outside = base / "checkout" / "agent_delivery_loop" / "orchestrator.py"
+            with patch("agent_delivery_loop.orchestrator.__file__", str(outside)):
+                with self.assertRaises(AgentDeliveryError):
+                    verify_installation(
+                        receipt_path=receipt, expected_source_sha=source_sha, expected_wheel_sha256=wheel_sha
+                    )
+
+
+class CiWaitTests(unittest.TestCase):
+    def test_only_full_uppercase_success_with_required_check_passes(self) -> None:
+        head = "c" * 40
+        view = {"headRefOid": head}
+        with patch("agent_delivery_loop.orchestrator._gh_json", side_effect=[
+            [{"name": "validate", "state": "SUCCESS", "link": "https://example.invalid/run/1"}], view,
+        ]):
+            outcome = _wait_for_ci(
+                repo_slug="o/r", pr_number=1, head_sha=head, timeout_seconds=5, proxy=None
+            )
+        self.assertEqual(outcome["checks"], [("validate", "SUCCESS")])
+
+    def test_missing_required_check_or_failure_state_stops(self) -> None:
+        with patch("agent_delivery_loop.orchestrator._gh_json", return_value=[
+            {"name": "other", "state": "SUCCESS"},
+        ]):
+            with self.assertRaises(AgentDeliveryError):
+                _wait_for_ci(repo_slug="o/r", pr_number=1, head_sha="c" * 40, timeout_seconds=5, proxy=None)
+        with patch("agent_delivery_loop.orchestrator._gh_json", return_value=[
+            {"name": "validate", "state": "FAILURE"},
+        ]):
+            with self.assertRaises(AgentDeliveryError):
+                _wait_for_ci(repo_slug="o/r", pr_number=1, head_sha="c" * 40, timeout_seconds=5, proxy=None)
+
+    def test_empty_check_list_never_passes_as_success(self) -> None:
+        with patch("agent_delivery_loop.orchestrator.CI_POLL_SECONDS", 0):
+            with patch("agent_delivery_loop.orchestrator._gh_json", return_value=[]):
+                with self.assertRaises(AgentDeliveryError):
+                    _wait_for_ci(repo_slug="o/r", pr_number=1, head_sha="c" * 40, timeout_seconds=1, proxy=None)
 
 
 class ExplicitClaudeConfigurationTests(unittest.TestCase):

@@ -87,6 +87,23 @@ CI 等待应有时限；检查失败、取消、超时、检查缺失或版本�
 
 ## 5. 本轮试跑与后续推进
 
+本方案的 Python 单次编排入口已实现为 `agent-delivery deliver`（源码入口，需经审查合并、构建普通 wheel 并安装后使用）：
+
+```sh
+agent-delivery deliver \
+  --plan-pr '<merged-plan-pr-url>' \
+  --work-order-path '.agents/work-orders/<task-id>-r<revision>.json' \
+  --model glm-5.3 --base-url https://open.bigmodel.cn/api/anthropic --effort max \
+  --auth-config /path/outside/repository/claude-settings.json \
+  --install-receipt /path/outside/repository/install-receipt.json \
+  --expected-source-sha '<approved-40-hex>' --expected-wheel-sha256 '<approved-64-hex>' \
+  --review-model '<codex-model>' --review-effort '<effort>' \
+  --review-bundle-dir /path/outside/repository/new-bundle \
+  --proxy http://127.0.0.1:12451 --ci-timeout 900 --auto-merge
+```
+
+它按固定顺序串联：安装来源核验（receipt 与获准源码/wheel 摘要一致、入口来自虚拟环境而非 editable 源码）→ 已合并 Plan PR 授权核对 → 以安装的 `agent-run` 入口真实执行 Worker 并捕获退出码 → 运行记录与允许范围复核 → 资料包 + 真实只读审查进程（`run-review` 同一实现）→ 回执核对 → 以一次性个人 `gh` 身份推送并定位/创建 Delivery PR（见 [ADR-0004](adr/0004-one-shot-personal-gh-bootstrap.md)）→ 等待该 head 的必需 CI → `--auto-merge` 时在门禁全绿后合并并核验 `main` 包含关系。每一步失败关闭并写入脱敏编排记录；结果不明不向成功路径推进。`--auto-merge` 未指定时停在 `awaiting_user_merge`。
+
 本轮先使用**本方案文档的普通维护 PR**作为低风险样本，验证：
 
 1. Steward 在当前授权会话中准备并提交文档，固定 base / head。
