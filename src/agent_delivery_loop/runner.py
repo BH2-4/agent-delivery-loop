@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import uuid
+from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -37,7 +38,7 @@ from .store import RunStateError, RunStore, authorization_key, default_state_dir
 from .work_order import WorkOrder, parse_work_order
 
 
-def _validate_paths(worktree: Path, order: WorkOrder, paths: list[str]) -> list[str]:
+def _validate_paths(worktree: Path, order: WorkOrder, paths: Sequence[str]) -> list[str]:
     if not paths:
         raise AgentDeliveryError("Claude Code produced no changes; no Delivery branch was committed.")
     for relative in paths:
@@ -52,7 +53,7 @@ def _validate_paths(worktree: Path, order: WorkOrder, paths: list[str]) -> list[
             raise AgentDeliveryError(f"Changed path resolves outside the isolated worktree: {relative}.") from None
         if candidate.is_symlink():
             raise AgentDeliveryError(f"Changed path is a symlink; first-version delivery rejects it: {relative}.")
-    return paths
+    return list(paths)
 
 
 def _safe_changed_paths(worktree: Path, order: WorkOrder) -> list[str]:
@@ -259,7 +260,7 @@ def execute_plan(
             committed = commit_changes(worktree, order.identity, staged)
             commit_sha = committed.commit_sha
             paths = _validate_paths(worktree, order, committed.paths)
-            record["changed_paths"] = paths
+            record["changed_paths"] = list(paths)
             record["result_summary"] = f"Validated {len(paths)} committed path(s); raw model output and transcript were not retained."
             record["delivery_commit"] = commit_sha
             record["status"] = "local_ready"

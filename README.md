@@ -5,7 +5,7 @@
 **English summary:** A GitHub-native, human-authorized delivery loop for CLI coding agents.
 
 > [!IMPORTANT]
-> 当前仓库已有第一版 Python 本机 CLI 与最小 CI，但尚未完成真实 Work Order 端到端试运行。可以先做受人工监督的试运行：检查本地交付分支后，由人手动推送并创建 Delivery PR。Codex CLI 已修复，可人工启动 Steward 审查。GitHub App、`main` 保护和无人值守发布仍未验证；**不要把本项目视为生产可用系统**。
+> 首次真实 Work Order 已执行，Worker 生成了本地候选提交；最终运行记录校验报错，未创建 Delivery PR，完整交付链路尚未成功。候选成果和运行记录保持原样。Codex CLI 已修复，可人工启动 Steward 审查。GitHub App、`main` 保护和无人值守发布仍未验证；**不要把本项目视为生产可用系统**。
 
 ## 当前实现状态
 
@@ -24,17 +24,17 @@
 
 **尚未验证**
 
-- 此仓库代码尚未执行一张真实 Plan PR Work Order；Claude CLI 与当前 GLM 路由均没有通过本仓库启动真实 Session。允许先由人检查本地交付分支，再手动推送并创建 Delivery PR；这条手动路径也尚未实际试运行。
-- 当前记录的本机 Claude Code CLI 版本为 2.1.288。账号认证有效性、GLM-5.3 路由及 Worker 启动均未验证；没有发起真实模型请求。
+- 首次真实 Plan PR Work Order `WO-PILOT-001-r1` 已运行；Worker 返回结构化 `complete` 并生成本地候选提交，但最终运行记录持久化/回读校验失败，未创建 Delivery PR。该次确已启动 Worker，不代表完整交付链路成功。
+- 本次运行中的 Worker 返回并停止；此证据仅限该次调用。本机 Claude Code CLI 版本记录为 2.1.288；账号与 GLM-5.3 路由的持续可用性尚未验证。
 - GitHub App 尚未配置；只读检查确认 `main` 未启用 branch protection，且仓库没有 ruleset，因此 `--publish` 不可用。默认只创建本地分支；人工可在检查后自行推送并创建 Delivery PR。
 - App 私钥隔离没有进行操作系统级实测；restricted CLI 工具边界不等同于独立 OS 用户或沙箱。
 - Claude Code 管理员托管策略可能仍适用，当前执行环境的托管策略尚未审计。
-- Work Order 的 `max_budget_usd` 会传入 Claude CLI，但经当前自定义模型端点的实际费用上限语义尚未验证；首次试运行前应按软限制看待。
+- Work Order 的 `max_budget_usd` 会传入 Claude CLI，但经当前自定义模型端点的实际费用上限语义尚未验证；应按软限制看待。
 - `agent-watch` 只做手动 `--once`；无跨主机抢单、自动重试或定时器。
 - Codex CLI 安装问题已修复；Codex Steward 审查及自动简报尚无接口实现。Delivery PR 的语义审查需要人工启动 Codex 并报告。
 - 不调用模型的临时子进程与故障注入回归覆盖启动登记取消、创建阶段未返回句柄的异常、停止未确认后的写入失败/再次取消、门禁读写故障，以及 HOME 清理时取消不得继续交付。这些验证只覆盖受控替身与本机状态路径；真实 Claude Code CLI 在当前主机与路由下的启动和停止行为尚未验证。Session ID 会记录，但 transcript 不保存；Session 恢复流程尚未设计。
 
-**后续阶段**：真实试运行、GitHub App/仓库规则验证、Issue 进度讨论、Hermes 手机通知、Steward 自动审查，以及跨主机或自动恢复都需另行讨论和验证。
+**后续阶段**：完成首次 Delivery PR 交付链路、由用户决定如何接纳既有候选成果、GitHub App/仓库规则验证、Issue 进度讨论、Hermes 手机通知、Steward 自动审查，以及跨主机或自动恢复都需另行讨论和验证。
 
 ## 为什么要做这个项目
 
@@ -206,7 +206,7 @@ v0 只支持一个固定配置的 Claude Code Worker。它负责：
 
 `agent-watch --once` 是已实现的单次“门铃”。它按 PR 更新时间降序分页读取关闭 PR，最多检查其中先遇到的 30 个已合并 PR，每页最多 100 个、总计最多 1000 个关闭 PR。若达到 1000 个上限仍未检查满 30 个已合并 PR，命令会报错而不报告“无任务”。
 
-这个排序依据是更新时间，不是合并时间；旧 PR 的后续活动可能改变顺序，因此不能保证覆盖按合并时间最新的 30 个 PR。首次真实 Work Order 试运行应显式指定已合并的 Plan PR 调用 `agent-run`；手动执行路径稳定后，再单独验证 `agent-watch --once`。
+这个排序依据是更新时间，不是合并时间；旧 PR 的后续活动可能改变顺序，因此不能保证覆盖按合并时间最新的 30 个 PR。本次首次真实 Work Order 已由人显式指定合并后的 Plan PR 调用 `agent-run` 执行；后续仍需单独验证 `agent-watch --once` 的发现行为。
 
 - 单次查询 GitHub；
 - 找到已经授权但尚未执行的任务；
@@ -379,7 +379,7 @@ python3 -m venv .venv
 )
 ```
 
-将 `git rev-parse HEAD` 的完整值记录为安装源码 SHA，将 `shasum` 输出记录为 wheel SHA-256。当前已安装的普通 wheel 不随源码目录更新；本轮不替换它。首次真实试运行须使用审查并合并后的构建。
+将 `git rev-parse HEAD` 的完整值记录为安装源码 SHA，将 `shasum` 输出记录为 wheel SHA-256。首次真实 Work Order 使用此前已安装的普通 wheel 执行；当前已安装 wheel 不随源码目录更新，本轮不替换它。后续如用户决定运行新的 Work Order，应使用审查并合并后的构建；本次修复不要求或触发重跑。
 
 ```sh
 agent-delivery validate examples/work-orders/WO-2026-001.json
@@ -391,7 +391,7 @@ agent-run --plan-pr https://github.com/OWNER/REPO/pull/123 \
   --auth-config /path/outside/repository/claude-settings.json
 ```
 
-默认执行成功后只留下本地分支及 worktree，不推送 GitHub。Work Order 需要的检查若超出只读/编辑工具边界，Worker 应停止；CI 在 Delivery PR 阶段执行机械检查，包括源码编译、聚焦回归检查、schema JSON 解析和示例 Work Order 解析。CI 没有扫描每张新 Work Order。首次真实试运行应显式指定已合并的 Plan PR 调用 `agent-run`。后续可用 `agent-watch --once` 手动发现至多一个未处理任务；它按更新时间降序扫描关闭 PR，最多读取 1000 个，并在其中检查先遇到的 30 个已合并 PR。旧 PR 后续活动可能改变排序，因此扫描范围不保证等同于按合并时间最新的 30 个 PR；达到 1000 个上限仍未检查满 30 个已合并 PR 时会报错，不报告“无任务”。
+默认执行成功后只留下本地分支及 worktree，不推送 GitHub。Work Order 需要的检查若超出只读/编辑工具边界，Worker 应停止；CI 在 Delivery PR 阶段执行机械检查，包括源码编译、聚焦回归检查、schema JSON 解析和示例 Work Order 解析。CI 没有扫描每张新 Work Order。首次真实 Work Order 已通过显式指定合并后的 Plan PR 调用 `agent-run` 执行；本次结果及未完成的交付链路见下方当前检查点。后续可用 `agent-watch --once` 手动发现至多一个未处理任务；它按更新时间降序扫描关闭 PR，最多读取 1000 个，并在其中检查先遇到的 30 个已合并 PR。旧 PR 后续活动可能改变排序，因此扫描范围不保证等同于按合并时间最新的 30 个 PR；达到 1000 个上限仍未检查满 30 个已合并 PR 时会报错，不报告“无任务”。
 
 手动运行 `agent-watch --once` 时同样必须提供上述四个配置参数，例如 `agent-watch --once --model glm-5.3 --base-url https://open.bigmodel.cn/api/anthropic --effort max --auth-config /path/outside/repository/claude-settings.json`。执行器完成后先检查命令返回的本地分支和 worktree。确认交付内容后，由人使用自己的 Git/GitHub 身份推送该分支并创建 Delivery PR；个人凭据不传给 Claude Code，也不用于 `--publish`。Codex 审查仍需人工启动。
 
@@ -403,7 +403,11 @@ GitHub App 发布入口通过 `--publish` 显式请求，并要求安装可选�
 
 Worker 已确认退出但没有完成任务时，保留交付成果与脱敏运行记录。返修需要另行明确授权，并由人以新 Session 接入；只有目标、验收条件或允许路径发生变化时才要求新 Work Order 修订。Session ID 只用于关联记录，不能恢复完整对话。当前没有续修命令；`agent-run` 从所授权的 Plan merge commit 创建新工作分支，不会接手原 Delivery 分支。若无法确认 Worker 已停止，则继续遵守上方安全门禁，保留 HOME、worktree 和阻断状态，不尝试返修。
 
-失败时命令返回非零并写入脱敏状态；不要手动改写运行记录或直接重用失败 worktree。先检查状态 JSON 和 worktree，再由人决定是否创建新修订。所有变更仍需独立 Codex 审查和 CI；本仓库不自动批准、合并或部署。首次真实 Work Order 试运行尚未发生。
+失败时命令返回非零并写入脱敏状态；不要手动改写运行记录或直接重用失败 worktree。先检查状态 JSON 和 worktree，再由人决定是否创建新修订。所有变更仍需独立 Codex 审查和 CI；本仓库不自动批准、合并或部署。
+
+### 当前真实 Work Order 检查点（2026-10-04）
+
+首次真实 Work Order `WO-PILOT-001-r1` 已执行。Worker 返回结构化 `complete`，并在本地候选分支 `agent/wo-pilot-001-r1-cb0ef3e5` 生成提交 `b6af9114157a784aa65091868382c1fbd7c1218d`，唯一变更为 `docs/glossary.md`。`agent-run` 在最终运行记录持久化/回读校验时报错并以非零退出；只读检查看到磁盘记录为 `local_ready` / `stopped`。路径集合的 tuple/list 往返类型差异导致该校验失败。没有创建 Delivery PR，因此完整交付链路尚未成功。现有候选成果和运行记录保持原样；本次修复不重跑该 Work Order。
 
 ## 安全边界
 
@@ -431,12 +435,12 @@ GitHub App 的 `Contents:write` 权限也满足合并 PR 接口的权限要求�
 
 ## 仍需讨论的问题
 
-仍未验证或需在首次真实试运行后再讨论：
+仍未验证或需结合本次真实运行结果继续讨论：
 
 - Plan PR 与任务 Issue 的关系；
 - `agent-watch` 使用 `launchd`、cron 还是其他本地服务；
 - GitHub App 的精确权限、私钥隔离与仓库规则；
-- 跨主机领取回执与精确重试规则留到首次真实运行之后；
+- 跨主机领取回执与精确重试规则结合本次真实运行结果讨论；
 - 首轮执行的超时和停止边界；自动失败重试暂不实现；
 - Session 中断后的恢复策略与 CLI 版本提升流程；
 - Worker 允许使用哪些现有 Skills、Hooks 和 MCP；
@@ -450,14 +454,14 @@ GitHub App 的 `Contents:write` 权限也满足合并 PR 接口的权限要求�
 ## 当前状态
 
 ```text
-阶段：最小实现与验证准备
+阶段：首次真实 Work Order 已执行；完整交付链路尚未成功
 可运行代码：Python CLI、Work Order 解析器、单次 watcher 与最小 CI 已有
-生产可用性：不可用；未完成真实 Work Order 试运行
+生产可用性：不可用；尚未完成首次 Delivery PR 交付链路
 默认执行器：Claude Code CLI，限制为文件工具
 许可证：待确定；源码公开但暂未授权复用
 ```
 
-当前允许在审查本次实现后，挑选一张小而真实的 Work Order 做人工监督试运行，并由人推送本地交付分支、创建 Delivery PR。GitHub App 发布、`main` 保护和无人值守流程仍需另行配置与验证。
+首次真实 Work Order 已产生本地候选成果，但最终运行登记失败，尚未创建 Delivery PR。GitHub App 发布、`main` 保护和无人值守流程仍需另行配置与验证。
 
 ## 路线图
 
@@ -475,7 +479,7 @@ GitHub App 的 `Contents:write` 权限也满足合并 PR 接口的权限要求�
 - [x] 接入受限配置的 Claude Code CLI；
 - [x] 加入 Python 编译、聚焦回归、schema 解析与示例 Work Order 解析 CI；
 - [ ] 验证 GitHub App/仓库保护后创建 Delivery PR；
-- [ ] 完成首个真实仓库试运行。
+- [ ] 完成首个真实 Work Order 的 Delivery PR 交付链路。
 
 ### 阶段 2：可靠性与可观测性
 
@@ -525,4 +529,4 @@ The initial version focuses on one problem: turning an already-approved requirem
 
 GitHub is the source of truth. Merging a Plan PR authorizes execution; merging a separate Delivery PR accepts the implementation. Agents cannot approve their own work, merge changes, or deploy automatically.
 
-The project has not yet processed a real Work Order. A supervised manual trial can use a locally created delivery branch that a human reviews, pushes, and turns into a Delivery PR. GitHub App publishing, main branch protection, and unattended delivery remain unverified.
+The first real Work Order has run. The Worker returned structured completion and created a local candidate delivery commit, but final run-record persistence/read-back validation failed; no Delivery PR was created, so the complete delivery chain has not succeeded. The candidate and run record remain unchanged. GitHub App publishing, main branch protection, and unattended delivery remain unverified.

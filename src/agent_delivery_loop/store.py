@@ -167,7 +167,9 @@ class RunStore:
             if self._read_record(path) != record:
                 raise ValueError("Persisted record did not match")
         except (OSError, ValueError, TypeError) as exc:
-            raise RunStateError("Run safety state could not be persisted and verified. Stop trials; no safe end was recorded.") from exc
+            raise RunStateError(
+                "Run safety state could not be persisted or verified. Stop trials and inspect the run record before any further run."
+            ) from exc
         finally:
             # An interrupted update leaves the previous JSON safety gate intact.
             try:
