@@ -34,11 +34,6 @@
   },
   "review_evidence": [
     {
-      "path": "src/agent_delivery_loop/work_order.py",
-      "ref": "a4863cb4a33c5620f240d554792117b66a02079e",
-      "purpose": "review_evidence 字段的解析与校验规则（路径/SHA/条数限制）"
-    },
-    {
       "path": "src/agent_delivery_loop/review_handoff.py",
       "ref": "a4863cb4a33c5620f240d554792117b66a02079e",
       "purpose": "资料包固定版本证据嵌入、check-evidence 就绪检查与 check-review 同快照核对"
