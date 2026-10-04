@@ -2,13 +2,13 @@
 
 ## 当前检查点（2026-10-04）
 
-仓库已有第一版 Python `agent-run`、`agent-watch --once`、Work Order v1、Claude Code 受限启动器和最小 CI。CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并解析示例 Work Order；它不验证每张新 Work Order。首次真实 Work Order `WO-PILOT-001-r1` 已执行：Plan PR #2 合并于 `0038259bad1a23f737c5585f66a49b8c3721289a`，Worker 返回结构化 `complete`，并生成本地候选分支 `agent/wo-pilot-001-r1-cb0ef3e5` 和提交 `b6af9114157a784aa65091868382c1fbd7c1218d`，唯一变更为 `docs/glossary.md`。`agent-run` 在最终运行记录持久化/回读校验时报错并以退出码 2 结束；只读检查发现磁盘记录为 `local_ready` / `stopped`。根因是 Git 提交路径以 tuple 进入运行记录，而 JSON 回读为 list，严格比较失败。没有创建 Delivery PR，完整交付链路尚未成功。现有候选成果与运行记录保持不变，本次不重跑该工单。这次真实执行能证明该次 Worker 返回及本地提交已经发生，但不证明完整交付链路成功。
+仓库已有第一版 Python `agent-run`、`agent-watch --once`、Work Order v1、Claude Code 受限启动器和最小 CI。CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并解析示例 Work Order；它不验证每张新 Work Order。两张真实文档工单已执行并由人接纳到 `main`：第一张原命令退出码 2，候选成果后来通过 [Delivery PR #5](https://github.com/BH2-4/agent-delivery-loop/pull/5) 人工接纳；登记问题由 [PR #4](https://github.com/BH2-4/agent-delivery-loop/pull/4) 修复后，第二张命令退出码 0，再经人工修正文案、独立审查和 CI，通过 [Delivery PR #7](https://github.com/BH2-4/agent-delivery-loop/pull/7) 人工合并。第二张证明一次正常的人工监督文档闭环，不证明零人工返修、可重复性或代码开发任务。
 
-本次真实运行中的 Worker 已启动，返回结构化 `complete` 并停止；这只记录该次执行，不代表账号或路由的持续可用性已验证。本机记录的 Claude Code CLI 版本为 2.1.288。Codex CLI 安装问题已修复，可人工启动 Steward 审查。仓库是公开仓库，但只读查询显示 `main` 当前没有 branch protection，且未配置 GitHub App。因此 `--publish` 不能使用，默认执行只提交本地 Delivery 分支。后续应先审查本次修复，再由用户决定如何接纳既有本地候选成果；本次不重跑任务。GitHub App、`main` 保护与无人值守发布仍未验证。不要把个人 GitHub 凭据传给 Claude Code，也不要用个人 Token 冒充 App 身份。
+两次记录的 Claude Code CLI 版本均为 2.1.289，请求配置为 `glm-5.3`、`https://open.bigmodel.cn/api/anthropic` 和 `max` effort，CC Switch 配置未改动。真实正常返回和清理已观察到；账号及路由的持续可用性、真实 Ctrl+C/超时/启动故障、脱离进程组的后代行为和实际扣费硬上限仍未验证。Codex CLI 安装问题已修复，Steward 审查仍由人启动。此前只读查询未发现 `main` 保护或 App 配置；这些条件和操作系统级凭据隔离仍未验证，本阶段不启用 `--publish`。两次 PR 的推送、创建和合并都由人使用自己的身份完成，不将个人 GitHub 凭据传给 Claude Code，也不使用个人 Token 冒充 App 身份。
 
 下方首轮提示词保留为本次引导交付的原始任务范围和审查依据，不表示需要再次交给另一个 Agent 重做。
 
-本页区分两件容易混淆的事：**引导交付**用于实现执行器；**第一次真实 Work Order 执行**已经发生，但其最终登记报错，完整交付链路（包括 Delivery PR）尚未成功。
+本页区分三件事：**引导交付**实现执行器；**首次工单候选成果的人工接纳**不改变原命令失败的事实；**第二次工单正常执行后的人工交付**已完成一次，但不等于无人值守能力已验证。
 
 ## 当前边界
 
@@ -41,7 +41,9 @@ agent-watch --once \
   --auth-config /path/outside/repository/claude-settings.json
 ```
 
-本次首次真实 Work Order 使用此前已安装的普通 wheel 执行；该 wheel 来自已知源码提交 `f4661f9616201ce38be0468f39ee69d493cc0847`。当前已安装 wheel 不随源码修改更新，本轮不替换它。后续若用户决定运行新的 Work Order，应先审查并合并修复，再从准确完整 SHA 的干净 checkout 重建普通 wheel；记录源码 SHA 与 wheel SHA-256，并按用户确认安装。本次修复不重跑既有 Work Order。
+第一次工单使用 PR #3 合并提交 `f4661f9616201ce38be0468f39ee69d493cc0847` 的普通 wheel。第二次使用重新构建安装的 PR #4 合并提交 `fb5f16590f6e4b7609c0114858967d456d93e525` 的普通 wheel，SHA-256 为 `1ae2bbc8cc03d0ae37e357bf9cd685460bb1d7942a6b930f553d5d6f2fc2afb5`；启动前核对安装包 11 个 Python 模块与 Plan PR #6 授权基线对应模块一致。普通安装已绕开隐藏 editable `.pth` 的入口问题，隐藏位回变的根因仍未知。
+
+`git pull` 不自动更新 wheel，包版本 `0.1.0` 也不能区分不同源码构建。后续执行器源码变化时，须从审查并合并后的准确 SHA 重建、记录源码与 wheel 摘要并按授权安装；仅文档或工单变化时，也应先核对代码一致性。本次只收尾文档，不替换安装、不重跑工单或改写原记录。
 
 ## 运行记录的安全门禁
 
@@ -58,25 +60,35 @@ agent-watch --once \
 
 出现未确认运行、记录损坏或持久化故障，**停止继续试运行**。保留运行记录、临时 HOME 和 worktree，记录运行 ID，由维护者检查进程及其后代和状态存储，取得独立安全确认后再单独制定、审查恢复方案。当前没有恢复/清除命令；不要删除或改写记录、删除旧标记、换用 `AGENT_STATE_DIR` 或重跑任务绕过门禁。本轮不验证或执行人工恢复。
 
-## 两次交付
+## 引导交付与两次真实试运行
 
 ### 0. 引导交付：人工实现最小链路
 
-本次由 Codex 按照下方提示词在普通开发分支实现最小链路，并通过普通 PR 交付。此时还没有用该执行器执行 Work Order，因此这次**不是**系统自我运行的证明，也不应伪装成已自动授权、领取或审查。
+引导阶段由 Codex 按照下方提示词在普通开发分支实现最小链路，并通过 PR #1 交付。当时还没有用该执行器执行 Work Order，因此这次**不是**系统自我运行的证明，也不应伪装成已自动授权、领取或审查。
 
 首轮实现已做到：能根据明确的 Plan PR 引用，读取其合并后的 Work Order，固定任务内容与代码基线，在单机启动一次 Claude Code，并将结果整理为本地分支。`agent-watch` 只提供手动 `--once` 入口。GitHub App 凭据隔离和分支规则未验证，因此执行器不会自动推送；人工检查后可以自行推送本地分支并创建 Delivery PR。推送凭据由人使用，不传给 Claude Code。Codex 审查也由人手动启动。
 
-### 1. 首次真实交付：小而真实的 Work Order
+### 1. 首次真实工单：执行失败，候选成果后来人工接纳
 
-首次真实 Work Order 已按此前流程执行并生成本地候选分支，但最终运行记录校验失败；候选成果尚未被接纳为完整交付。后续完整交付仍需先按维护者审查结论处理该登记问题，再由人检查候选分支，并决定如何手动推送和创建 Delivery PR；本轮修复不重跑 Work Order，也不覆盖既有候选成果或运行记录。Actions 的确定性 CI、Codex 独立审查与用户简报仍是完整链路的一部分。GitHub App 和 `main` 保护仍未验证，不用于这条手动试运行路径。
+`WO-PILOT-001-r1` 的 [Plan PR #2](https://github.com/BH2-4/agent-delivery-loop/pull/2) 合并提交为 `0038259bad1a23f737c5585f66a49b8c3721289a`。Worker 返回 `complete`，原始提交 `b6af9114157a784aa65091868382c1fbd7c1218d` 仅新增 `docs/glossary.md`。但 `agent-run` 因路径 tuple/list 的 JSON 往返类型差异导致严格回读比较失败，以退出码 2 结束；磁盘记录虽为 `local_ready` / `stopped`，原调用仍是失败。
 
-首次真实 Work Order 的执行已经发生；首次完整交付链路尚未成功，因为 `agent-run` 未成功结束，且没有创建 Delivery PR。即使 Delivery PR 尚未合并，也只能称为“候选交付”，不能称为代码已进入 `main`；如果没有部署流程，更不能称为 `deployed`。
+PR #4 修复登记问题后，没有重跑该工单。人工修正两处文案，独立审查绑定 head `5ed83060606fc08c6a0ae4d827535a9b87a34f72`，CI 通过后通过 PR #5 人工接纳到 `main`，合并提交为 `857610db0b7f72d5cc423b98137e3194f8e45d68`。原运行记录未改写，仍指向 Worker 原始提交；后续人工接纳不把原命令变成成功。
+
+### 2. 第二次真实工单：正常执行后的人工交付
+
+`WO-PILOT-002-r1` 的 [Plan PR #6](https://github.com/BH2-4/agent-delivery-loop/pull/6) 合并提交为 `cde271b5180d10738b2955ef9f073668be790e20`。使用修复版安装后，`agent-run` 实际退出码 0，记录为 `local_ready` / `stopped`，验收结果 `complete`、无未完成项；Worker 已确认停止，临时 HOME 已清理。使用新 Session，与首次运行不同。Worker 原始提交 `31be68cad2e24566eae51b82a96a7660379ab8b1` 仅新增 `docs/manual-delivery-checklist.md`。
+
+之后在原交付分支人工修正文案；独立审查绑定最终 head `dbff77762e1a42b68adcb1f7d583f84819bd452c`，[该 head 的 CI](https://github.com/BH2-4/agent-delivery-loop/actions/runs/37190023251) 通过后，由人通过 PR #7 合并到 `main`，合并提交为 `15dc48a881d75e19af7e21451a6d5625d0ad286a`。原运行记录保持不变，仍指向 `31be68c...`；人工返修、审查、推送、PR 创建与合并不是执行器自动完成的操作。
+
+这次观察到一次正常的、人工监督的文档交付闭环。`local_ready` 只表示本地候选已准备；Delivery PR 合并才表示成果进入 `main`，不表示 `deployed`。没有自动部署流程，也未验证无人值守发布、真实异常停止或操作系统级凭据隔离。
+
+### 返修与停止边界仍不变
 
 Worker 已确认退出但任务未完成时，保留成果与脱敏运行记录。返修需要另行明确授权，并由人以新 Session 接入；只有目标、验收条件或允许路径发生变化时才要求新 Work Order 修订。Session ID 不能恢复完整对话。当前没有续修命令；`agent-run` 从所授权的 Plan merge commit 创建新工作分支，不会接手原 Delivery 分支。无法确认 Worker 已停止时，继续保留 HOME、worktree 和安全门禁，不进入返修流程。
 
-## 首轮观察记录
+## 试运行观察记录
 
-只记录能帮助第二轮设计的信息：Work Order 与 Plan PR 链接、实际执行主机和 CLI 版本、开始及结束时间、Delivery PR 链接、CI 结果、Codex 审查结论，以及是否出现重复启动、中断或凭据问题。第一版不制定跨主机领取回执或自动失败重试的精确协议；结合本次首次真实运行结果再讨论。
+本机记录运行 ID、Session ID、授权基线、任务与 Skill 摘要、请求配置、开始及结束时间、Worker 原始提交和安全状态。人工接纳部分在 PR 中记录最终 head、审查结论、CI 及合并提交，不覆盖原始运行记录。公开说明只保留必要的脱敏结果，不提交认证文件、完整会话或本机私有路径。第一版不制定跨主机领取回执或自动失败重试协议；下一阶段依据这两次真实运行另行讨论，不自动扩展功能。
 
 ## 首轮执行提示词（任务原文）
 
