@@ -32,7 +32,7 @@ from agent_delivery_loop.claude_worker import (
 from agent_delivery_loop.cli import _report_error, agent_run_main, agent_watch_main
 from agent_delivery_loop.errors import AgentDeliveryError
 from agent_delivery_loop.github import GitHubClient, Repo
-from agent_delivery_loop.git_ops import commit_changes, stage_changes
+from agent_delivery_loop.git_ops import DeliveryCommit, StagedSnapshot, commit_changes, stage_changes
 from agent_delivery_loop.runner import _record_cancelled_run, _safe_changed_paths, execute_plan
 from agent_delivery_loop.store import RunStateError, RunStore, task_key
 from agent_delivery_loop.work_order import parse_work_order
@@ -547,6 +547,122 @@ class DeliveredPathTests(unittest.TestCase):
             ).stdout.strip()
             self.assertEqual(committed, staged.tree_sha)
             self.assertEqual((repo / "docs/delivered.md").read_text(encoding="utf-8"), "delivered\n")
+
+
+class RunRecordRoundTripTests(unittest.TestCase):
+    def test_completed_delivery_paths_roundtrip_through_run_store(self) -> None:
+        order_path = ".agents/work-orders/WO-TEST-001-r1.json"
+        skill_path = ".agents/policies/delivery/SKILL.md"
+        skill_bytes = b"Use the local file tools only.\n"
+        order_bytes = json.dumps(
+            {
+                "schema_version": 1,
+                "task_id": "WO-TEST-001",
+                "revision": 1,
+                "objective": "Create one documentation file.",
+                "out_of_scope": [],
+                "acceptance_criteria": ["Create docs/delivered.md"],
+                "allowed_paths": ["docs/**"],
+                "worker_profile": "claude-code-v1",
+                "skill_ref": skill_path,
+                "stop_conditions": ["Stop when the file is created."],
+                "limits": {"max_turns": 1, "timeout_seconds": 60, "max_budget_usd": 1},
+            }
+        ).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repo = base / "repository"
+            state_dir = base / "state"
+            repo.mkdir()
+
+            def git(*args: str) -> str:
+                result = subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return result.stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.name", "Regression Test")
+            git("config", "user.email", "regression@example.invalid")
+            git("remote", "add", "origin", "https://github.com/BH2-4/agent-delivery-loop.git")
+            skill_file = repo / skill_path
+            skill_file.parent.mkdir(parents=True)
+            skill_file.write_bytes(skill_bytes)
+            git("add", ".")
+            git("commit", "-m", "test base")
+            merge_sha = git("rev-parse", "HEAD")
+
+            github = Mock()
+            github.authorized_plan.return_value = SimpleNamespace(
+                merge_sha=merge_sha,
+                order_path=order_path,
+                order_bytes=order_bytes,
+            )
+            github.content.return_value = skill_bytes
+            worker_config = ClaudeConfig(
+                executable="/not-started/claude",
+                model="test-model",
+                base_url="https://api.example.invalid",
+                provider_host="api.example.invalid",
+                auth_name="ANTHROPIC_API_KEY",
+                auth_value="test-only-credential",
+                effort="high",
+                target_repo_root=repo,
+            )
+            commits: list[DeliveryCommit] = []
+
+            def record_commit(worktree: Path, task_identity: str, staged: StagedSnapshot) -> DeliveryCommit:
+                committed = commit_changes(worktree, task_identity, staged)
+                commits.append(committed)
+                return committed
+
+            def fake_worker(
+                worktree: Path,
+                _skill: Path,
+                _order: object,
+                _runtime_home: Path,
+                _config: ClaudeConfig,
+                *,
+                lifecycle: WorkerLifecycle,
+            ) -> WorkerOutcome:
+                (worktree / "docs").mkdir()
+                (worktree / "docs/delivered.md").write_text("candidate\n", encoding="utf-8")
+                lifecycle.status = "stopped"
+                lifecycle.session_id = "test-session"
+                return WorkerOutcome("test-session", "complete", [])
+
+            with (
+                patch("agent_delivery_loop.runner.default_state_dir", return_value=state_dir),
+                patch("agent_delivery_loop.runner.GitHubClient", return_value=github),
+                patch("agent_delivery_loop.runner.ensure_plan_is_on_main"),
+                patch("agent_delivery_loop.runner.preflight", return_value=(2, 1, 288)),
+                patch("agent_delivery_loop.runner.run_claude", side_effect=fake_worker),
+                patch("agent_delivery_loop.runner.commit_changes", side_effect=record_commit),
+            ):
+                result = execute_plan(
+                    repo_path=repo,
+                    plan_pr="https://github.com/BH2-4/agent-delivery-loop/pull/2",
+                    work_order_path=order_path,
+                    worker_config=worker_config,
+                )
+
+            self.assertEqual(len(commits), 1)
+            self.assertIsInstance(commits[0], DeliveryCommit)
+            self.assertEqual(commits[0].paths, ("docs/delivered.md",))
+            self.assertIs(type(result["changed_paths"]), list)
+            self.assertEqual(result["changed_paths"], ["docs/delivered.md"])
+
+            store = RunStore(state_dir)
+            key = task_key("BH2-4/agent-delivery-loop", "WO-TEST-001", 1)
+            persisted = store._read_record(store.record_path(key, result["run_id"]))
+            self.assertEqual(persisted["changed_paths"], ["docs/delivered.md"])
+            self.assertEqual(persisted["status"], "local_ready")
+            self.assertEqual(persisted["worker_status"], "stopped")
+            store.assert_worker_available()
 
 
 class WorkerCancellationTests(unittest.TestCase):

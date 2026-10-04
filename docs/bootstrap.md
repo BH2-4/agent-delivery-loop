@@ -1,14 +1,14 @@
 # 从设计稿走到第一次真实交付
 
-## 当前检查点（2026-10-03）
+## 当前检查点（2026-10-04）
 
-仓库已有第一版 Python `agent-run`、`agent-watch --once`、Work Order v1、Claude Code 受限启动器和最小 CI。CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并解析示例 Work Order；它不验证每张新 Work Order。当前变更将 Worker 安全门禁移到启动前的持久化运行记录，保留进程组停止与最终提交快照核对。临时子进程及故障注入覆盖创建阶段未返回句柄的异常、停止未确认后的记录更新失败/再次取消、门禁读写错误和清理期间取消；已有临时 Git 回归核对提交快照。这些仅证明受控替身、状态机制与本地 Git 路径，不证明真实 Claude Code CLI 的端到端执行或停止行为。**尚未启动真实 Work Order**。
+仓库已有第一版 Python `agent-run`、`agent-watch --once`、Work Order v1、Claude Code 受限启动器和最小 CI。CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并解析示例 Work Order；它不验证每张新 Work Order。首次真实 Work Order `WO-PILOT-001-r1` 已执行：Plan PR #2 合并于 `0038259bad1a23f737c5585f66a49b8c3721289a`，Worker 返回结构化 `complete`，并生成本地候选分支 `agent/wo-pilot-001-r1-cb0ef3e5` 和提交 `b6af9114157a784aa65091868382c1fbd7c1218d`，唯一变更为 `docs/glossary.md`。`agent-run` 在最终运行记录持久化/回读校验时报错并以退出码 2 结束；只读检查发现磁盘记录为 `local_ready` / `stopped`。根因是 Git 提交路径以 tuple 进入运行记录，而 JSON 回读为 list，严格比较失败。没有创建 Delivery PR，完整交付链路尚未成功。现有候选成果与运行记录保持不变，本次不重跑该工单。这次真实执行能证明该次 Worker 返回及本地提交已经发生，但不证明完整交付链路成功。
 
-当前记录的本机 Claude Code CLI 版本为 2.1.288。账号认证有效性、GLM-5.3 路由和 Worker 启动均未验证。Codex CLI 安装问题已修复，可人工启动 Steward 审查。仓库是公开仓库，但只读查询显示 `main` 当前没有 branch protection，且未配置 GitHub App。因此 `--publish` 不能使用，默认执行只提交本地 Delivery 分支。当前允许先做人工监督试运行：由人检查本地分支后，手动推送并创建 Delivery PR；GitHub App、`main` 保护与无人值守发布仍未验证。不要把个人 GitHub 凭据传给 Claude Code，也不要用个人 Token 冒充 App 身份。
+本次真实运行中的 Worker 已启动，返回结构化 `complete` 并停止；这只记录该次执行，不代表账号或路由的持续可用性已验证。本机记录的 Claude Code CLI 版本为 2.1.288。Codex CLI 安装问题已修复，可人工启动 Steward 审查。仓库是公开仓库，但只读查询显示 `main` 当前没有 branch protection，且未配置 GitHub App。因此 `--publish` 不能使用，默认执行只提交本地 Delivery 分支。后续应先审查本次修复，再由用户决定如何接纳既有本地候选成果；本次不重跑任务。GitHub App、`main` 保护与无人值守发布仍未验证。不要把个人 GitHub 凭据传给 Claude Code，也不要用个人 Token 冒充 App 身份。
 
 下方首轮提示词保留为本次引导交付的原始任务范围和审查依据，不表示需要再次交给另一个 Agent 重做。
 
-本页区分两件容易混淆的事：**引导交付**用于实现执行器；**第一次真实交付**才用实现好的执行器处理一张已合并的 Work Order。前者已经完成代码阶段，后者仍未发生。
+本页区分两件容易混淆的事：**引导交付**用于实现执行器；**第一次真实 Work Order 执行**已经发生，但其最终登记报错，完整交付链路（包括 Delivery PR）尚未成功。
 
 ## 当前边界
 
@@ -68,9 +68,9 @@ agent-watch --once \
 
 ### 1. 首次真实交付：小而真实的 Work Order
 
-引导交付审查完成后，再选一项范围小、验收明确、不会触及生产部署的仓库改动。用户合并其 Plan PR；首次真实试运行由人显式指定这个已合并 Plan PR 调用 `agent-run`，执行器启动 Claude Code 并生成本地交付分支。人检查分支后使用自己的 GitHub 身份手动推送并创建 Delivery PR；Actions 给出确定性 CI 结果，Codex 独立审查并给用户简报。手动路径稳定后，再单独验证 `agent-watch --once` 的发现行为。GitHub App 和 `main` 保护仍未验证，不用于这条手动试运行路径。
+首次真实 Work Order 已按此前流程执行并生成本地候选分支，但最终运行记录校验失败；候选成果尚未被接纳为完整交付。后续完整交付仍需先按维护者审查结论处理该登记问题，再由人检查候选分支，并决定如何手动推送和创建 Delivery PR；本轮修复不重跑 Work Order，也不覆盖既有候选成果或运行记录。Actions 的确定性 CI、Codex 独立审查与用户简报仍是完整链路的一部分。GitHub App 和 `main` 保护仍未验证，不用于这条手动试运行路径。
 
-只有真实 Work Order 确实经过这些步骤，才能称为“首次真实试运行”；截至当前，这次试运行尚未发生。如果 Delivery PR 尚未合并，只能称为“候选交付完成”，不能称为代码已进入 `main`；如果没有部署流程，更不能称为 `deployed`。
+首次真实 Work Order 的执行已经发生；首次完整交付链路尚未成功，因为 `agent-run` 未成功结束，且没有创建 Delivery PR。即使 Delivery PR 尚未合并，也只能称为“候选交付”，不能称为代码已进入 `main`；如果没有部署流程，更不能称为 `deployed`。
 
 Worker 已确认退出但任务未完成时，保留成果与脱敏运行记录。返修需要另行明确授权，并由人以新 Session 接入；只有目标、验收条件或允许路径发生变化时才要求新 Work Order 修订。Session ID 不能恢复完整对话。当前没有续修命令；`agent-run` 从所授权的 Plan merge commit 创建新工作分支，不会接手原 Delivery 分支。无法确认 Worker 已停止时，继续保留 HOME、worktree 和安全门禁，不进入返修流程。
 
