@@ -41,7 +41,7 @@ agent-watch --once \
   --auth-config /path/outside/repository/claude-settings.json
 ```
 
-审查并合并后，使用该准确完整 SHA 的干净 checkout 重建普通 wheel。用 `git rev-parse HEAD` 记录完整源码 SHA，用 wheel 文件的 `shasum -a 256` 输出记录 wheel SHA-256；构建失败时停止，不继续安装。当前已安装的普通 wheel 不随源码修改更新；本轮不替换它。首次真实试运行须安装审查合并后的构建。
+本次首次真实 Work Order 使用此前已安装的普通 wheel 执行；该 wheel 来自已知源码提交 `f4661f9616201ce38be0468f39ee69d493cc0847`。当前已安装 wheel 不随源码修改更新，本轮不替换它。后续若用户决定运行新的 Work Order，应先审查并合并修复，再从准确完整 SHA 的干净 checkout 重建普通 wheel；记录源码 SHA 与 wheel SHA-256，并按用户确认安装。本次修复不重跑既有 Work Order。
 
 ## 运行记录的安全门禁
 

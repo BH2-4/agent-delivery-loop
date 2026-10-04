@@ -206,7 +206,7 @@ v0 只支持一个固定配置的 Claude Code Worker。它负责：
 
 `agent-watch --once` 是已实现的单次“门铃”。它按 PR 更新时间降序分页读取关闭 PR，最多检查其中先遇到的 30 个已合并 PR，每页最多 100 个、总计最多 1000 个关闭 PR。若达到 1000 个上限仍未检查满 30 个已合并 PR，命令会报错而不报告“无任务”。
 
-这个排序依据是更新时间，不是合并时间；旧 PR 的后续活动可能改变顺序，因此不能保证覆盖按合并时间最新的 30 个 PR。首次真实 Work Order 试运行应显式指定已合并的 Plan PR 调用 `agent-run`；手动执行路径稳定后，再单独验证 `agent-watch --once`。
+这个排序依据是更新时间，不是合并时间；旧 PR 的后续活动可能改变顺序，因此不能保证覆盖按合并时间最新的 30 个 PR。本次首次真实 Work Order 已由人显式指定合并后的 Plan PR 调用 `agent-run` 执行；后续仍需单独验证 `agent-watch --once` 的发现行为。
 
 - 单次查询 GitHub；
 - 找到已经授权但尚未执行的任务；
@@ -379,7 +379,7 @@ python3 -m venv .venv
 )
 ```
 
-将 `git rev-parse HEAD` 的完整值记录为安装源码 SHA，将 `shasum` 输出记录为 wheel SHA-256。当前已安装的普通 wheel 不随源码目录更新；本轮不替换它。首次真实试运行须使用审查并合并后的构建。
+将 `git rev-parse HEAD` 的完整值记录为安装源码 SHA，将 `shasum` 输出记录为 wheel SHA-256。首次真实 Work Order 使用此前已安装的普通 wheel 执行；当前已安装 wheel 不随源码目录更新，本轮不替换它。后续如用户决定运行新的 Work Order，应使用审查并合并后的构建；本次修复不要求或触发重跑。
 
 ```sh
 agent-delivery validate examples/work-orders/WO-2026-001.json
@@ -435,12 +435,12 @@ GitHub App 的 `Contents:write` 权限也满足合并 PR 接口的权限要求�
 
 ## 仍需讨论的问题
 
-仍未验证或需在首次真实试运行后再讨论：
+仍未验证或需结合本次真实运行结果继续讨论：
 
 - Plan PR 与任务 Issue 的关系；
 - `agent-watch` 使用 `launchd`、cron 还是其他本地服务；
 - GitHub App 的精确权限、私钥隔离与仓库规则；
-- 跨主机领取回执与精确重试规则留到首次真实运行之后；
+- 跨主机领取回执与精确重试规则结合本次真实运行结果讨论；
 - 首轮执行的超时和停止边界；自动失败重试暂不实现；
 - Session 中断后的恢复策略与 CLI 版本提升流程；
 - Worker 允许使用哪些现有 Skills、Hooks 和 MCP；
