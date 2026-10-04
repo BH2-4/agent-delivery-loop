@@ -23,7 +23,7 @@ from .review_cli import (
     MIN_REVIEW_TIMEOUT_SECONDS,
     run_review_process,
 )
-from .review_handoff import check_review, prepare_review
+from .review_handoff import check_review, prepare_review, resolve_review_evidence
 from .runner import _delivery_body  # reuse the authorized Delivery PR body format
 from .store import default_state_dir, now_utc, task_key
 from .work_order import parse_work_order
@@ -247,6 +247,10 @@ def deliver(
         orchestration.save(stage="install_verified", install=install)
 
         if proxy:
+            # An inherited ALL_PROXY can override scheme-specific settings in some
+            # HTTP stacks; when an explicit proxy is given it must be the only route.
+            for legacy in ("ALL_PROXY", "all_proxy"):
+                os.environ.pop(legacy, None)
             os.environ.update({"HTTPS_PROXY": proxy, "HTTP_PROXY": proxy, "https_proxy": proxy, "http_proxy": proxy})
         root = repository_root(repo_path.expanduser().resolve())
         local_repo = repository_remote(root)
@@ -256,12 +260,20 @@ def deliver(
         client = GitHubClient(plan_repo)
         authorization = client.authorized_plan(number, work_order_path, plan_url)
         order = parse_work_order(authorization.order_bytes, expected_path=authorization.order_path)
+        # Deterministic evidence readiness BEFORE any Worker spend: pinned refs must
+        # resolve locally so the review packet can carry the acceptance basis.
+        git(root, "fetch", "--no-tags", plan_repo.https_url, "+refs/heads/main:refs/remotes/adl-main")
+        evidence_ready = resolve_review_evidence(root, order.review_evidence)
         orchestration.save(
             stage="authorization_verified",
             authorization={
                 "plan_pr": plan_url, "plan_merge_sha": authorization.merge_sha,
                 "work_order_path": authorization.order_path, "work_order_sha256": order.sha256,
                 "task_id": order.task_id, "revision": order.revision,
+            },
+            evidence_ready={
+                "entries": [{key: item[key] for key in ("path", "ref", "sha256")} for item in evidence_ready],
+                "total_evidence_bytes": sum(item["bytes"] for item in evidence_ready),
             },
         )
 
@@ -308,6 +320,15 @@ def deliver(
             bundle_dir=review_bundle_dir, timeout_seconds=review_timeout_seconds,
             review_model=review_model, review_effort=review_effort, proxy=proxy,
         )
+        # Persist the captured receipt linkage BEFORE the network-bound re-verification,
+        # so a transient check failure never forces a redundant model re-run.
+        review_linkage = {
+            "review_id": review_run["review_id"], "codex_version": review_run["codex_version"],
+            "exit_code": review_run["exit_code"], "stop_status": review_run["stop_status"],
+            "result_path": review_run["result_path"],
+            "context_sha256": bundle.get("context_sha256"),
+        }
+        orchestration.save(stage="review_completed_pending_check", review=review_linkage)
         checked = check_review(
             bundle_dir=review_bundle_dir, result_path=Path(review_run["result_path"]),
             review_exit_code=review_run["exit_code"],
@@ -319,12 +340,7 @@ def deliver(
             raise AgentDeliveryError("The independent review did not pass; nothing was published.")
         orchestration.save(
             stage="review_passed",
-            review={
-                "review_id": review_run["review_id"], "codex_version": review_run["codex_version"],
-                "exit_code": review_run["exit_code"], "stop_status": review_run["stop_status"],
-                "context_sha256": bundle.get("context_sha256"),
-                "unverified_count": checked.get("unverified_count"),
-            },
+            review={**review_linkage, "unverified_count": checked.get("unverified_count")},
         )
 
         # Stage 4: publish with the one-shot personal gh identity (never passed to the Worker).

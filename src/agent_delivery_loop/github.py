@@ -7,6 +7,7 @@ import binascii
 import hashlib
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,6 +23,27 @@ MAX_CLOSED_PR_PAGES = 10
 PLAN_URL_RE = re.compile(
     r"^https://github\.com/(?P<owner>[A-Za-z0-9-]+)/(?P<repo>[A-Za-z0-9_.-]+)/pull/(?P<number>[1-9][0-9]*)/?$"
 )
+# Read-only reliability bounds: at most two bounded retries per request.
+READ_RETRY_DELAYS_SECONDS = (2.0, 8.0)
+READ_ATTEMPT_TIMEOUT_SECONDS = 30
+READ_TOTAL_BUDGET_SECONDS = 120
+_CONTENT_CACHE: dict[tuple[str, str, str], tuple[str, bytes]] = {}
+_CONTENT_CACHE_LIMIT = 32
+
+
+class GitHubReadError(AgentDeliveryError):
+    """A read-only query stayed failed after bounded, classified retries."""
+
+
+def _rate_reset_remaining(headers: Any) -> int | None:
+    if headers is None or not hasattr(headers, "get"):
+        return None
+    try:
+        if str(headers.get("X-RateLimit-Remaining")) == "0":
+            return int(headers.get("X-RateLimit-Reset", "0"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,13 +107,49 @@ class GitHubClient:
                 **({"Content-Type": "application/json"} if data is not None else {}),
             },
         )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                body = response.read()
-        except urllib.error.HTTPError as exc:
-            raise AgentDeliveryError(f"GitHub API request failed with HTTP {exc.code}.") from None
-        except (urllib.error.URLError, TimeoutError) as exc:
-            raise AgentDeliveryError("Could not reach the GitHub API.") from exc
+        deadline = time.monotonic() + READ_TOTAL_BUDGET_SECONDS
+        last_failure = "unknown"
+        for attempt in range(len(READ_RETRY_DELAYS_SECONDS) + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=READ_ATTEMPT_TIMEOUT_SECONDS) as response:
+                    body = response.read()
+                break
+            except urllib.error.HTTPError as exc:
+                try:
+                    raw_body = exc.read()
+                except OSError:
+                    raw_body = b""
+                body_text = raw_body[:2000].decode("utf-8", "replace")
+                rate_reset = _rate_reset_remaining(exc.headers)
+                if exc.code in (401, 403) and rate_reset is not None:
+                    wait = rate_reset - int(time.time()) + 1
+                    if 0 < wait <= deadline - time.monotonic() and attempt < len(READ_RETRY_DELAYS_SECONDS):
+                        time.sleep(wait)
+                        last_failure = f"rate limited (resets in ~{wait}s); waited once"
+                        continue
+                    raise GitHubReadError(f"GitHub rate limit persists beyond the bounded wait (HTTP {exc.code}).") from None
+                if exc.code in (429,) or (exc.code == 403 and "rate limit" in body_text.lower()):
+                    if attempt < len(READ_RETRY_DELAYS_SECONDS) and time.monotonic() < deadline:
+                        time.sleep(READ_RETRY_DELAYS_SECONDS[attempt])
+                        last_failure = f"rate limited (HTTP {exc.code})"
+                        continue
+                    raise GitHubReadError(f"GitHub rate limiting persisted after bounded retries (HTTP {exc.code}).") from None
+                if exc.code >= 500 and attempt < len(READ_RETRY_DELAYS_SECONDS) and time.monotonic() < deadline:
+                    time.sleep(READ_RETRY_DELAYS_SECONDS[attempt])
+                    last_failure = f"server error (HTTP {exc.code})"
+                    continue
+                # 404, 401/403 without rate-limit markers, 4xx: real errors, never retried.
+                raise GitHubReadError(f"GitHub API request failed with HTTP {exc.code}.") from None
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                last_failure = f"network ({type(exc).__name__})"
+                if attempt < len(READ_RETRY_DELAYS_SECONDS) and time.monotonic() < deadline:
+                    time.sleep(READ_RETRY_DELAYS_SECONDS[attempt])
+                    continue
+                raise GitHubReadError(
+                    f"GitHub API could not be reached after bounded retries; last failure: {last_failure}."
+                ) from exc
+        else:  # pragma: no cover - loop always breaks or raises
+            raise GitHubReadError("GitHub API read did not complete.")
         if not body:
             return None
         try:
@@ -122,23 +180,32 @@ class GitHubClient:
     def content(self, path: str, ref: str) -> bytes:
         encoded_path = urllib.parse.quote(path, safe="/")
         encoded_ref = urllib.parse.quote(ref, safe="")
-        result = self.request(
-            "GET",
-            f"/repos/{self.repo.slug}/contents/{encoded_path}?ref={encoded_ref}",
-        )
-        if not isinstance(result, dict) or result.get("type") != "file" or result.get("encoding") != "base64":
-            raise AgentDeliveryError(f"Authorized file is missing or is not a regular file: {path}.")
-        content = result.get("content")
-        blob_sha = result.get("sha")
-        if not isinstance(content, str) or not isinstance(blob_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", blob_sha):
-            raise AgentDeliveryError("GitHub file response did not contain file content.")
-        try:
-            decoded = base64.b64decode("".join(content.split()), validate=True)
-        except (ValueError, binascii.Error) as exc:
-            raise AgentDeliveryError("GitHub file content could not be decoded.") from exc
-        git_blob = hashlib.sha1(f"blob {len(decoded)}\0".encode() + decoded).hexdigest()
-        if git_blob != blob_sha:
-            raise AgentDeliveryError("GitHub file content did not match the blob SHA returned by GitHub.")
+        # Fixed-ref file content is immutable; a verified (path, ref) result may be reused.
+        cache_key = (self.repo.slug.casefold(), path, ref)
+        cached = _CONTENT_CACHE.get(cache_key)
+        if cached is not None:
+            blob_sha, decoded = cached
+        else:
+            result = self.request(
+                "GET",
+                f"/repos/{self.repo.slug}/contents/{encoded_path}?ref={encoded_ref}",
+            )
+            if not isinstance(result, dict) or result.get("type") != "file" or result.get("encoding") != "base64":
+                raise AgentDeliveryError(f"Authorized file is missing or is not a regular file: {path}.")
+            content = result.get("content")
+            blob_sha = result.get("sha")
+            if not isinstance(content, str) or not isinstance(blob_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", blob_sha):
+                raise AgentDeliveryError("GitHub file response did not contain file content.")
+            try:
+                decoded = base64.b64decode("".join(content.split()), validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise AgentDeliveryError("GitHub file content could not be decoded.") from exc
+            git_blob = hashlib.sha1(f"blob {len(decoded)}\0".encode() + decoded).hexdigest()
+            if git_blob != blob_sha:
+                raise AgentDeliveryError("GitHub file content did not match the blob SHA returned by GitHub.")
+            if len(_CONTENT_CACHE) >= _CONTENT_CACHE_LIMIT:
+                _CONTENT_CACHE.clear()
+            _CONTENT_CACHE[cache_key] = (blob_sha, decoded)
         return decoded
 
     def authorized_plan(self, number: int, order_path: str, url: str) -> PlanAuthorization:

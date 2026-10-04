@@ -230,6 +230,24 @@ def run_review_process(
     }
 
 
+def load_verified_review_record(review_record: Path) -> dict[str, Any]:
+    """Load a harness-captured review record; only a confirmed-stopped exit-0 review may be re-verified."""
+    record = _read_record(review_record.expanduser().resolve())
+    if (
+        record.get("mode") != "read_only_review_cli"
+        or record.get("stop_status") != "confirmed_stopped"
+        or not isinstance(record.get("exit_code"), int) or isinstance(record.get("exit_code"), bool)
+        or record["exit_code"] != 0
+    ):
+        raise AgentDeliveryError(
+            "The recorded review process is not a confirmed-stopped successful run; no receipt may be re-verified."
+        )
+    result_path = review_record.parent / f"{record['review_id']}.output" / "review-result.json"
+    if not result_path.is_file():
+        raise AgentDeliveryError("The recorded review result file is missing; re-verification is impossible.")
+    return {"record": record, "result_path": result_path, "exit_code": record["exit_code"]}
+
+
 def _truncate_if_needed(path: Path) -> None:
     try:
         if path.stat().st_size > MAX_CAPTURED_OUTPUT_BYTES:

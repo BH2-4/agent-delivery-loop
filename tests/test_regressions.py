@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 import signal
 import sys
 import time
+import urllib.error
 import fcntl
 import subprocess
 import tempfile
@@ -212,6 +215,177 @@ class InstallVerificationTests(unittest.TestCase):
                     verify_installation(
                         receipt_path=receipt, expected_source_sha=source_sha, expected_wheel_sha256=wheel_sha
                     )
+
+
+class ReviewEvidenceTests(unittest.TestCase):
+    def _order_bytes(self, evidence: object | None) -> bytes:
+        payload = json.loads((
+            Path(__file__).parents[1] / "examples/work-orders/WO-2026-001.json"
+        ).read_text(encoding="utf-8"))
+        if evidence is not None:
+            payload["review_evidence"] = evidence
+        return json.dumps(payload).encode("utf-8")
+
+    def test_review_evidence_field_is_optional_and_strictly_parsed(self) -> None:
+        parse_work_order(self._order_bytes(None))  # absent stays valid
+        ref = "a" * 40
+        order = parse_work_order(self._order_bytes([
+            {"path": "src/x.py", "ref": ref, "purpose": "implementation basis"}
+        ]))
+        self.assertEqual(order.review_evidence[0].ref, ref)
+        for bad in (
+            [{"path": "src/**", "ref": ref, "purpose": "p"}],
+            [{"path": "/etc/passwd", "ref": ref, "purpose": "p"}],
+            [{"path": "src/x.py", "ref": "a" * 39, "purpose": "p"}],
+            [{"path": "src/x.py", "ref": ref, "purpose": "p", "extra": 1}],
+            [{"path": f"f{i}", "ref": ref, "purpose": "p"} for i in range(21)],
+            [{"path": "src/x.py", "ref": ref, "purpose": "p"}, {"path": "src/x.py", "ref": ref, "purpose": "q"}],
+            "not-a-list",
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(AgentDeliveryError):
+                    parse_work_order(self._order_bytes(bad))
+
+    def test_evidence_resolution_reads_pinned_blobs_and_fails_closed(self) -> None:
+        from agent_delivery_loop.review_handoff import resolve_review_evidence
+        from agent_delivery_loop.work_order import EvidenceRef
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+
+            def raw(*args: str) -> str:
+                return subprocess.run(
+                    ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+                ).stdout
+
+            raw("init", "-q")
+            raw("config", "user.name", "T")
+            raw("config", "user.email", "t@example.invalid")
+            (repo / "impl.py").write_text("BASELINE = 1\n", encoding="utf-8")
+            (repo / "link").symlink_to("impl.py")
+            raw("add", "impl.py")
+            raw("commit", "-m", "base")
+            base = raw("rev-parse", "HEAD").strip()
+            (repo / "impl.py").write_text("BASELINE = 2\n", encoding="utf-8")
+            raw("add", "impl.py")
+            raw("commit", "-m", "later")
+
+            resolved = resolve_review_evidence(
+                repo, (EvidenceRef(path="impl.py", ref=base, purpose="implementation basis"),)
+            )
+            self.assertIn("BASELINE = 1", resolved[0]["text"])
+            self.assertNotIn("BASELINE = 2", resolved[0]["text"])
+            self.assertEqual(len(resolved[0]["blob"]), 40)
+
+            for bad in (
+                EvidenceRef(path="missing.py", ref=base, purpose="p"),
+                EvidenceRef(path="link", ref=base, purpose="p"),
+                EvidenceRef(path="impl.py", ref="0" * 40, purpose="p"),
+            ):
+                with self.subTest(bad=bad.path):
+                    with self.assertRaises(AgentDeliveryError):
+                        resolve_review_evidence(repo, (bad,))
+
+
+class GitHubRetryTests(unittest.TestCase):
+    def _client(self) -> "GitHubClient":
+        return GitHubClient(Repo("example", "repo"))
+
+    def test_transient_network_error_retries_then_succeeds(self) -> None:
+        good = io.BytesIO(b'{"ok": 1}')
+        calls = {"n": 0}
+
+        def flaky(url: object, timeout: object = None) -> object:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise urllib.error.URLError("handshake timed out")
+            return good
+
+        with patch("agent_delivery_loop.github.time.sleep") as sleep, patch(
+            "urllib.request.urlopen", side_effect=flaky
+        ):
+            result = self._client().request("GET", "/x")
+        self.assertEqual(result, {"ok": 1})
+        self.assertEqual(calls["n"], 2)
+        sleep.assert_called()
+
+    def test_real_errors_never_retry_and_rate_limit_waits_once(self) -> None:
+        from agent_delivery_loop.github import GitHubReadError
+        for code in (404, 401):
+            with self.subTest(code=code):
+                error = urllib.error.HTTPError("u", code, "nope", None, io.BytesIO(b"{}"))
+                with patch("urllib.request.urlopen", side_effect=error), patch(
+                    "agent_delivery_loop.github.time.sleep"
+                ) as sleep:
+                    with self.assertRaises(GitHubReadError):
+                        self._client().request("GET", "/x")
+                sleep.assert_not_called()
+
+        reset = int(time.time()) + 5
+        headers = {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(reset)}
+        rate = urllib.error.HTTPError("u", 403, "limit", headers, io.BytesIO(b"{}"))
+        good = io.BytesIO(b"{}")
+        sequence = iter([rate, good])
+
+        def raise_or_good(*args: object, **kwargs: object) -> object:
+            item = next(sequence)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+        with patch("agent_delivery_loop.github.time.sleep") as sleep, patch(
+            "urllib.request.urlopen", side_effect=raise_or_good
+        ):
+            self.assertEqual(self._client().request("GET", "/x"), {})
+        sleep.assert_called_once()
+
+    def test_retries_are_bounded(self) -> None:
+        from agent_delivery_loop.github import GitHubReadError
+        with patch("agent_delivery_loop.github.time.sleep"), patch(
+            "urllib.request.urlopen", side_effect=urllib.error.URLError("down")
+        ):
+            with self.assertRaises(GitHubReadError) as raised:
+                self._client().request("GET", "/x")
+        self.assertIn("bounded retries", str(raised.exception))
+
+    def test_fixed_ref_content_is_cached(self) -> None:
+        import hashlib as _hashlib
+        blob_sha = _hashlib.sha1(b"blob 12\0cached-bytes").hexdigest()
+        body = json.dumps({
+            "type": "file", "encoding": "base64", "sha": blob_sha,
+            "content": base64.b64encode(b"cached-bytes").decode(),
+        }).encode()
+        good = io.BytesIO(body)
+        calls = {"n": 0}
+
+        def counting(url: object, timeout: object = None) -> object:
+            calls["n"] += 1
+            return good
+
+        from agent_delivery_loop import github as github_module
+        github_module._CONTENT_CACHE.clear()
+        client = self._client()
+        with patch("urllib.request.urlopen", side_effect=counting):
+            first = client.content("p", "a" * 40)
+            second = client.content("p", "a" * 40)
+        self.assertEqual(first, second)
+        self.assertEqual(calls["n"], 1)
+
+
+class VerifyReviewGateTests(unittest.TestCase):
+    def test_unconfirmed_or_unsuccessful_records_never_reverify(self) -> None:
+        from agent_delivery_loop.review_cli import load_verified_review_record
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            for record in (
+                {"review_id": "r1", "mode": "read_only_review_cli", "stop_status": "stop_unconfirmed", "exit_code": 0},
+                {"review_id": "r2", "mode": "read_only_review_cli", "stop_status": "confirmed_stopped", "exit_code": 3},
+                {"review_id": "r3", "mode": "other", "stop_status": "confirmed_stopped", "exit_code": 0},
+            ):
+                path = base / f"{record['review_id']}.json"
+                path.write_text(json.dumps(record), encoding="utf-8")
+                with self.subTest(record=record["review_id"]):
+                    with self.assertRaises(AgentDeliveryError):
+                        load_verified_review_record(path)
 
 
 class CiWaitTests(unittest.TestCase):
