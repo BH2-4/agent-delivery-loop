@@ -307,6 +307,8 @@ Hermes 通知尚未实现。若未来接入，应先只开放输出方向，避�
 
 从引导实现到首次真实 Work Order 试运行的步骤，见[引导交付说明](docs/bootstrap.md)。
 
+第一遍手动串联流程的操作顺序、问题处理、关键提交和两张工单的证据，单独归档在[第一次人工交付纪实（2026-10-04）](docs/history/2026-10-04-first-manual-delivery.md)。这是历史记录，不随当前实现状态改写，也不构成重跑授权。
+
 尚未决定的扩展建议单独记录在[后续讨论提案](docs/discussion-backlog.md)，目前包括 GitHub Issue 进度对齐与 CLI Session 归属管理。
 
 ## CCSwitch 的位置
@@ -345,6 +347,8 @@ CCSwitch 可以继续作为个人 Claude Code 环境中的模型与能力实验�
 │   ├── bootstrap.md
 │   ├── discussion-backlog.md
 │   ├── glossary.md
+│   ├── history/
+│   │   └── 2026-10-04-first-manual-delivery.md
 │   └── manual-delivery-checklist.md
 ├── examples/work-orders/WO-2026-001.json
 ├── pyproject.toml
