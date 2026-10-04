@@ -20,6 +20,7 @@ from .work_order import EvidenceRef, WorkOrder, parse_work_order
 MAX_JSON_BYTES = 64 * 1024
 MAX_DIFF_BYTES = 32 * 1024
 MAX_CONTEXT_BYTES = 96 * 1024
+MAX_TOUCHED_BYTES = 64 * 1024
 MAX_CHANGED_FILES = 100
 MAX_EVIDENCE_BYTES = 48 * 1024
 MAX_EVIDENCE_FILE_BYTES = 32 * 1024
@@ -138,10 +139,9 @@ def resolve_review_evidence(root: Path, entries: tuple[EvidenceRef, ...]) -> lis
         total += size
         if total > MAX_EVIDENCE_BYTES:
             raise AgentDeliveryError("Pinned evidence exceeds the total limit; reduce scope instead of truncating.")
-        raw = git(root, "show", f"{entry.ref}:{entry.path}").stdout
         try:
-            text = raw if isinstance(raw, str) else raw.decode("utf-8")
-        except UnicodeError:
+            text = git(root, "show", f"{entry.ref}:{entry.path}").stdout
+        except UnicodeDecodeError:
             raise AgentDeliveryError(f"Evidence must be UTF-8 text: {entry.path}.") from None
         resolved.append({
             "path": entry.path,
@@ -163,7 +163,7 @@ def check_evidence(repo_path: Path, source_ref: str, work_order_path: str) -> di
     git(root, "cat-file", "-e", f"{source_ref}^{{commit}}")
     try:
         order_bytes = git(root, "show", f"{source_ref}:{work_order_path}").stdout.encode("utf-8")
-    except UnicodeError:
+    except UnicodeDecodeError:
         raise AgentDeliveryError("Work Order is not UTF-8 text at the source ref.") from None
     order = parse_work_order(order_bytes, expected_path=work_order_path)
     resolved = resolve_review_evidence(root, order.review_evidence)
@@ -199,7 +199,7 @@ def _paths(root: Path, base: str, head: str, order: WorkOrder) -> list[str]:
             if filename != path or len(fields) != 4 or fields[0] not in {"100644", "100755"} or fields[1] != "blob":
                 raise AgentDeliveryError("Review rejects changed symlinks, submodules, or non-regular files.")
             touched_bytes += int(fields[3])
-    if touched_bytes > MAX_CONTEXT_BYTES:
+    if touched_bytes > MAX_TOUCHED_BYTES:
         raise AgentDeliveryError("Touched file content exceeds the review limit; reduce scope instead of truncating.")
     return paths
 
@@ -235,7 +235,7 @@ def _snapshot(
     authorization = client.authorized_plan(number, work_order_path, plan_url)
     order = parse_work_order(authorization.order_bytes, expected_path=authorization.order_path)
     skill = client.content(order.skill_ref, authorization.merge_sha)
-    if not skill or len(skill) > MAX_CONTEXT_BYTES:
+    if not skill or len(skill) > MAX_TOUCHED_BYTES:
         raise AgentDeliveryError("Authorized Skill is empty or exceeds the review limit.")
     original = _sha(record.get("delivery_commit"))
     expected = {

@@ -262,7 +262,7 @@ class ReviewEvidenceTests(unittest.TestCase):
             raw("config", "user.email", "t@example.invalid")
             (repo / "impl.py").write_text("BASELINE = 1\n", encoding="utf-8")
             (repo / "link").symlink_to("impl.py")
-            raw("add", "impl.py")
+            raw("add", "impl.py", "link")
             raw("commit", "-m", "base")
             base = raw("rev-parse", "HEAD").strip()
             (repo / "impl.py").write_text("BASELINE = 2\n", encoding="utf-8")

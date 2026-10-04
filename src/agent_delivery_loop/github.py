@@ -109,6 +109,7 @@ class GitHubClient:
         )
         deadline = time.monotonic() + READ_TOTAL_BUDGET_SECONDS
         last_failure = "unknown"
+        waited_for_rate = False
         for attempt in range(len(READ_RETRY_DELAYS_SECONDS) + 1):
             try:
                 with urllib.request.urlopen(request, timeout=READ_ATTEMPT_TIMEOUT_SECONDS) as response:
@@ -123,7 +124,8 @@ class GitHubClient:
                 rate_reset = _rate_reset_remaining(exc.headers)
                 if exc.code in (401, 403) and rate_reset is not None:
                     wait = rate_reset - int(time.time()) + 1
-                    if 0 < wait <= deadline - time.monotonic() and attempt < len(READ_RETRY_DELAYS_SECONDS):
+                    if not waited_for_rate and 0 < wait <= deadline - time.monotonic() and attempt < len(READ_RETRY_DELAYS_SECONDS):
+                        waited_for_rate = True
                         time.sleep(wait)
                         last_failure = f"rate limited (resets in ~{wait}s); waited once"
                         continue
