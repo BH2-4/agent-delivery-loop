@@ -12,8 +12,13 @@ from .claude_worker import ClaudeConfig, SUPPORTED_EFFORTS
 from .errors import AgentDeliveryError
 from .git_ops import repository_root
 from .runner import execute_plan, watch_once
-from .review_cli import MAX_REVIEW_TIMEOUT_SECONDS, MIN_REVIEW_TIMEOUT_SECONDS, run_review_process
-from .review_handoff import check_review, prepare_review
+from .review_cli import (
+    MAX_REVIEW_TIMEOUT_SECONDS,
+    MIN_REVIEW_TIMEOUT_SECONDS,
+    load_verified_review_record,
+    run_review_process,
+)
+from .review_handoff import check_evidence, check_review, prepare_review
 from .work_order import parse_work_order
 
 
@@ -163,6 +168,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     deliver_parser.add_argument("--proxy", default=None)
     deliver_parser.add_argument("--ci-timeout", type=int, default=900)
     deliver_parser.add_argument("--auto-merge", action="store_true", help="Merge the Delivery PR only after every gate passes")
+    evidence_parser = subparsers.add_parser(
+        "check-evidence",
+        help="Verify a Work Order's pinned review evidence resolves before any Worker runs"
+    )
+    evidence_parser.add_argument("--repo-path", type=Path, default=Path.cwd())
+    evidence_parser.add_argument("--work-order-path", required=True)
+    evidence_parser.add_argument("--source-ref", required=True, help="Full commit SHA containing the Work Order file")
+    verify_parser = subparsers.add_parser(
+        "verify-review",
+        help="Re-verify an already captured review receipt without re-running the review model"
+    )
+    verify_parser.add_argument("--plan-pr", required=True)
+    verify_parser.add_argument("--work-order-path", required=True)
+    verify_parser.add_argument("--run-record", required=True, type=Path)
+    verify_parser.add_argument("--head-sha", required=True)
+    verify_parser.add_argument("--repo-path", type=Path, default=Path.cwd())
+    verify_parser.add_argument("--bundle-dir", required=True, type=Path)
+    verify_parser.add_argument("--review-record", required=True, type=Path, help="Harness review process record with the captured exit code")
     args = parser.parse_args(argv)
     if args.command == "validate":
         try:
@@ -219,6 +242,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                 review_timeout_seconds=args.review_timeout, review_bundle_dir=args.review_bundle_dir,
                 proxy=args.proxy, ci_timeout_seconds=args.ci_timeout, auto_merge=args.auto_merge,
             )
+        except Exception as exc:
+            return _report_error(exc)
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.command == "check-evidence":
+        try:
+            result = check_evidence(args.repo_path, args.source_ref, args.work_order_path)
+        except Exception as exc:
+            return _report_error(exc)
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.command == "verify-review":
+        try:
+            captured = load_verified_review_record(args.review_record)
+            result = check_review(
+                bundle_dir=args.bundle_dir.expanduser(),
+                result_path=captured["result_path"],
+                review_exit_code=captured["exit_code"],
+                repo_path=args.repo_path,
+                plan_pr=args.plan_pr,
+                work_order_path=args.work_order_path,
+                run_record=args.run_record,
+                head_sha=args.head_sha,
+                exit_code_source="captured_by_orchestrator",
+            )
+            result["reused_review_id"] = captured["record"]["review_id"]
         except Exception as exc:
             return _report_error(exc)
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))

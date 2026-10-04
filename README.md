@@ -21,7 +21,7 @@
 - 本机任务互斥锁、提交前允许路径检查、提交内容和父提交快照、最终提交路径复核、`git diff --check`、本地 Delivery 分支与私有运行记录。执行器使用单次 Git 命令配置屏蔽钩子，不改用户全局配置，也不删除用户钩子。
 - `agent-watch --once`：单次扫描已合并 Plan PR；不安装定时任务，不运行守护进程。
 - GitHub App 窄权限发布接口；CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并验证示例 Work Order。CI 不会自动检查每张新 Work Order。
-- 审查交接源码入口 `agent-delivery prepare-review` / `check-review`：核对固定授权与候选，准备有限上下文资料包，检查结构化回执；不启动模型、执行任务或发布。`agent-delivery run-review` 进一步亲自启动一次全新只读审查进程并捕获实际退出码、结构化结果与停止确认；`agent-delivery deliver` 按 [automation-v1 方案](docs/automation-v1-plan.md) 单次串联安装核验、授权核对、Worker、审查、发布、CI 与条件式合并（一次性个人 `gh` 例外见 [ADR-0004](docs/adr/0004-one-shot-personal-gh-bootstrap.md)）。上述新入口的端到端真实验证以运行记录为准。
+- 审查交接源码入口 `agent-delivery prepare-review` / `check-review`：核对固定授权与候选，准备有限上下文资料包，检查结构化回执；不启动模型、执行任务或发布。`agent-delivery run-review` 进一步亲自启动一次全新只读审查进程并捕获实际退出码、结构化结果与停止确认；`agent-delivery check-evidence` 在 Worker 开工前核对工单 `review_evidence` 固定版本证据就绪；`agent-delivery verify-review` 在网络恢复后复核已捕获的同一回执而不重调模型；`agent-delivery deliver` 按 [automation-v1 方案](docs/automation-v1-plan.md) 单次串联安装核验、授权核对、Worker、审查、发布、CI 与条件式合并（限次个人 `gh` 例外见 [ADR-0004](docs/adr/0004-one-shot-personal-gh-bootstrap.md)/[ADR-0005](docs/adr/0005-evidence-contract-and-read-reliability.md)）。上述新入口的端到端真实验证以运行记录为准。
 
 **已观察的真实试运行**
 

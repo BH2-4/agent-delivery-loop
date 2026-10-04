@@ -33,7 +33,28 @@ PYTHONPATH=src .venv/bin/python -m agent_delivery_loop prepare-review \
 
 不复制原始运行记录、认证文件、认证环境变量、Session ID 或完整会话。资料包仍可能含候选文件里的敏感内容，不要直接公开上传；本工具不承诺识别任意秘密。目录权限和提示词约束也不证明操作系统级隔离。
 
-净变更最多 100 个文件，涉及的两端 blob 总大小最多 64 KiB，差异最多 32 KiB，整个上下文最多 64 KiB。超过就停止，不悄悄截断。拒绝变更中的符号链接、子模块与 Git 判断为二进制的差异。这些上限只限制本资料包，不是模型 Token 或账单硬上限，也不证明编译、测试或真实代码行为。
+净变更最多 100 个文件，涉及的两端 blob 总大小最多 64 KiB，差异最多 32 KiB，整个上下文最多 96 KiB（若工单声明 `review_evidence`，另计单文件 ≤32 KiB、合计 ≤48 KiB 的固定版本证据）。超过就停止，不悄悄截断。拒绝变更中的符号链接、子模块与 Git 判断为二进制的差异。这些上限只限制本资料包，不是模型 Token 或账单硬上限，也不证明编译、测试或真实代码行为。
+
+## 1a. 工单证据契约（review_evidence）
+
+Work Order v1 可选字段 `review_evidence`（1–20 条 `{path, ref, purpose}`）声明本工单验收所需的固定版本依据：`path` 为仓库相对普通文件，`ref` 为完整提交 SHA，`purpose` 说明用途。资料包会从固定 `ref` 读取这些 blob，标注 git blob id 与嵌入文本 SHA-256，放入 "Pinned baseline review evidence" 区，明确区分**主线依据**与候选 diff。check-review 重建同一快照并逐字核对。
+
+- 授权：证据清单随 Plan PR 的合并提交固定；候选文档、Issue 或模型建议不能扩大读取范围。
+- 就绪检查：`agent-delivery check-evidence --source-ref <sha> --work-order-path <path>` 在 Worker 开工前确认全部条目可解析、未超限；deliver 也在授权核对后内联执行同一检查。
+- 读取仍走统一 `core.useReplaceRefs=false` 入口；拒绝任意本机路径、越界路径、符号链接、子模块与非 UTF-8 内容。
+
+## 1b. 只读查询可靠性与回执复核
+
+`GitHubClient` 对只读请求按实际响应分类：瞬时网络错误最多两次有界重试（总预算 120 秒）；明确限流在预算内等待一次；401/403 非限流与 404 等立即失败。固定 ref 的文件内容经 blob sha 核验后可缓存复用；可变状态在关键动作前重新查询。推送、创建 PR 与合并不做盲目重试。
+
+审查进程已正常完成（记录 `confirmed_stopped` 且退出码 0）而仅网络复核失败时，编排记录先保存 `review_completed_pending_check` 及回执关联；网络恢复后用：
+
+```sh
+agent-delivery verify-review --plan-pr … --work-order-path … --run-record … \
+  --head-sha … --bundle-dir … --review-record <state>/reviews/<review-id>.json
+```
+
+复核**同一回执**（退出码取自 harness 捕获的记录），不重新调用模型。候选或基线变化后旧回执不得复用。
 
 ## 2. 独立只读审查
 

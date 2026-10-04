@@ -26,7 +26,17 @@ ALLOWED_KEYS = {
     "skill_ref",
     "stop_conditions",
     "limits",
+    "review_evidence",
 }
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+OPTIONAL_KEYS = {"review_evidence"}
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceRef:
+    path: str
+    ref: str
+    purpose: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +54,7 @@ class WorkOrder:
     max_turns: int
     timeout_seconds: int
     max_budget_usd: float
+    review_evidence: tuple[EvidenceRef, ...]
     sha256: str
 
     @property
@@ -85,6 +96,30 @@ def _safe_repo_path(value: Any, name: str, *, allow_tree_pattern: bool = False) 
     return path
 
 
+def _evidence_entries(value: Any) -> tuple[EvidenceRef, ...]:
+    """Optional pinned review evidence; repo-relative blobs at explicit full commit SHAs."""
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not 1 <= len(value) <= 20:
+        raise AgentDeliveryError("Work Order review_evidence must contain 1 to 20 entries.")
+    entries: list[EvidenceRef] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"path", "ref", "purpose"}:
+            raise AgentDeliveryError("Each review_evidence entry needs exactly path, ref, and purpose.")
+        path = _safe_repo_path(item["path"], "review_evidence.path")
+        ref = _string(item["ref"], "review_evidence.ref", maximum=40)
+        if not SHA_RE.fullmatch(ref):
+            raise AgentDeliveryError("review_evidence.ref must be a full lowercase commit SHA.")
+        purpose = _string(item["purpose"], "review_evidence.purpose", maximum=500)
+        key = f"{ref}:{path}"
+        if key in seen:
+            raise AgentDeliveryError("review_evidence contains a duplicate path and ref pair.")
+        seen.add(key)
+        entries.append(EvidenceRef(path=path, ref=ref, purpose=purpose))
+    return tuple(entries)
+
+
 def _object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -107,7 +142,7 @@ def parse_work_order(raw: bytes, *, expected_path: str | None = None) -> WorkOrd
     if not isinstance(payload, dict):
         raise AgentDeliveryError("Work Order must be a JSON object.")
     unknown = set(payload) - ALLOWED_KEYS
-    missing = ALLOWED_KEYS - set(payload)
+    missing = (ALLOWED_KEYS - OPTIONAL_KEYS) - set(payload)
     if unknown:
         raise AgentDeliveryError(f"Work Order contains unsupported fields: {', '.join(sorted(unknown))}.")
     if missing:
@@ -166,5 +201,6 @@ def parse_work_order(raw: bytes, *, expected_path: str | None = None) -> WorkOrd
         max_turns=max_turns,
         timeout_seconds=timeout_seconds,
         max_budget_usd=float(budget),
+        review_evidence=_evidence_entries(payload.get("review_evidence")),
         sha256=hashlib.sha256(canonical).hexdigest(),
     )
