@@ -30,7 +30,9 @@ class DeliveryCommit:
 def git(cwd: Path, *args: str, check: bool = True, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
-            ["git", "-c", f"core.hooksPath={os.devnull}", *args],
+            # core.useReplaceRefs=false: labeled SHAs must always read the original
+            # objects, never content silently substituted by refs/replace/*.
+            ["git", "-c", f"core.hooksPath={os.devnull}", "-c", "core.useReplaceRefs=false", *args],
             cwd=cwd,
             env=env,
             text=True,

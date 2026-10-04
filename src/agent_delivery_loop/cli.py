@@ -12,6 +12,7 @@ from .claude_worker import ClaudeConfig, SUPPORTED_EFFORTS
 from .errors import AgentDeliveryError
 from .git_ops import repository_root
 from .runner import execute_plan, watch_once
+from .review_handoff import check_review, prepare_review
 from .work_order import parse_work_order
 
 
@@ -120,6 +121,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     validate_parser = subparsers.add_parser("validate", help="Parse and validate a version 1 Work Order JSON file")
     validate_parser.add_argument("path", type=Path)
+    for command in ("prepare-review", "check-review"):
+        review_parser = subparsers.add_parser(command, help="Prepare or check a bounded review-only candidate handoff")
+        review_parser.add_argument("--plan-pr", required=True)
+        review_parser.add_argument("--work-order-path", required=True)
+        review_parser.add_argument("--run-record", required=True, type=Path)
+        review_parser.add_argument("--head-sha", required=True, help="Full candidate SHA at the local Delivery branch head")
+        review_parser.add_argument("--repo-path", type=Path, default=Path.cwd())
+        if command == "prepare-review":
+            review_parser.add_argument("--output-dir", required=True, type=Path, help="New private directory outside repo and Worker state")
+        else:
+            review_parser.add_argument("--bundle-dir", required=True, type=Path)
+            review_parser.add_argument("--result", required=True, type=Path)
+            review_parser.add_argument("--review-exit-code", required=True, type=int, help="Operator-attested CLI exit code; not independently proven")
     args = parser.parse_args(argv)
     if args.command == "validate":
         try:
@@ -127,5 +141,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, AgentDeliveryError) as exc:
             return _report_error(exc)
         print(f"Valid Work Order {order.identity}; canonical SHA-256 {order.sha256}")
+        return 0
+    if args.command in {"prepare-review", "check-review"}:
+        inputs = {
+            "repo_path": args.repo_path,
+            "plan_pr": args.plan_pr,
+            "work_order_path": args.work_order_path,
+            "run_record": args.run_record,
+            "head_sha": args.head_sha,
+        }
+        try:
+            if args.command == "prepare-review":
+                result = prepare_review(output_dir=args.output_dir, **inputs)
+            else:
+                result = check_review(
+                    bundle_dir=args.bundle_dir.expanduser(), result_path=args.result.expanduser(),
+                    review_exit_code=args.review_exit_code, **inputs,
+                )
+        except Exception as exc:
+            return _report_error(exc)
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     return 2

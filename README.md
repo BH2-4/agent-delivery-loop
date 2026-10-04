@@ -21,6 +21,7 @@
 - 本机任务互斥锁、提交前允许路径检查、提交内容和父提交快照、最终提交路径复核、`git diff --check`、本地 Delivery 分支与私有运行记录。执行器使用单次 Git 命令配置屏蔽钩子，不改用户全局配置，也不删除用户钩子。
 - `agent-watch --once`：单次扫描已合并 Plan PR；不安装定时任务，不运行守护进程。
 - GitHub App 窄权限发布接口；CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并验证示例 Work Order。CI 不会自动检查每张新 Work Order。
+- 审查交接源码入口 `agent-delivery prepare-review` / `check-review`：核对固定授权与候选，准备有限上下文资料包，检查结构化回执；不启动模型、执行任务或发布。新入口尚未构建安装，真实交接路径未验证，详见[审查交接说明](docs/review-handoff.md)。
 
 **已观察的真实试运行**
 
@@ -36,7 +37,7 @@
 - Claude Code 管理员托管策略可能仍适用，当前执行环境的托管策略尚未审计。
 - Work Order 的 `max_budget_usd` 会传入 Claude CLI，但经当前自定义模型端点的实际费用上限语义尚未验证；应按软限制看待。
 - `agent-watch` 的真实发现路径尚未验证；两次工单均直接调用 `agent-run`。只实现手动 `--once`，无跨主机抢单、自动重试或定时器。
-- Codex CLI 安装问题已修复；Codex Steward 审查及自动简报尚无接口实现。Delivery PR 的语义审查需要人工启动 Codex 并报告。
+- Codex CLI 安装问题已修复；已有候选资料包与结构化回执核对的源码接口，但自动启动 Codex、捕获实际退出码、连接 PR / CI 的完整编排及自动简报尚未实现。Delivery PR 的语义审查仍需独立启动 Codex；交接入口通过不代表语义审查、CI 或交付已经成功。
 - 不调用模型的临时子进程与故障注入回归覆盖启动登记取消、创建阶段未返回句柄的异常、停止未确认后的写入失败/再次取消、门禁读写故障，以及 HOME 清理时取消不得继续交付。真实调用已观察到正常返回及清理，但真实 Claude 的 Ctrl+C、超时、启动故障和脱离进程组的后代行为仍未验证；替身回归不能证明这些真实异常路径。Session ID 会记录，但 transcript 不保存；Session 恢复流程尚未设计。
 
 **后续阶段**：基于这两次文档试运行另行讨论可重复性和代码任务验证、GitHub App/仓库规则验证、Issue 进度讨论、Hermes 手机通知、Steward 自动审查，以及跨主机或自动恢复；当前不自动进入这些阶段。
@@ -352,7 +353,8 @@ CCSwitch 可以继续作为个人 Claude Code 环境中的模型与能力实验�
 │   ├── glossary.md
 │   ├── history/
 │   │   └── 2026-10-04-first-manual-delivery.md
-│   └── manual-delivery-checklist.md
+│   ├── manual-delivery-checklist.md
+│   └── review-handoff.md
 ├── examples/work-orders/WO-2026-001.json
 ├── pyproject.toml
 └── src/agent_delivery_loop/
@@ -362,6 +364,7 @@ CCSwitch 可以继续作为个人 Claude Code 环境中的模型与能力实验�
     ├── github.py
     ├── github_app.py
     ├── runner.py
+    ├── review_handoff.py
     ├── store.py
     └── work_order.py
 ```

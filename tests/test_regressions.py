@@ -32,7 +32,7 @@ from agent_delivery_loop.claude_worker import (
 from agent_delivery_loop.cli import _report_error, agent_run_main, agent_watch_main
 from agent_delivery_loop.errors import AgentDeliveryError
 from agent_delivery_loop.github import GitHubClient, Repo
-from agent_delivery_loop.git_ops import DeliveryCommit, StagedSnapshot, commit_changes, stage_changes
+from agent_delivery_loop.git_ops import DeliveryCommit, StagedSnapshot, commit_changes, git, stage_changes
 from agent_delivery_loop.runner import _record_cancelled_run, _safe_changed_paths, execute_plan
 from agent_delivery_loop.store import RunStateError, RunStore, task_key
 from agent_delivery_loop.work_order import parse_work_order
@@ -473,6 +473,57 @@ class MergedPullRequestDiscoveryTests(unittest.TestCase):
         with patch("agent_delivery_loop.github.MAX_CLOSED_PR_PAGES", 1):
             with self.assertRaises(AgentDeliveryError):
                 client.merged_plan_candidates()
+
+
+class GitReplaceRefTests(unittest.TestCase):
+    def test_executor_reads_ignore_replace_refs_and_keep_them_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+
+            def raw(*args: str) -> str:
+                return subprocess.run(
+                    ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+                ).stdout
+
+            raw("init", "-q")
+            raw("config", "user.name", "Regression Test")
+            raw("config", "user.email", "regression@example.invalid")
+            (repo / "base.md").write_text("base\n", encoding="utf-8")
+            raw("add", ".")
+            raw("commit", "-m", "base")
+            base = raw("rev-parse", "HEAD").strip()
+            (repo / "delivered.md").write_text("original candidate\n", encoding="utf-8")
+            raw("add", ".")
+            raw("commit", "-m", "candidate")
+            head = raw("rev-parse", "HEAD").strip()
+
+            raw("checkout", "-q", "--detach", base)
+            (repo / "delivered.md").write_text("replaced content\n", encoding="utf-8")
+            raw("add", ".")
+            raw("commit", "-m", "impostor")
+            impostor = raw("rev-parse", "HEAD").strip()
+            raw("replace", head, impostor)
+
+            # The failure signal: plain Git honors refs/replace/* for the labeled SHA.
+            self.assertIn("replaced content", raw("show", f"{head}:delivered.md"))
+            self.assertNotIn("replaced content", git(repo, "show", f"{head}:delivered.md").stdout)
+            self.assertIn("original candidate", git(repo, "show", f"{head}:delivered.md").stdout)
+            diff = git(
+                repo, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", base, head
+            ).stdout
+            self.assertIn("original candidate", diff)
+            self.assertNotIn("replaced content", diff)
+            self.assertEqual(
+                git(repo, "show", "-s", "--format=%P", head).stdout.strip(), base
+            )
+            self.assertTrue(
+                subprocess.run(
+                    ["git", "-C", str(repo), "rev-parse", "--verify", "-q", f"refs/replace/{head}"],
+                    capture_output=True,
+                ).returncode
+                == 0,
+                "existing replace refs must not be deleted by the executor",
+            )
 
 
 class DeliveredPathTests(unittest.TestCase):
