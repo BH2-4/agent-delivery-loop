@@ -309,6 +309,8 @@ Hermes 通知尚未实现。若未来接入，应先只开放输出方向，避�
 
 第一遍手动串联流程的操作顺序、问题处理、关键提交和两张工单的证据，单独归档在[第一次人工交付纪实（2026-10-04）](docs/history/2026-10-04-first-manual-delivery.md)。这是历史记录，不随当前实现状态改写，也不构成重跑授权。
 
+下一阶段先减少命令与结果的人工搬运，方案见[人工授权、单次自动串联（proposed）](docs/automation-v1-plan.md)。当前仅试跑会话内的审查与 GitHub 机械步骤；Python 完整编排入口尚未实现，不启用后台服务、自动返修或无人值守发布。
+
 尚未决定的扩展建议单独记录在[后续讨论提案](docs/discussion-backlog.md)，目前包括 GitHub Issue 进度对齐与 CLI Session 归属管理。
 
 ## CCSwitch 的位置
@@ -344,6 +346,7 @@ CCSwitch 可以继续作为个人 Claude Code 环境中的模型与能力实验�
 │       └── WO-PILOT-002-r1.json
 ├── docs/
 │   ├── adr/
+│   ├── automation-v1-plan.md
 │   ├── bootstrap.md
 │   ├── discussion-backlog.md
 │   ├── glossary.md
