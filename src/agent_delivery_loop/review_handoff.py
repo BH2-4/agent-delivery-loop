@@ -307,6 +307,7 @@ def _text(value: Any, maximum: int) -> bool:
 def check_review(
     *, bundle_dir: Path, result_path: Path, review_exit_code: int,
     repo_path: Path, plan_pr: str, work_order_path: str, run_record: Path, head_sha: str,
+    exit_code_source: str = "operator_attested_not_independently_proven",
 ) -> dict[str, Any]:
     if not isinstance(review_exit_code, int) or isinstance(review_exit_code, bool) or review_exit_code != 0:
         raise AgentDeliveryError("Review CLI was reported unsuccessful; no review was accepted.")
@@ -331,7 +332,7 @@ def check_review(
         raise AgentDeliveryError("Review is blocked, has findings, or has an invalid completion contract; stop before publishing.")
     return {
         "status": "review_checked", **metadata, "verdict": "pass",
-        "review_exit_code_source": "operator_attested_not_independently_proven",
+        "review_exit_code_source": exit_code_source,
         "unverified_count": len(result["unverified"]),
         "summary": "Snapshot and structured review match; original command success, CI, publishing, and merge are not certified.",
         "next_actions": ["CI, publishing permission, and merge remain separate checks and decisions."],

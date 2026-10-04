@@ -37,9 +37,27 @@ PYTHONPATH=src .venv/bin/python -m agent_delivery_loop prepare-review \
 
 ## 2. 独立只读审查
 
-目前仍由操作者 / Steward 单独启动 Codex CLI。使用全新、只读、非续接会话；只读取资料包，按 schema 返回结果。缺少必要代码或业务上下文时返回 `blocked`，不要让 Agent 自动扩大读取范围。自动调用、进程时限和取消处理留给下一小步实现。
+审查现在有两种入口，均不修改候选、不取得发布或合并职责：
 
-这组限制降低不必要的上下文搬运，但不证明模型实际遵守所有提示，也不保证节省多少 Token。资料包没有完整目标主线代码，无法据此认证最终合并后的行为或 CI；语义审查不足时应另行确认所需资料。
+- `agent-delivery check-review`：操作者自己启动审查 CLI 后提交回执与**声明**的退出码；输出标记 `operator_attested_not_independently_proven`，仅核对数据契约。
+- `agent-delivery run-review`（推荐）：由程序启动一次全新、只读、非续接的审查进程，**亲自捕获**其实际退出码、结构化结果、进程停止与清理结果，然后执行同一套回执核对；输出标记 `captured_by_orchestrator`。
+
+```sh
+PYTHONPATH=src .venv/bin/python -m agent_delivery_loop run-review \
+  --plan-pr '<merged-plan-pr-url>' \
+  --work-order-path '.agents/work-orders/<task-id>-r<revision>.json' \
+  --run-record '/path/outside/repository/runs/<task-key>/<run-id>.json' \
+  --head-sha '<full-delivery-branch-head-sha>' \
+  --output-dir '/path/outside/repository-and-worker-state/new-review-bundle' \
+  --review-model '<codex-model>' --review-effort '<effort>' \
+  --review-timeout 900 --proxy 'http://127.0.0.1:12451'
+```
+
+审查进程固定为 `codex exec --ignore-user-config --ignore-rules --ephemeral --skip-git-repo-check --sandbox read-only`，工作目录限定在资料包内；不加载用户 MCP、通知钩子或 rules，不续接任何会话。认证只来自 Codex 自身的登录态（CODEX_HOME）；资料包与提示词不含凭据。审查资料保持有界（沿用资料包上限）；资料不足时应返回 `blocked`，不得自动扩大读取范围。
+
+进程控制与停止语义：启动前在仓库外审查记录目录写入 `start_unconfirmed` 门禁；超时或取消时对整个进程组先 TERM 后 KILL，仅当确认进程组已消失才写 `confirmed_stopped` 并允许后续审查；无法确认停止时保留证据并阻断后续启动。任何审查记录不可读或存在未确认停止的记录时，新审查一律阻断。回执核对沿用第 3 节规则；`pass` 必须没有发现。
+
+临时子进程（如假 CLI 回归）只能证明控制路径，不能冒充真实 Codex 行为；真实调用的结论以真实运行记录为准。CLI 只读沙箱不证明操作系统级凭据隔离。
 
 回执字段固定为 `base_sha`、`head_sha`、`context_sha256`、`verdict`、`summary`、`findings`、`unverified`。`pass` 必须没有发现；`changes_required`、`blocked` 或仍有任何发现都不能通过本阶段核对。
 
