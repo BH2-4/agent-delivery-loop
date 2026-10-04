@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "task_id": "WO-RUNBOOK-002",
+  "revision": 1,
+  "objective": "仅新增一个文件 docs/evidence-and-reliability-notes.md：用简体中文写给仓库使用者，说明两项新能力——(1) Work Order 的可选 review_evidence 字段如何声明固定版本审查证据（path/ref/purpose 约束、随 Plan PR 授权固定）；(2) 只读 GitHub 查询的分类重试语义与 verify-review 回执复核用途。内容必须与资料包内附带的本轮实现源码和 ADR-0005 一致：具体字段名、命令名（check-evidence、verify-review、deliver）、重试上限（两次有界重试、限流预算内等待一次）等都要能在所附证据中找到对应。结尾必须明确本轮为限次个人 gh 实验且列出未验证项。",
+  "out_of_scope": [
+    "不修改任何 Python 源码、测试、CI、打包或 .agents/ 下任何文件",
+    "不修改既有文档（README、docs/ 全部现有文件）",
+    "不执行真实 agent-run、审查 CLI 或任何 GitHub 写操作",
+    "不描述未在所附证据中体现的行为或参数"
+  ],
+  "acceptance_criteria": [
+    "仓库中存在且仅存在一个新文件 docs/evidence-and-reliability-notes.md，为简体中文",
+    "包含四个小节：证据声明（review_evidence）、就绪检查（check-evidence）、回执复核（verify-review）、读取可靠性与边界",
+    "文档中出现的每个命令名、参数名、字段名与数值上限都能在资料包附带的本轮实现源码或 ADR-0005 中找到一致出处",
+    "明确写出最多两次有界重试、限流预算内等待一次、资料包不截断",
+    "结尾明确：本轮属限次个人 gh 实验例外（ADR-0005），并列出未验证项（App 线路、OS 凭据隔离、真实异常停止、账单硬上限、部署）",
+    "全文不超过 120 行，不含任何认证值或本机私有路径"
+  ],
+  "allowed_paths": [
+    "docs/evidence-and-reliability-notes.md"
+  ],
+  "worker_profile": "claude-code-v1",
+  "skill_ref": ".agents/policies/delivery-skill/SKILL.md",
+  "stop_conditions": [
+    "验收所需信息在可读取的仓库文件中不存在时停止并报告 blocked，不得编造行为细节",
+    "需要修改 allowed_paths 之外任何文件时停止",
+    "对证据内容与要写内容的一致性不确定时停止，不猜测"
+  ],
+  "limits": {
+    "max_turns": 24,
+    "timeout_seconds": 900,
+    "max_budget_usd": 5
+  },
+  "review_evidence": [
+    {
+      "path": "src/agent_delivery_loop/review_handoff.py",
+      "ref": "a4863cb4a33c5620f240d554792117b66a02079e",
+      "purpose": "资料包固定版本证据嵌入、check-evidence 就绪检查与 check-review 同快照核对"
+    },
+    {
+      "path": "src/agent_delivery_loop/github.py",
+      "ref": "a4863cb4a33c5620f240d554792117b66a02079e",
+      "purpose": "只读查询错误分类、两次有界重试、限流单次等待与固定 ref 缓存"
+    },
+    {
+      "path": "docs/adr/0005-evidence-contract-and-read-reliability.md",
+      "ref": "a4863cb4a33c5620f240d554792117b66a02079e",
+      "purpose": "本轮限次实验的范围、期限、停止条件与未验证项声明"
+    }
+  ]
+}
