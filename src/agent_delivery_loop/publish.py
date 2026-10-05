@@ -551,11 +551,13 @@ def wait_for_ci(
     identity.token_for(repo_slug)
     deadline = time.monotonic() + timeout_seconds
 
-    def remaining_timeout() -> int:
+    def remaining_timeout() -> float:
         left = deadline - time.monotonic()
         if left <= 0:
             raise AgentDeliveryError("CI wait exceeded its total time budget before completion.")
-        return max(1, min(GH_TIMEOUT_SECONDS, int(left)))
+        # Exact float, never floored or padded: a sub-second remainder must reach
+        # run_gh_read untouched so it can decline to start a request it cannot fit.
+        return min(float(GH_TIMEOUT_SECONDS), left)
 
     while True:
         current = gh_json(

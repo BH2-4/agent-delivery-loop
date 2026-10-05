@@ -192,24 +192,27 @@ def _stop_agent_run_bounded(process: subprocess.Popen[str]) -> bool:
     stopping the outer group is never proof that Claude stopped. SIGINT goes to the
     outer group first: a Python runner turns it into KeyboardInterrupt and runs its
     own Worker cleanup — including stopping and confirming the inner Claude group and
-    persisting the safety record. Only when it does not exit within the bounded grace
-    does the hard SIGTERM/SIGKILL group stop run. A True return confirms the OUTER
-    group stopped; whether the inner run ended safely is proven only by its persisted
-    run record, which the spawn gate resolution checks separately.
+    persisting the safety record. The leader exiting is not enough: same-group
+    descendants that ignore SIGINT must be caught by checking the group and
+    escalating to the hard SIGTERM/SIGKILL stop. A True return confirms the OUTER
+    process group is gone; whether the inner run ended safely is proven only by its
+    persisted run record, which the spawn gate resolution checks separately.
     """
-    from .claude_worker import _stop_process_group
+    from .claude_worker import _process_group_exists, _stop_process_group
 
     if process.poll() is not None:
-        return True
+        return not _process_group_exists(process.pid)
     try:
         os.killpg(process.pid, signal.SIGINT)
     except (ProcessLookupError, PermissionError, OSError):
         pass
     try:
         process.wait(timeout=AGENT_RUN_INTERRUPT_GRACE_SECONDS)
-        return True
     except subprocess.TimeoutExpired:
         return _stop_process_group(process)
+    if not _process_group_exists(process.pid):
+        return True
+    return _stop_process_group(process)
 
 
 def _spawn_gate_record(orchestration_id: str, phase: str) -> dict[str, Any]:
@@ -239,11 +242,15 @@ def _preflight_spawn_gates(store: Any) -> None:
 def _resolve_spawn_gate(store: Any, task_key_value: str, gate_path: Path, registered_epoch: float) -> bool:
     """Remove the gate only with trusted safe-end evidence for THIS spawn window.
 
-    Evidence = a run record of the same task, written after the gate was registered,
-    whose worker_status is 'stopped' with a status the safety table accepts. Absent
-    that, the gate stays and continues blocking every launch path.
+    The window starts at the gate's own last write (the post-Popen flip to the blocking
+    phase): run records strictly older than the flip — even by a fraction of a second —
+    belong to earlier launches and can never release this gate. Evidence = a run record
+    of the same task, written at or after the flip, whose worker_status is 'stopped'
+    with a status the safety table accepts. Absent that, the gate stays and continues
+    blocking every launch path.
     """
     try:
+        window_start = max(gate_path.stat().st_mtime, registered_epoch)
         for path in (store.runs / task_key_value).glob("*.json"):
             if path.name.startswith("spawn-"):
                 continue
@@ -251,7 +258,7 @@ def _resolve_spawn_gate(store: Any, task_key_value: str, gate_path: Path, regist
             if (
                 record.get("worker_status") == "stopped"
                 and record.get("status") in {"validating", "local_ready", "delivery_pr_open", "cancelled", "failed"}
-                and path.stat().st_mtime >= registered_epoch - 1.0
+                and path.stat().st_mtime >= window_start
             ):
                 gate_path.unlink()
                 return True
@@ -286,36 +293,43 @@ def _spawn_agent_run(
     # The child is told which durable spawn gate tracks it so its own availability
     # check can exempt exactly that one record (name only; not a credential).
     env["AGENT_DELIVERY_SPAWN_GATE"] = f"{task_key_value}/{gate_path.name}"
-    try:
-        with open(stdout_path, "wb") as captured:
+    with open(stdout_path, "wb") as captured:
+        # Only a Popen failure proves no child was created; every later OSError is an
+        # unknown outcome and must keep the gate, so the conversion is scoped here.
+        try:
             process = subprocess.Popen(
                 argv, stdin=subprocess.DEVNULL, stdout=captured, stderr=subprocess.STDOUT,
                 env=env, start_new_session=True,
             )
-            # The handle exists: flip the durable gate to the blocking phase before the
-            # child can do real work, so every later launch sees an unconfirmed spawn.
+        except OSError as exc:
+            raise AgentRunNotStartedError("The installed agent-run entry could not be started.") from exc
+        # The handle exists: flip the durable gate to the blocking phase before the
+        # child can do real work, so every later launch sees an unconfirmed spawn.
+        # If the flip cannot be persisted, stop the child and leave the pending gate.
+        try:
             store.write(task_key_value, gate_path.stem, _spawn_gate_record(
                 gate_path.stem.removeprefix("spawn-"), "started",
             ))
-            try:
-                exit_code = process.wait(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired:
-                if not _stop_agent_run_bounded(process):
-                    raise AgentDeliveryError(
-                        "The spawned agent-run exceeded its time limit and its process group could not be confirmed stopped; runs are blocked."
-                    )
-                raise AgentDeliveryError("The spawned agent-run exceeded its time limit and was stopped; no delivery continued.")
-            except BaseException:
-                # Interruption or cancellation must not leave the trusted child (and its
-                # one-shot PAT channel) running unconfirmed. A confirmed outer stop
-                # re-raises the interruption; an unconfirmed stop blocks future runs.
-                if not _stop_agent_run_bounded(process):
-                    raise AgentDeliveryError(
-                        "agent-run was interrupted and its process group could not be confirmed stopped; runs are blocked."
-                    ) from None
-                raise
-    except OSError as exc:
-        raise AgentRunNotStartedError("The installed agent-run entry could not be started.") from exc
+        except BaseException:
+            _stop_agent_run_bounded(process)
+            raise
+        try:
+            exit_code = process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            if not _stop_agent_run_bounded(process):
+                raise AgentDeliveryError(
+                    "The spawned agent-run exceeded its time limit and its process group could not be confirmed stopped; runs are blocked."
+                )
+            raise AgentDeliveryError("The spawned agent-run exceeded its time limit and was stopped; no delivery continued.")
+        except BaseException:
+            # Interruption or cancellation must not leave the trusted child (and its
+            # one-shot PAT channel) running unconfirmed. A confirmed outer stop
+            # re-raises the interruption; an unconfirmed stop blocks future runs.
+            if not _stop_agent_run_bounded(process):
+                raise AgentDeliveryError(
+                    "agent-run was interrupted and its process group could not be confirmed stopped; runs are blocked."
+                ) from None
+            raise
     output = stdout_path.read_bytes()[:MAX_AGENT_RUN_OUTPUT_BYTES]
     if exit_code != 0:
         raise AgentDeliveryError(f"The installed agent-run exited with code {exit_code}; its sanitized output was preserved.")

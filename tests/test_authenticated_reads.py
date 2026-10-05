@@ -35,10 +35,10 @@ class _FakeStore:
     def __init__(self, root: Path) -> None:
         self.root = root
 
-    def assert_worker_available(self) -> None:
+    def assert_worker_available(self, *, exempt_record: Path | None = None) -> None:
         return None
 
-    def claim(self, _key: str):
+    def claim(self, _key: str, *, exempt_record: Path | None = None):
         return contextlib.nullcontext()
 
     def write(self, *_args, **_kwargs) -> None:
@@ -424,6 +424,96 @@ class TwoLayerStopTests(unittest.TestCase):
     outer Python process group is possible while an inner, separately-sessioned child
     stays alive — exactly why outer-stop can never prove the inner Worker stopped."""
 
+    def test_flip_failure_stops_the_child_and_keeps_the_gate(self) -> None:
+        identity = _identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            stdout = Path(temporary) / "out.json"
+            gate_path = Path(temporary) / "spawn-abcd1234.json"
+
+            class FlipFailureStore:
+                def write(self, *_args, **_kwargs):
+                    raise RuntimeError("disk full")
+
+            with patch("agent_delivery_loop.orchestrator.subprocess.Popen") as popen, \
+                 patch("agent_delivery_loop.orchestrator._stop_agent_run_bounded", return_value=True) as stop:
+                popen.return_value.wait.return_value = 0
+                with self.assertRaises(RuntimeError):
+                    orchestrator._spawn_agent_run(
+                        entry="agent-run", repo_root=Path(temporary),
+                        plan_pr="https://github.com/o/r/pull/26",
+                        work_order_path=".agents/work-orders/WO-X-001-r1.json",
+                        model="m", base_url="https://api.example", effort="max",
+                        auth_config=Path("/nowhere"), timeout_seconds=30, proxy=None,
+                        stdout_path=stdout, identity=identity,
+                        store=FlipFailureStore(), task_key_value="k", gate_path=gate_path,
+                    )
+            stop.assert_called_once()
+
+    def test_sigint_ignoring_same_group_descendant_is_hard_stopped(self) -> None:
+        import signal as signal_module
+
+        outer = subprocess.Popen(
+            [
+                "python3", "-c",
+                "import subprocess,time\n"
+                "subprocess.Popen(['python3','-c',"
+                "'import signal,time\\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\\ntime.sleep(120)'])\n"
+                "print('ready',flush=True)\n"
+                "time.sleep(120)\n",
+            ],
+            start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        try:
+            self.assertEqual(outer.stdout.readline().strip(), "ready")
+            confirmed = orchestrator._stop_agent_run_bounded(outer)
+            self.assertTrue(confirmed)
+            self.assertIsNotNone(outer.poll())
+            # The whole outer group (including the SIGINT-ignoring descendant) is gone.
+            with self.assertRaises(OSError):
+                os.killpg(outer.pid, 0)
+        finally:
+            outer.kill()
+            try:
+                os.killpg(outer.pid, signal_module.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            outer.wait(timeout=10)
+
+
+class CiRemainingBudgetTests(unittest.TestCase):
+    def test_wait_for_ci_passes_exact_remaining_floats_to_reads(self) -> None:
+        identity = _identity()
+        captured: list[float] = []
+
+        def fake_gh_json(args, *, identity=None, proxy=None, timeout=0):  # noqa: ANN001
+            captured.append(float(timeout))
+            return {"headRefOid": "a" * 40, "baseRefName": "main"}
+
+        def fake_snapshot(identity_arg, *, pr_number, head_sha, proxy, request_timeout):  # noqa: ANN001
+            captured.append(float(request_timeout()))
+            return {
+                "status": "completed", "conclusion": "success",
+                "workflow_run_id": 1, "run_attempt": 1,
+                "checks": [("validate", "SUCCESS")],
+            }
+
+        with patch("agent_delivery_loop.publish.gh_json", side_effect=fake_gh_json), \
+             patch("agent_delivery_loop.publish._ci_snapshot", side_effect=fake_snapshot):
+            result = publish.wait_for_ci(
+                repo_slug="o/r", pr_number=1, head_sha="a" * 40,
+                timeout_seconds=2, identity=identity,
+            )
+        self.assertEqual(result["status"], "completed")
+        # Exact floats, never floored to 1: with ~2s left, reads get ~2s budgets.
+        self.assertTrue(all(value > 1.5 for value in captured), msg=str(captured))
+        self.assertTrue(all(value <= 2.0 for value in captured), msg=str(captured))
+
+
+class TwoLayerStopSeparationTests(unittest.TestCase):
+    """Real local subprocesses, no credentials and no models: prove that stopping the
+    outer Python process group is possible while an inner, separately-sessioned child
+    stays alive — exactly why outer-stop can never prove the inner Worker stopped."""
+
     OUTER = (
         "import subprocess,sys,time\n"
         "inner=subprocess.Popen(['sleep','120'],start_new_session=True)\n"
@@ -460,6 +550,30 @@ class SpawnGateTests(unittest.TestCase):
         from agent_delivery_loop.store import RunStore
 
         return RunStore(base / "state")
+
+    def test_stale_safe_evidence_cannot_release_a_newer_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = self._store(Path(temporary))
+            key = "k"
+            # A safe record from an EARLIER launch (written before the gate)...
+            store.write(key, "11111111-1111-1111-1111-111111111111", {
+                "schema_version": 1, "run_id": "11111111-1111-1111-1111-111111111111",
+                "worker_status": "stopped", "status": "local_ready",
+            })
+            old = store.record_path(key, "11111111-1111-1111-1111-111111111111")
+            # ...then THIS spawn's gate flips (necessarily later), plus an unconfirmed
+            # record for the current launch.
+            gate = store.record_path(key, "spawn-abcd1234")
+            store.write(key, "spawn-abcd1234", orchestrator._spawn_gate_record("abcd1234-full", "started"))
+            store.write(key, "22222222-2222-2222-2222-222222222222", {
+                "schema_version": 1, "run_id": "22222222-2222-2222-2222-222222222222",
+                "worker_status": "stop_unconfirmed", "status": "cleanup_failed",
+            })
+            self.assertGreater(gate.stat().st_mtime, old.stat().st_mtime)
+            self.assertFalse(orchestrator._resolve_spawn_gate(
+                store, key, gate, gate.stat().st_mtime - 5.0,
+            ))
+            self.assertTrue(gate.exists())
 
     def test_started_gate_actually_blocks_until_trusted_evidence_resolves_it(self) -> None:
         from agent_delivery_loop.store import RunStateError

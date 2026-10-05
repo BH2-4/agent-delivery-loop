@@ -173,7 +173,22 @@ def execute_plan(
 
     config = worker_config
     store = RunStore(default_state_dir())
-    store.assert_worker_available()
+    # The orchestrator's durable spawn gate tracks this launch; exempt exactly that one
+    # record in EVERY availability check (including the preflight below) so this runner
+    # may start while every other launch path stays blocked by the gate.
+    exempt_record: Path | None = None
+    if spawn_gate_name is not None:
+        parts = spawn_gate_name.split("/")
+        candidate_gate = store.runs / spawn_gate_name if len(parts) == 2 else None
+        if (
+            candidate_gate is None
+            or not parts[1].startswith("spawn-")
+            or not parts[1].endswith(".json")
+            or not candidate_gate.is_file()
+        ):
+            raise AgentDeliveryError("The orchestrator spawn gate is invalid or missing; refusing to run.")
+        exempt_record = candidate_gate
+    store.assert_worker_available(exempt_record=exempt_record)
     run_id = str(uuid.uuid4())
     runtime_home = store.root / "runtime" / run_id
     version = preflight(config, runtime_home)
@@ -235,21 +250,7 @@ def execute_plan(
     }
     worker_lifecycle = WorkerLifecycle()
 
-    # The orchestrator's durable spawn gate tracks this launch; exempt exactly that one
-    # record so this runner may start while every other launch path stays blocked by it.
-    exempt_record: Path | None = None
-    if spawn_gate_name is not None:
-        parts = spawn_gate_name.split("/")
-        candidate_gate = store.runs / spawn_gate_name if len(parts) == 2 else None
-        if (
-            candidate_gate is None
-            or not parts[1].startswith("spawn-")
-            or not parts[1].endswith(".json")
-            or not candidate_gate.is_file()
-        ):
-            raise AgentDeliveryError("The orchestrator spawn gate is invalid or missing; refusing to run.")
-        exempt_record = candidate_gate
-
+    # exempt_record was validated before the preflight above and covers the claim too.
     with store.claim(task_identity_key, exempt_record=exempt_record):
         # This durable, read-back-verified record is the gate BEFORE any Worker
         # creation. A later failed/interrupted update cannot release it.
