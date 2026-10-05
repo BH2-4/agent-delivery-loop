@@ -425,6 +425,12 @@ class PublishReconciliationTests(unittest.TestCase):
 
         def fake_run_gh(args, proxy=None, timeout=60):
             if args[0] == "pr" and args[1] == "merge":
+                self.assertEqual(
+                    args,
+                    ["pr", "merge", "7", "--repo", "o/r", "--merge",
+                     "--match-head-commit", candidate],
+                    "the merge write must enforce the reviewed head, not just preflight it",
+                )
                 merges["n"] += 1
                 return subprocess.CompletedProcess(args, 1, "", "connection lost")
             raise AssertionError("unexpected gh call")
@@ -448,12 +454,15 @@ class PublishReconciliationTests(unittest.TestCase):
         self.assertEqual(merges["n"], 1, "an already-merged PR must not be merged again")
 
         # A PR whose head drifted away from the reviewed candidate is never merged.
-        with patch.object(publish, "gh_json", return_value={"state": "OPEN", "headRefOid": "d" * 40}):
+        with patch.object(publish, "run_gh") as merge_call, patch.object(
+            publish, "gh_json", return_value={"state": "OPEN", "headRefOid": "d" * 40}
+        ):
             with self.assertRaises(publish.WriteReconciliationError):
                 publish.merge_delivery_pr(
                     repo_slug="o/r", pr_number=7, candidate_sha=candidate,
                     intent_sink=lambda i: None,
                 )
+            merge_call.assert_not_called()
 
     def test_pr_creation_reuses_unique_match_and_stops_on_ambiguity(self) -> None:
         from agent_delivery_loop import publish
