@@ -1,5 +1,9 @@
 # 从设计稿走到第一次真实交付
 
+## PAT 阶段补充（2026-10-05）
+
+用户选择细粒度 PAT，本地源码已增加显式身份和只读预检，尚未安装或真实验证。按 [PAT 接入说明](pat-setup.md) 接入，不复用日常 `gh` 凭据；App 门禁不变。旧的限次授权与历史运行记录不迁移、不延长。下方保留首轮检查点，不代表当前编排源码仍没有审查／返修能力；当前状态见 README，正式身份决策见 [ADR 待确认草案](adr-0007-pat-draft.md)。
+
 ## 当前检查点（2026-10-04）
 
 仓库已有第一版 Python `agent-run`、`agent-watch --once`、Work Order v1、Claude Code 受限启动器和最小 CI。CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并解析示例 Work Order；它不验证每张新 Work Order。两张真实文档工单已执行并由人接纳到 `main`：第一张原命令退出码 2，候选成果后来通过 [Delivery PR #5](https://github.com/BH2-4/agent-delivery-loop/pull/5) 人工接纳；登记问题由 [PR #4](https://github.com/BH2-4/agent-delivery-loop/pull/4) 修复后，第二张命令退出码 0，再经人工修正文案、独立审查和 CI，通过 [Delivery PR #7](https://github.com/BH2-4/agent-delivery-loop/pull/7) 人工合并。第二张证明一次正常的人工监督文档闭环，不证明零人工返修、可重复性或代码开发任务。

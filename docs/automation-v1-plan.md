@@ -2,6 +2,8 @@
 
 日期：2026-10-04。状态：**proposed**。
 
+2026-10-05 更新：下方保留第一阶段设计与实验背景。当前编排源码已存在，并在新的本地分支改为显式 PAT 身份；日常 `gh` 限次例外已结束，不再是当前入口。PAT 版尚未安装或真实验证，接入与边界见 [PAT 说明](pat-setup.md)。
+
 本文是自动化方案，不是 Work Order 或已接受的 ADR，不授予开工、返修、合并或部署权限。当前 Python CLI 尚未实现本文描述的整条编排链。第一遍人工交付的历史保存在[人工交付纪实](history/2026-10-04-first-manual-delivery.md)，不因自动化实验而改写。
 
 ## 1. 先减少搬运，不先增加后台服务
@@ -99,10 +101,11 @@ agent-delivery deliver \
   --expected-source-sha '<approved-40-hex>' --expected-wheel-sha256 '<approved-64-hex>' \
   --review-model '<codex-model>' --review-effort '<effort>' \
   --review-bundle-dir /path/outside/repository/new-bundle \
-  --proxy http://127.0.0.1:12451 --ci-timeout 900 --auto-merge
+  --github-pat-file /path/outside/repository/private/github.pat --github-login BH2-4 \
+  --proxy http://127.0.0.1:12451 --ci-timeout 900
 ```
 
-它按固定顺序串联：安装来源核验（receipt 与获准源码/wheel 摘要一致、入口来自虚拟环境而非 editable 源码）→ 已合并 Plan PR 授权核对 → 以安装的 `agent-run` 入口真实执行 Worker 并捕获退出码 → 运行记录与允许范围复核 → 资料包 + 真实只读审查进程（`run-review` 同一实现）→ 回执核对 → 以一次性个人 `gh` 身份推送并定位/创建 Delivery PR（见 [ADR-0004](adr/0004-one-shot-personal-gh-bootstrap.md)）→ 等待该 head 的必需 CI → `--auto-merge` 时在门禁全绿后合并并核验 `main` 包含关系。每一步失败关闭并写入脱敏编排记录；结果不明不向成功路径推进。`--auto-merge` 未指定时停在 `awaiting_user_merge`。
+它按固定顺序串联：安装来源核验 → 显式 PAT 的账号／仓库／PR／CI 只读预检 → 已合并 Plan PR 授权核对 → 安装入口真实执行 Worker 并捕获退出码 → 运行记录与允许范围复核 → 真实只读审查（必要时有界返修）→ 回执核对 → 同一 PAT 推送并定位／创建 Delivery PR → 等待该 head 的必需 CI。仅在本轮另行明确授权并指定 `--auto-merge` 时，门禁全绿后合并并核验 `main` 包含关系；默认停在 `awaiting_user_merge`。历史个人 `gh` 例外不续期；PAT 版尚未真实验证。
 
 本轮先使用**本方案文档的普通维护 PR**作为低风险样本，验证：
 

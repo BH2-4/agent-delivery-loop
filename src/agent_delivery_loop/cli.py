@@ -10,7 +10,8 @@ from typing import Sequence
 
 from .claude_worker import ClaudeConfig, SUPPORTED_EFFORTS
 from .errors import AgentDeliveryError
-from .git_ops import repository_root
+from .git_ops import repository_remote, repository_root
+from .github_identity import GitHubPAT
 from .runner import execute_plan, watch_once
 from .review_cli import (
     MAX_REVIEW_TIMEOUT_SECONDS,
@@ -65,6 +66,11 @@ def _worker_config(args: argparse.Namespace) -> tuple[Path, ClaudeConfig]:
         repo_root=root,
     )
     return root, config
+
+
+def _add_github_identity_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--github-pat-file", required=True, type=Path, help="Private fine-grained PAT file outside Git/Worker state")
+    parser.add_argument("--github-login", required=True, help="Expected GitHub account; never inferred from gh login")
 
 
 def _report_error(exc: Exception) -> int:
@@ -164,6 +170,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         pipeline_parser.add_argument("--work-order-path", required=True)
         pipeline_parser.add_argument("--repo-path", type=Path, default=Path.cwd())
         _add_worker_arguments(pipeline_parser)
+        _add_github_identity_arguments(pipeline_parser)
         pipeline_parser.add_argument("--install-receipt", required=True, type=Path, help="Install provenance receipt for the running entry")
         pipeline_parser.add_argument("--expected-source-sha", required=True, help="Approved full source SHA the installation must match")
         pipeline_parser.add_argument("--expected-wheel-sha256", required=True, help="Approved wheel SHA-256 the installation must match")
@@ -174,6 +181,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         pipeline_parser.add_argument("--proxy", default=None)
         pipeline_parser.add_argument("--ci-timeout", type=int, default=900)
         pipeline_parser.add_argument("--auto-merge", action="store_true", help="Merge the Delivery PR only after every gate passes")
+    auth_parser = subparsers.add_parser(
+        "check-github-auth", help="Read-only PAT account, repository, PR and CI probe; never starts a Worker or writes to GitHub"
+    )
+    auth_parser.add_argument("--repo-path", type=Path, default=Path.cwd())
+    auth_parser.add_argument("--pr", required=True, type=int, help="Existing PR number used only for a read/CI probe")
+    auth_parser.add_argument("--proxy", default=None)
+    _add_github_identity_arguments(auth_parser)
     evidence_parser = subparsers.add_parser(
         "check-evidence",
         help="Verify a Work Order's pinned review evidence resolves before any Worker runs"
@@ -193,6 +207,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     verify_parser.add_argument("--bundle-dir", required=True, type=Path)
     verify_parser.add_argument("--review-record", required=True, type=Path, help="Harness review process record with the captured exit code")
     args = parser.parse_args(argv)
+    if args.command == "check-github-auth":
+        from .publish import probe_github_access
+
+        try:
+            if args.pr < 1:
+                raise AgentDeliveryError("The read-only probe requires a positive existing PR number.")
+            root = repository_root(args.repo_path.expanduser().resolve())
+            identity = GitHubPAT.from_file(
+                path=args.github_pat_file, repo_root=root, repository=repository_remote(root).slug,
+                expected_login=args.github_login,
+            )
+            result = probe_github_access(identity, pr_number=args.pr, proxy=args.proxy)
+        except Exception as exc:
+            return _report_error(exc)
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
     if args.command == "validate":
         try:
             order = parse_work_order(args.path.read_bytes())
@@ -247,6 +277,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 review_model=args.review_model, review_effort=args.review_effort,
                 review_timeout_seconds=args.review_timeout, review_bundle_dir=args.review_bundle_dir,
                 proxy=args.proxy, ci_timeout_seconds=args.ci_timeout, auto_merge=args.auto_merge,
+                github_pat_file=args.github_pat_file, github_login=args.github_login,
             )
             if args.command == "deliver":
                 result = deliver(**common)

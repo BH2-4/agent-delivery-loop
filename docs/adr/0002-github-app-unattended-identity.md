@@ -1,7 +1,7 @@
 # ADR-0002: 使用 GitHub App 作为无人值守身份
 
 **日期**：2026-09-28<br>
-**状态**：accepted<br>
+**状态**：accepted（历史决策保留；其"当前单机阶段执行身份"的部分已被 [ADR-0007](0007-fine-grained-pat-stage.md) 替代，App 路线、风险与发布门禁仍有效）<br>
 **决策者**：仓库所有者与 Steward
 
 ## 背景

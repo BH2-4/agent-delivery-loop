@@ -9,6 +9,8 @@
 
 ## 当前实现状态
 
+**PAT 阶段补充（2026-10-05，本地源码待交付）**：用户已选择细粒度 PAT，其他身份路线保留。`deliver/resume` 现在要求显式 `--github-pat-file` / `--github-login`，不再使用日常 `gh auth` 凭据；新增 `check-github-auth` 只读预检。CI 改用 `Actions:read` 的 run／jobs REST 接口，固定 `ci.yml`／`validate`，不依赖 Checks API。已安装 wheel 尚未更新，真实 PAT 权限／CI 兼容性／交付未验证。App 的 `agent-run --publish` 仍独立且不可冒充启用。见 [接入说明](docs/pat-setup.md)、[身份备选](docs/identity-options-and-pat-transition.md)与 [ADR 草案](docs/adr-0007-pat-draft.md)。下一轮模板见 [PAT Goal](docs/goal-pat-trial.md)，保存模板不启动 Goal 或授予运行权限。
+
 **已实现（源码范围）**
 
 - JSON Work Order v1、严格解析器及示例；授权文件必须按 `.agents/work-orders/{task_id}-r{revision}.json` 命名。
@@ -21,7 +23,7 @@
 - 本机任务互斥锁、提交前允许路径检查、提交内容和父提交快照、最终提交路径复核、`git diff --check`、本地 Delivery 分支与私有运行记录。执行器使用单次 Git 命令配置屏蔽钩子，不改用户全局配置，也不删除用户钩子。
 - `agent-watch --once`：单次扫描已合并 Plan PR；不安装定时任务，不运行守护进程。
 - GitHub App 窄权限发布接口；CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并验证示例 Work Order。CI 不会自动检查每张新 Work Order。
-- 审查交接源码入口 `agent-delivery prepare-review` / `check-review`：核对固定授权与候选，准备有限上下文资料包，检查结构化回执；不启动模型、执行任务或发布。`agent-delivery run-review` 进一步亲自启动一次全新只读审查进程并捕获实际退出码、结构化结果与停止确认；`agent-delivery check-evidence` 在 Worker 开工前核对工单 `review_evidence` 固定版本证据就绪；`agent-delivery verify-review` 在网络恢复后复核已捕获的同一回执而不重调模型；写操作（推送/建 PR/合并）经意图持久化与只读结果核对，绝不盲目重放（`publish`）；`changes_required` 触发最多两轮有界返修（全新 Worker 会话、独立返修记录、复用既有安全机制）；`agent-delivery resume` 从已确认阶段安全续接（ADR-0006）；`agent-delivery deliver` 按 [automation-v1 方案](docs/automation-v1-plan.md) 单次串联安装核验、授权核对、Worker、审查、发布、CI 与条件式合并（限次个人 `gh` 例外见 [ADR-0004](docs/adr/0004-one-shot-personal-gh-bootstrap.md)/[ADR-0005](docs/adr/0005-evidence-contract-and-read-reliability.md)）。上述新入口的端到端真实验证以运行记录为准。
+- 审查交接源码入口 `agent-delivery prepare-review` / `check-review`：核对固定授权与候选，准备有限上下文资料包，检查结构化回执；不启动模型、执行任务或发布。`agent-delivery run-review` 进一步亲自启动一次全新只读审查进程并捕获实际退出码、结构化结果与停止确认；`agent-delivery check-evidence` 在 Worker 开工前核对工单 `review_evidence` 固定版本证据就绪；`agent-delivery verify-review` 在网络恢复后复核已捕获的同一回执而不重调模型；写操作（推送/建 PR/合并）经意图持久化与只读结果核对，绝不盲目重放（`publish`）；`changes_required` 触发最多两轮有界返修（全新 Worker 会话、独立返修记录、复用既有安全机制）；`agent-delivery resume` 从已确认阶段安全续接（ADR-0006）；`agent-delivery deliver` 按 [automation-v1 方案](docs/automation-v1-plan.md) 单次串联安装核验、授权核对、Worker、审查、发布、CI 与条件式合并。过去个人 `gh` 实验例外见 ADR-0004/0005/0006，不自动续期；当前源码改用显式 PAT，真实验证仍以新一轮记录为准。
 
 **已观察的真实试运行**
 
@@ -37,7 +39,7 @@
 - Claude Code 管理员托管策略可能仍适用，当前执行环境的托管策略尚未审计。
 - Work Order 的 `max_budget_usd` 会传入 Claude CLI，但经当前自定义模型端点的实际费用上限语义尚未验证；应按软限制看待。
 - `agent-watch` 的真实发现路径尚未验证；两次工单均直接调用 `agent-run`。只实现手动 `--once`，无跨主机抢单、自动重试或定时器。
-- Codex CLI 安装问题已修复；已有候选资料包与结构化回执核对的源码接口，但自动启动 Codex、捕获实际退出码、连接 PR / CI 的完整编排及自动简报尚未实现。Delivery PR 的语义审查仍需独立启动 Codex；交接入口通过不代表语义审查、CI 或交付已经成功。
+- Codex CLI 安装问题已修复；已有自动启动只读审查、捕获退出码并连接 PR / CI 的单次编排源码，不是长期后台服务。PAT 版本尚未安装或真实验证；交接入口通过不代表语义审查、CI 或交付已经成功。
 - 不调用模型的临时子进程与故障注入回归覆盖启动登记取消、创建阶段未返回句柄的异常、停止未确认后的写入失败/再次取消、门禁读写故障，以及 HOME 清理时取消不得继续交付。真实调用已观察到正常返回及清理，但真实 Claude 的 Ctrl+C、超时、启动故障和脱离进程组的后代行为仍未验证；替身回归不能证明这些真实异常路径。Session ID 会记录，但 transcript 不保存；Session 恢复流程尚未设计。
 
 **后续阶段**：基于这两次文档试运行另行讨论可重复性和代码任务验证、GitHub App/仓库规则验证、Issue 进度讨论、Hermes 手机通知、Steward 自动审查，以及跨主机或自动恢复；当前不自动进入这些阶段。
@@ -272,7 +274,7 @@ Hermes 通知尚未实现。若未来接入，应先只开放输出方向，避�
 | 仓库与主机 | 一个仓库、一台受信任的本地主机 |
 | Worker | 一个固定配置的 Claude Code |
 | 本机执行器语言 | Python |
-| GitHub 写身份 | 运行器只准备了 GitHub App 接口；尚未配置或验证，不可用于发布 |
+| GitHub 写身份 | App 接口保留且未验证；单次编排源码改用显式 PAT，尚待审查、安装与真实权限／交付验证 |
 | 并发 | 同一时间最多一个任务 |
 | 运行隔离 | 每次使用新会话和独立 worktree |
 | 当前入口 | 手动调用 `agent-run` 或 `agent-watch --once` |
