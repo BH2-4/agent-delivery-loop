@@ -26,8 +26,9 @@ from .github_identity import GitHubPAT
 from .publish import (
     ensure_delivery_pr,
     merge_delivery_pr,
-    push_delivery_branch,
     probe_github_access,
+    push_delivery_branch,
+    verify_ci_current,
     wait_for_ci,
 )
 from .review_cli import (
@@ -486,6 +487,13 @@ def _continue_inner(orchestration: Orchestration, params: _Params, *, fresh: boo
     orchestration.save(stage="ci_passed", ci=ci)
     merge = {"merged": False, "merge_sha": None, "main_contains_head": False}
     if params.auto_merge:
+        # Re-verify the fixed CI for this exact head immediately before merging so a
+        # newer run/attempt cannot hide behind the earlier wait's success.
+        pre_merge_ci = verify_ci_current(
+            params.github_identity, repo_slug=plan_repo.slug, pr_number=pr["number"],
+            head_sha=candidate, proxy=params.proxy,
+        )
+        orchestration.save(stage="pre_merge_ci_verified", pre_merge_ci=pre_merge_ci)
         merge = merge_delivery_pr(
             repo_slug=plan_repo.slug, pr_number=pr["number"], candidate_sha=candidate,
             intent_sink=orchestration.write_intent_sink, identity=identity, proxy=params.proxy,

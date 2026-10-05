@@ -683,7 +683,7 @@ class CiWaitTests(unittest.TestCase):
     def api_fixture(self, *, states=("success",), job_name="validate", head="c" * 40, total=1, missing=False):
         seen = {"n": 0, "run": None}
 
-        def read(args, *, identity, proxy=None):
+        def read(args, *, identity, proxy=None, timeout=60):
             if args[:2] == ["pr", "view"]:
                 return {"headRefOid": "c" * 40, "baseRefName": "main"}
             path = args[1]

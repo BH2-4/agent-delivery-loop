@@ -128,3 +128,122 @@ class PublishIdentityFlowTests(unittest.TestCase):
             )
         self.assertTrue(merged["merged"])
         self.assertEqual(merged["merge_sha"], "b" * 40)
+
+
+class CiAssociationAndDeadlineTests(unittest.TestCase):
+    def _run_payload(self, pulls, run_id=1, conclusion="success", jobs=None):
+        base = {
+            "id": run_id, "run_attempt": 1, "head_sha": "a" * 40, "event": "pull_request",
+            "path": ".github/workflows/ci.yml@refs/heads/main", "status": "completed",
+            "conclusion": conclusion, "pull_requests": pulls, "html_url": "https://example.invalid/run/1",
+        }
+        return {
+            "total_count": 1, "workflow_runs": [base],
+        } if pulls is not None else {"total_count": 0, "workflow_runs": []}
+
+    def _jobs_payload(self, names=(("validate", "success"),)):
+        return {"total_count": len(names), "jobs": [
+            {"name": name, "head_sha": "a" * 40, "run_id": 1, "status": "completed",
+             "conclusion": conclusion} for name, conclusion in names
+        ]}
+
+    def test_merged_pr_run_with_empty_association_is_accepted(self) -> None:
+        from agent_delivery_loop import publish
+
+        identity = GitHubPAT(repository="o/r", expected_login="o", _token=FAKE_PAT)
+
+        def gh(args, *, identity, proxy=None, timeout=60):
+            identity.token_for("o/r")
+            url = args[-1]
+            if "/runs?" in url:
+                return self._run_payload([])  # observed on merged PRs in this repository
+            if "/jobs" in url:
+                return self._jobs_payload()
+            if args[-1].endswith("/runs/1"):
+                return {"id": 1, "run_attempt": 1, "head_sha": "a" * 40, "status": "completed",
+                        "conclusion": "success"}
+            raise AssertionError(f"unexpected {url}")
+
+        with patch.object(publish, "gh_json", side_effect=gh):
+            snapshot = publish._ci_snapshot(identity, pr_number=7, head_sha="a" * 40, proxy=None)
+        self.assertEqual(snapshot["workflow_run_id"], 1)
+        self.assertEqual(snapshot["conclusion"], "success")
+
+    def test_run_associated_with_a_different_pr_is_rejected_as_ambiguous(self) -> None:
+        from agent_delivery_loop import publish
+
+        identity = GitHubPAT(repository="o/r", expected_login="o", _token=FAKE_PAT)
+
+        def gh(args, *, identity, proxy=None, timeout=60):
+            identity.token_for("o/r")
+            return self._run_payload([{"number": 9}])
+
+        with patch.object(publish, "gh_json", side_effect=gh):
+            snapshot = publish._ci_snapshot(identity, pr_number=7, head_sha="a" * 40, proxy=None)
+        self.assertIsNone(snapshot["workflow_run_id"])
+
+    def test_verify_ci_current_requires_unique_successful_validate(self) -> None:
+        from agent_delivery_loop import publish
+
+        identity = GitHubPAT(repository="o/r", expected_login="o", _token=FAKE_PAT)
+
+        def gh(args, *, identity, proxy=None, timeout=60):
+            identity.token_for("o/r")
+            url = args[-1]
+            if "/runs?" in url:
+                return self._run_payload([])
+            if "/jobs" in url:
+                return self._jobs_payload([("validate", "success"), ("validate", "success")])
+            if args[-1].endswith("/runs/1"):
+                return {"id": 1, "run_attempt": 1, "head_sha": "a" * 40, "status": "completed",
+                        "conclusion": "success"}
+            raise AssertionError(url)
+
+        with patch.object(publish, "gh_json", side_effect=gh):
+            with self.assertRaises(AgentDeliveryError):
+                publish.verify_ci_current(identity, repo_slug="o/r", pr_number=7, head_sha="a" * 40)
+
+
+class ResumeIdentityBindingTests(unittest.TestCase):
+    def test_resume_rejects_missing_or_mismatched_identity_metadata(self) -> None:
+        from agent_delivery_loop.orchestrator import Orchestration, resume
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.dict(os.environ, {"AGENT_STATE_DIR": str(Path(temporary) / "state")}):
+                base = {
+                    "plan_pr": "https://github.com/o/r/pull/1", "work_order_path": ".agents/work-orders/WO-X-r1.json",
+                    "expected_source_sha": "f" * 40, "expected_wheel_sha256": "0" * 64,
+                    "review_model": "m", "review_effort": "high", "review_timeout_seconds": 900,
+                    "review_bundle_dir": "/tmp/b", "proxy": None, "ci_timeout_seconds": 900,
+                    "auto_merge": True, "model": "m", "base_url": "https://x", "effort": "max",
+                    "auth_config": "/tmp/a.json", "repo_path": ".", "install_receipt": "/tmp/r.json",
+                }
+                common = dict(
+                    repo_path=Path.cwd(), plan_pr=base["plan_pr"], work_order_path=base["work_order_path"],
+                    model="m", base_url="https://x", effort="max", auth_config=Path("/tmp/a.json"),
+                    install_receipt=Path("/tmp/r.json"), expected_source_sha=base["expected_source_sha"],
+                    expected_wheel_sha256=base["expected_wheel_sha256"], review_model="m",
+                    review_effort="high", review_timeout_seconds=900,
+                    review_bundle_dir=Path("/tmp/b"), proxy=None, ci_timeout_seconds=900, auto_merge=True,
+                    github_pat_file=Path("/tmp/p.pat"), github_login="o",
+                )
+                legacy = Orchestration("orch-legacy")
+                legacy.record["stage"] = "worker_completed"
+                legacy.record["worker"] = {"run_id": "r", "delivery_branch": "b", "worker_commit": "a" * 40,
+                                           "record_path": "/tmp/r.json"}
+                legacy.record["candidate"] = {"sha": "a" * 40, "origin": "worker", "review_round": 0}
+                legacy.save(parameters=dict(base))  # no github_identity key: legacy personal-gh record
+                with self.assertRaises(AgentDeliveryError) as raised:
+                    resume(orchestration_id="orch-legacy", **common)
+                self.assertIn("identity", str(raised.exception))
+
+                wrong = Orchestration("orch-wrong")
+                wrong.record["stage"] = "worker_completed"
+                wrong.record["worker"] = dict(legacy.record["worker"])
+                wrong.record["candidate"] = dict(legacy.record["candidate"])
+                wrong.record["github_identity"] = {"kind": "fine_grained_pat", "repository": "o/r",
+                                                   "expected_login": "someone-else"}
+                wrong.save(parameters=dict(base))
+                with self.assertRaises(AgentDeliveryError) as raised:
+                    resume(orchestration_id="orch-wrong", **common)
+                self.assertIn("identity", str(raised.exception))

@@ -149,7 +149,12 @@ def _ci_snapshot(identity: GitHubPAT, *, pr_number: int, head_sha: str, proxy: s
         pulls = run.get("pull_requests")
         if not isinstance(pulls, list) or any(not isinstance(pull, dict) for pull in pulls):
             raise AgentDeliveryError("Actions run lacks explicit PR association; no CI state was assumed.")
-        if not any(pull.get("number") == pr_number for pull in pulls):
+        # Real-world contract: merged pull_request runs may carry an EMPTY association
+        # list (observed on this repository). head_sha already binds the run to this
+        # PR's exact candidate commit, so an empty list is accepted; an explicit
+        # association with a DIFFERENT PR is an unresolvable ambiguity and rejected.
+        numbers = {pull.get("number") for pull in pulls}
+        if numbers and pr_number not in numbers:
             continue
         if (
             run.get("head_sha") != head_sha or run.get("event") != "pull_request"
@@ -378,6 +383,27 @@ def merge_delivery_pr(
     raise WriteReconciliationError("Merge could not be confirmed after bounded attempts; inspect GitHub.")
 
 
+def verify_ci_current(
+    identity: GitHubPAT, *, repo_slug: str, pr_number: int, head_sha: str, proxy: str | None = None,
+) -> dict[str, Any]:
+    """One fresh CI verification for the exact head right before a merge decision."""
+    identity.token_for(repo_slug)
+    snapshot = _ci_snapshot(identity, pr_number=pr_number, head_sha=head_sha, proxy=proxy)
+    checks = snapshot["checks"]
+    if (
+        snapshot["status"] != "completed" or snapshot["conclusion"] != "success"
+        or not checks or any(state != "SUCCESS" for _, state in checks)
+        or sum(name == REQUIRED_CHECK_NAME for name, _ in checks) != 1
+    ):
+        raise AgentDeliveryError(
+            "The fixed CI workflow is not currently successful for the reviewed head; merge is not allowed."
+        )
+    return {
+        "workflow_run_id": snapshot["workflow_run_id"], "run_attempt": snapshot.get("run_attempt"),
+        "checks": checks,
+    }
+
+
 def wait_for_ci(
     *, repo_slug: str, pr_number: int, head_sha: str, timeout_seconds: int,
     identity: GitHubPAT, proxy: str | None = None,
@@ -385,14 +411,23 @@ def wait_for_ci(
     """Poll fixed Actions workflow via PAT-compatible REST; missing/failed checks never pass."""
     identity.token_for(repo_slug)
     deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
+
+    def remaining_timeout() -> int:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise AgentDeliveryError("CI wait exceeded its total time budget before completion.")
+        return max(1, min(GH_TIMEOUT_SECONDS, int(left)))
+
+    while True:
         current = gh_json(
             ["pr", "view", str(pr_number), "--repo", repo_slug, "--json", "headRefOid,baseRefName"],
-            identity=identity, proxy=proxy,
+            identity=identity, proxy=proxy, timeout=remaining_timeout(),
         )
         if not isinstance(current, dict) or current.get("headRefOid") != head_sha or current.get("baseRefName") != "main":
             raise AgentDeliveryError("PR head/target changed while waiting for CI; nothing was merged.")
         snapshot = _ci_snapshot(identity, pr_number=pr_number, head_sha=head_sha, proxy=proxy)
+        if time.monotonic() >= deadline:
+            raise AgentDeliveryError("CI wait exceeded its total time budget before completion.")
         if snapshot["status"] == "completed":
             checks = snapshot["checks"]
             if (
@@ -404,7 +439,7 @@ def wait_for_ci(
             # Re-read after the snapshot to bind success to the still-current head.
             after = gh_json(
                 ["pr", "view", str(pr_number), "--repo", repo_slug, "--json", "headRefOid,baseRefName"],
-                identity=identity, proxy=proxy,
+                identity=identity, proxy=proxy, timeout=remaining_timeout(),
             )
             if after != current:
                 raise AgentDeliveryError("PR identity changed during CI verification; nothing was merged.")
