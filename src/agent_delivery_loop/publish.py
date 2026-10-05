@@ -164,24 +164,30 @@ def ensure_delivery_pr(
         intent_sink({**identity, "state": "confirmed", "reused": True})
         return found
     intent_sink({**identity, "state": "intent"})
-    created = run_gh(
-        ["pr", "create", "--repo", repo_slug, "--head", branch, "--base", "main",
-         "--title", title, "--body-file", str(body_file)], proxy=proxy,
-    )
-    if created.returncode == 0:
+    created_error: AgentDeliveryError | None = None
+    try:
+        created = run_gh(
+            ["pr", "create", "--repo", repo_slug, "--head", branch, "--base", "main",
+             "--title", title, "--body-file", str(body_file)], proxy=proxy,
+        )
+    except AgentDeliveryError as exc:
+        created = None  # A timeout may still have created the PR; reconcile below.
+        created_error = exc
+    if created is not None and created.returncode == 0:
         match = re.search(r"https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9_.-]+/pull/[0-9]+", created.stdout)
         if match:
             found = existing()
             if found is not None:
                 intent_sink({**identity, "state": "confirmed", "reused": False})
                 return found
-    # Ambiguous or failed creation: reconcile read-only; never create a second time blind.
+    # Ambiguous, failed, or timed-out creation: reconcile read-only; never create a second time blind.
     found = existing()
     if found is not None:
         intent_sink({**identity, "state": "confirmed_after_reconcile", "reused": True})
         return found
     raise WriteReconciliationError(
         "Delivery PR creation result could not be confirmed by a read-only lookup; inspect GitHub before retrying."
+        + (f" (last error: {created_error})" if created_error else "")
     )
 
 
@@ -201,6 +207,11 @@ def merge_delivery_pr(
             raise WriteReconciliationError("Delivery PR state could not be read before merging.")
         if detail.get("state") == "MERGED":
             merge_commit = detail.get("mergeCommit")
+            if detail.get("headRefOid") != candidate_sha:
+                raise WriteReconciliationError(
+                    f"The merged Delivery PR head is {detail.get('headRefOid')}, not the reviewed {candidate_sha}; "
+                    "the real result does not match the approved merge."
+                )
             intent_sink({**identity, "state": "confirmed", "already_merged": attempt > 0 or None})
             return {
                 "merged": True, "merge_sha": merge_commit.get("oid") if isinstance(merge_commit, dict) else None,
@@ -210,8 +221,24 @@ def merge_delivery_pr(
                 f"Delivery PR is {detail.get('state')} at head {detail.get('headRefOid')}; "
                 f"merge is bound to OPEN at {candidate_sha} and was not executed."
             )
-        run_gh(["pr", "merge", str(pr_number), "--repo", repo_slug, "--merge"], proxy=proxy, timeout=120)
-        # A PR merges exactly once; if the response was lost the loop re-reads state and accepts MERGED.
+        try:
+            run_gh(["pr", "merge", str(pr_number), "--repo", repo_slug, "--merge"], proxy=proxy, timeout=120)
+        except AgentDeliveryError:
+            pass  # A lost merge response may still have merged the PR; the loop re-reads state.
+    # Final read-only confirmation after the last bounded merge attempt.
+    detail = gh_json(
+        ["pr", "view", str(pr_number), "--repo", repo_slug, "--json", "state,mergeCommit,headRefOid"], proxy=proxy
+    )
+    if isinstance(detail, dict) and detail.get("state") == "MERGED":
+        if detail.get("headRefOid") != candidate_sha:
+            raise WriteReconciliationError(
+                f"The merged Delivery PR head is {detail.get('headRefOid')}, not the reviewed {candidate_sha}."
+            )
+        merge_commit = detail.get("mergeCommit")
+        intent_sink({**identity, "state": "confirmed_after_reconcile"})
+        return {
+            "merged": True, "merge_sha": merge_commit.get("oid") if isinstance(merge_commit, dict) else None,
+        }
     raise WriteReconciliationError("Merge could not be confirmed after bounded attempts; inspect GitHub.")
 
 

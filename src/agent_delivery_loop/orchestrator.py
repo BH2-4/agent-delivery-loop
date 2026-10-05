@@ -21,11 +21,9 @@ from typing import Any
 from .claude_worker import ClaudeConfig
 from .errors import AgentDeliveryError
 from .git_ops import git, repository_remote, repository_root
-from .github import GitHubClient, GitHubReadError, parse_plan_pr_ref
+from .github import GitHubClient, parse_plan_pr_ref
 from .publish import (
-    WriteReconciliationError,
     ensure_delivery_pr,
-    gh_json,
     merge_delivery_pr,
     push_delivery_branch,
     run_gh,
@@ -46,7 +44,7 @@ from .work_order import parse_work_order
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 MAX_AGENT_RUN_OUTPUT_BYTES = 64 * 1024
-PRE_WORKER_STAGES = {"created", "starting", "install_verified", "authorization_verified", "evidence_ready"}
+PRE_WORKER_STAGES = {"created", "install_verified", "evidence_ready"}
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -311,11 +309,20 @@ def resume(
             "No Worker result exists yet for this orchestration; run a fresh deliver instead of resuming."
         )
     recorded = orchestration.record.get("parameters") or {}
-    for key, expected in (
+    strict_keys = (
         ("plan_pr", plan_pr), ("work_order_path", work_order_path),
         ("expected_source_sha", expected_source_sha), ("expected_wheel_sha256", expected_wheel_sha256),
-    ):
+    )
+    advisory_keys = (
+        ("review_model", review_model), ("review_effort", review_effort),
+        ("review_timeout_seconds", review_timeout_seconds), ("ci_timeout_seconds", ci_timeout_seconds),
+        ("auto_merge", auto_merge),
+    )
+    for key, expected in strict_keys:
         if recorded.get(key) != expected:
+            raise AgentDeliveryError(f"Resume parameter mismatch for '{key}'; the recorded orchestration binds different values.")
+    for key, expected in advisory_keys:
+        if key in recorded and recorded[key] != expected:
             raise AgentDeliveryError(f"Resume parameter mismatch for '{key}'; the recorded orchestration binds different values.")
     params = _Params(
         repo_path=repo_path, plan_pr=plan_pr, work_order_path=work_order_path,
@@ -469,10 +476,12 @@ def _continue_inner(orchestration: Orchestration, params: _Params, *, fresh: boo
 
 
 def _changed(record_path: Path, candidate: str, orchestration: Orchestration) -> list[str]:
-    rework_entries = orchestration.record.get("rework", {}).get("entries", [])
-    if rework_entries:
-        return rework_entries[-1].get("changed_paths", [])
-    return _read_json(record_path).get("changed_paths", [])
+    paths: list[str] = list(_read_json(record_path).get("changed_paths", []))
+    for entry in orchestration.record.get("rework", {}).get("entries", []):
+        for path in entry.get("changed_paths", []):
+            if path not in paths:
+                paths.append(path)
+    return paths
 
 
 def _review_loop(
@@ -497,14 +506,18 @@ def _review_loop(
             bump += 1
             bundle_dir = params.review_bundle_dir.with_name(params.review_bundle_dir.name + f"-r{bump}")
         prior = orchestration.record.get("review") or {}
-        pending_pass = (
-            orchestration.record.get("stage") == "review_completed_pending_check"
-            and prior.get("candidate") == candidate and prior.get("verdict") == "pass"
+        reusable = (
+            prior.get("candidate") == candidate
+            and prior.get("review_round") == round_index
+            and prior.get("verdict") in {"pass", "changes_required", "blocked"}
+            and Path(str(prior.get("result_path", ""))).is_file()
         )
-        if pending_pass:
-            # Infrastructure-only failure after a completed review: re-verify the SAME receipt
-            # against its ORIGINAL bundle, with no model call.
-            bundle_dir = Path(prior["bundle_dir"])
+        if reusable:
+            # A completed review for THIS candidate and round is never re-rolled on resume,
+            # whatever stage the orchestration stopped at: pass re-verifies the same receipt,
+            # changes_required proceeds to the rework decision, blocked keeps stopping.
+            if prior.get("bundle_dir"):
+                bundle_dir = Path(prior["bundle_dir"])
             review_run = {
                 "review_id": prior["review_id"], "codex_version": prior.get("codex_version"),
                 "exit_code": prior["exit_code"], "stop_status": prior["stop_status"],
@@ -553,6 +566,7 @@ def _review_loop(
             )
             outcome = run_bounded_rework(
                 store=store, repo_slug=plan_repo.slug, worktree=worktree, order=order,
+                expected_skill_sha256=worker_record.get("skill_sha256"),
                 worker_config=ClaudeConfig.from_explicit(
                     model=params.model, base_url=params.base_url, effort=params.effort,
                     auth_config=params.auth_config, repo_root=root,

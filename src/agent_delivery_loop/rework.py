@@ -67,6 +67,7 @@ def run_bounded_rework(
     rework_index: int,
     directive: str,
     rework_count_so_far: int,
+    expected_skill_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Run one bounded rework round; returns the new candidate head and linkage."""
     if rework_count_so_far >= MAX_REWORK_ROUNDS or not 1 <= rework_index <= MAX_REWORK_ROUNDS:
@@ -106,6 +107,10 @@ def run_bounded_rework(
             skill_path = worktree / order.skill_ref
             if skill_path.is_symlink() or not skill_path.is_file():
                 raise AgentDeliveryError("The authorized Delivery Skill is missing from the rework worktree.")
+            if expected_skill_sha256 and hashlib.sha256(skill_path.read_bytes()).hexdigest() != expected_skill_sha256:
+                raise AgentDeliveryError(
+                    "The Delivery Skill in the rework worktree differs from the authorized Skill; rework is blocked."
+                )
             outcome = run_claude(
                 worktree, skill_path, order, runtime_home, worker_config,
                 lifecycle=lifecycle, rework_directive=directive,

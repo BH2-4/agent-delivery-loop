@@ -159,21 +159,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Safely continue a delivery orchestration from its last confirmed stage; never re-runs the Worker"
     )
     resume_parser.add_argument("--orchestration-id", required=True)
-    for parser in (deliver_parser, resume_parser):
-        parser.add_argument("--plan-pr", required=True)
-        parser.add_argument("--work-order-path", required=True)
-        parser.add_argument("--repo-path", type=Path, default=Path.cwd())
-        _add_worker_arguments(parser)
-        parser.add_argument("--install-receipt", required=True, type=Path, help="Install provenance receipt for the running entry")
-        parser.add_argument("--expected-source-sha", required=True, help="Approved full source SHA the installation must match")
-        parser.add_argument("--expected-wheel-sha256", required=True, help="Approved wheel SHA-256 the installation must match")
-        parser.add_argument("--review-model", required=True)
-        parser.add_argument("--review-effort", required=True)
-        parser.add_argument("--review-timeout", type=int, default=900)
-        parser.add_argument("--review-bundle-dir", required=True, type=Path)
-        parser.add_argument("--proxy", default=None)
-        parser.add_argument("--ci-timeout", type=int, default=900)
-        parser.add_argument("--auto-merge", action="store_true", help="Merge the Delivery PR only after every gate passes")
+    for pipeline_parser in (deliver_parser, resume_parser):
+        pipeline_parser.add_argument("--plan-pr", required=True)
+        pipeline_parser.add_argument("--work-order-path", required=True)
+        pipeline_parser.add_argument("--repo-path", type=Path, default=Path.cwd())
+        _add_worker_arguments(pipeline_parser)
+        pipeline_parser.add_argument("--install-receipt", required=True, type=Path, help="Install provenance receipt for the running entry")
+        pipeline_parser.add_argument("--expected-source-sha", required=True, help="Approved full source SHA the installation must match")
+        pipeline_parser.add_argument("--expected-wheel-sha256", required=True, help="Approved wheel SHA-256 the installation must match")
+        pipeline_parser.add_argument("--review-model", required=True)
+        pipeline_parser.add_argument("--review-effort", required=True)
+        pipeline_parser.add_argument("--review-timeout", type=int, default=900)
+        pipeline_parser.add_argument("--review-bundle-dir", required=True, type=Path)
+        pipeline_parser.add_argument("--proxy", default=None)
+        pipeline_parser.add_argument("--ci-timeout", type=int, default=900)
+        pipeline_parser.add_argument("--auto-merge", action="store_true", help="Merge the Delivery PR only after every gate passes")
     evidence_parser = subparsers.add_parser(
         "check-evidence",
         help="Verify a Work Order's pinned review evidence resolves before any Worker runs"
