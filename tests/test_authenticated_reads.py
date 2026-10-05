@@ -664,6 +664,12 @@ class SpawnGateTests(unittest.TestCase):
             self.assertFalse(gate.exists())
             self.assertTrue(other.exists())
             store.assert_worker_available()  # unblocked only now
+            # Malformed gate content — including duplicate-key kind injection —
+            # never passes the release check and keeps blocking.
+            forged = store.record_path(key, "spawn-eeee1111")
+            forged.write_text('{"kind": "invalid", "kind": "orchestrator_spawn_gate"}', encoding="utf-8")
+            runner._release_own_spawn_gate(forged)
+            self.assertTrue(forged.exists())
 
     def test_tracked_runner_may_exempt_exactly_its_own_gate(self) -> None:
         from agent_delivery_loop.store import RunStateError

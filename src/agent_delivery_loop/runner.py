@@ -49,14 +49,23 @@ def _release_own_spawn_gate(gate_path: Path | None) -> None:
     content, mtime, or timestamp can release someone else's gate, and any failure path
     that never reaches a safe terminal write keeps the gate blocking.
     """
+
+    def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate gate field")
+            result[key] = value
+        return result
+
     if gate_path is None:
         return
     try:
-        record = json.loads(gate_path.read_text(encoding="utf-8"))
+        record = json.loads(gate_path.read_text(encoding="utf-8"), object_pairs_hook=_unique_keys)
         if isinstance(record, dict) and record.get("kind") == "orchestrator_spawn_gate":
             gate_path.unlink()
     except (OSError, ValueError):
-        # An unreadable gate keeps blocking; that is the safe direction.
+        # An unreadable or malformed gate keeps blocking; that is the safe direction.
         return
 
 
