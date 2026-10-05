@@ -222,7 +222,12 @@ def merge_delivery_pr(
                 f"merge is bound to OPEN at {candidate_sha} and was not executed."
             )
         try:
-            run_gh(["pr", "merge", str(pr_number), "--repo", repo_slug, "--merge"], proxy=proxy, timeout=120)
+            # Bind the write itself: the PR may change after the read-only preflight.
+            run_gh(
+                ["pr", "merge", str(pr_number), "--repo", repo_slug, "--merge",
+                 "--match-head-commit", candidate_sha],
+                proxy=proxy, timeout=120,
+            )
         except AgentDeliveryError:
             pass  # A lost merge response may still have merged the PR; the loop re-reads state.
     # Final read-only confirmation after the last bounded merge attempt.
