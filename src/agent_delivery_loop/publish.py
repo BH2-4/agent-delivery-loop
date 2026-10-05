@@ -44,8 +44,8 @@ GH_READ_BUDGET_SECONDS = 45.0
 # endpoint) plus output/header flags. Unknown flags, extra positionals (gh api treats
 # them as key=value fields and switches to POST) and any method/field/input spelling
 # — separated, --flag=value, or short-flag-attached — all disable retry (fail closed).
-_GH_API_FLAGS_WITH_VALUE = {"-H", "--header", "--jq", "--slurp"}
-_GH_API_SELF_CONTAINED_FLAGS = {"--verbose", "--paginate"}
+_GH_API_FLAGS_WITH_VALUE = {"-H", "--header", "--jq"}
+_GH_API_SELF_CONTAINED_FLAGS = {"--verbose", "--paginate", "--slurp"}
 _GH_TRANSIENT_PATTERNS = (
     "tls handshake timeout", "connection reset", "connection refused", "connection closed",
     "i/o timeout", "net/http", "dial tcp", "context deadline", "unexpected eof",

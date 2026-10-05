@@ -213,9 +213,16 @@ class GhReadOnlyRetryTests(unittest.TestCase):
             ["api", "-XPOST", "repos/o/r/pulls"],
             ["api", "--method=POST", "repos/o/r/pulls"],
             ["api", "repos/o/r/pulls", "-f", "title=x"],
+            ["api", "repos/o/r/pulls", "-F", "title=x"],
+            ["api", "repos/o/r/pulls", "--raw-field", "title=x"],
+            ["api", "repos/o/r/pulls", "--input", "body.json"],
             ["api", "repos/o/r/pulls", "--field=title=x"],
             # gh api treats extra positionals as key=value fields and switches to POST.
             ["api", "repos/o/r/pulls", "title=x"],
+            # --slurp is a boolean flag: it must not consume (and hide) a method override.
+            ["api", "--slurp", "--method=POST", "repos/o/r/pulls"],
+            # Everything after "--" is positional; a second positional is a POST field.
+            ["api", "--", "repos/o/r/pulls", "title=x"],
             ["pr", "merge", "26", "--repo", "o/r", "--merge"],
         ):
             with patch(
@@ -232,11 +239,14 @@ class GhReadOnlyRetryTests(unittest.TestCase):
             _completed(1, stderr="net/http: TLS handshake timeout"),
             _completed(0, stdout='"login"'),
         ]
-        args = ["api", "user", "--jq", ".login"]
-        with patch("agent_delivery_loop.publish.run_gh", side_effect=outcomes) as raw:
-            result = publish.gh_json(args, identity=identity)
-        self.assertEqual(result, "login")
-        self.assertEqual(raw.call_count, 2)
+        for args in (
+            ["api", "user", "--jq", ".login"],
+            ["api", "user", "--slurp", "--jq=.login", "--verbose"],
+        ):
+            with patch("agent_delivery_loop.publish.run_gh", side_effect=list(outcomes)) as raw:
+                result = publish.gh_json(list(args), identity=identity)
+            self.assertEqual(result, "login", msg=str(args))
+            self.assertEqual(raw.call_count, 2, msg=str(args))
 
     def test_empty_gh_args_report_sanitized_error(self) -> None:
         identity = _identity()
