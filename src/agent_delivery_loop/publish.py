@@ -137,12 +137,15 @@ def _bounded_items(payload: Any, key: str) -> list[dict[str, Any]]:
     return items
 
 
-def _ci_snapshot(identity: GitHubPAT, *, pr_number: int, head_sha: str, proxy: str | None) -> dict[str, Any]:
+def _ci_snapshot(
+    identity: GitHubPAT, *, pr_number: int, head_sha: str, proxy: str | None,
+    request_timeout: int = GH_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
     """Read the fixed workflow's newest run for this exact PR/head, then its latest jobs."""
     query = urlencode({"event": "pull_request", "head_sha": head_sha, "per_page": CI_PAGE_LIMIT})
     runs = _bounded_items(gh_json(
         ["api", f"repos/{identity.repository}/actions/workflows/{REQUIRED_WORKFLOW}/runs?{query}"],
-        identity=identity, proxy=proxy,
+        identity=identity, proxy=proxy, timeout=request_timeout,
     ), "workflow_runs")
     matches = []
     for run in runs:
@@ -151,8 +154,8 @@ def _ci_snapshot(identity: GitHubPAT, *, pr_number: int, head_sha: str, proxy: s
             raise AgentDeliveryError("Actions run lacks explicit PR association; no CI state was assumed.")
         # Real-world contract: merged pull_request runs may carry an EMPTY association
         # list (observed on this repository). head_sha already binds the run to this
-        # PR's exact candidate commit, so an empty list is accepted; an explicit
-        # association with a DIFFERENT PR is an unresolvable ambiguity and rejected.
+        # PR's exact candidate commit, so an empty list is accepted; a run explicitly
+        # associated with a different PR is excluded from matching.
         numbers = {pull.get("number") for pull in pulls}
         if numbers and pr_number not in numbers:
             continue
@@ -169,7 +172,7 @@ def _ci_snapshot(identity: GitHubPAT, *, pr_number: int, head_sha: str, proxy: s
     run = max(matches, key=lambda item: (item["id"], item["run_attempt"]))
     jobs = _bounded_items(gh_json(
         ["api", f"repos/{identity.repository}/actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page={CI_PAGE_LIMIT}"],
-        identity=identity, proxy=proxy,
+        identity=identity, proxy=proxy, timeout=request_timeout,
     ), "jobs")
     checks = []
     for job in jobs:
@@ -183,7 +186,10 @@ def _ci_snapshot(identity: GitHubPAT, *, pr_number: int, head_sha: str, proxy: s
         if state in {"NONE", ""}:
             raise AgentDeliveryError("A completed Actions job has no definite conclusion.")
         checks.append((job["name"], state))
-    confirmed = gh_json(["api", f"repos/{identity.repository}/actions/runs/{run['id']}"], identity=identity, proxy=proxy)
+    confirmed = gh_json(
+        ["api", f"repos/{identity.repository}/actions/runs/{run['id']}"],
+        identity=identity, proxy=proxy, timeout=request_timeout,
+    )
     if not isinstance(confirmed, dict) or any(
         confirmed.get(key) != run.get(key) for key in ("id", "head_sha", "run_attempt", "status", "conclusion")
     ):
@@ -425,7 +431,10 @@ def wait_for_ci(
         )
         if not isinstance(current, dict) or current.get("headRefOid") != head_sha or current.get("baseRefName") != "main":
             raise AgentDeliveryError("PR head/target changed while waiting for CI; nothing was merged.")
-        snapshot = _ci_snapshot(identity, pr_number=pr_number, head_sha=head_sha, proxy=proxy)
+        snapshot = _ci_snapshot(
+            identity, pr_number=pr_number, head_sha=head_sha, proxy=proxy,
+            request_timeout=remaining_timeout(),
+        )
         if time.monotonic() >= deadline:
             raise AgentDeliveryError("CI wait exceeded its total time budget before completion.")
         if snapshot["status"] == "completed":
@@ -446,5 +455,8 @@ def wait_for_ci(
             return {**snapshot, "source": "github_actions_rest", "head_sha": head_sha, "workflow": REQUIRED_WORKFLOW}
         if snapshot["status"] not in {"missing", "queued", "in_progress", "waiting", "pending", "requested"}:
             raise AgentDeliveryError("Actions workflow status is unknown; nothing was merged.")
-        time.sleep(CI_POLL_SECONDS)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise AgentDeliveryError("CI wait exceeded its total time budget before completion.")
+        time.sleep(min(CI_POLL_SECONDS, left))
     raise AgentDeliveryError(f"CI did not reach a terminal state within {timeout_seconds} seconds; nothing was merged.")

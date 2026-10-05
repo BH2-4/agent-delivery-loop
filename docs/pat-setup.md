@@ -30,7 +30,7 @@
 
 官方 PAT 总览仍列出 Checks API 限制，而具体 check-runs 读取端点列出细粒度 PAT 支持；因此本阶段不依赖 `gh pr checks`。选择官方明确支持细粒度 PAT 与 `Actions:read` 的工作流运行／指定 attempt 的 jobs REST 接口；真实账号兼容性仍需预检，不自动换 classic、个人登录或追加权限。[Workflow runs API](https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-workflow)、[Jobs API](https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run-attempt)
 
-当前只验证 `.github/workflows/ci.yml` 的 `pull_request` 运行：必须关联目标 PR 和精确 head SHA，选最新匹配 run，固定 run attempt、核对任务及回读 run；工作流与全部任务成功且唯一 `validate` 成功才通过。列表超过 100 条或不完整即停止，不漏扫后宣称通过。不读取外部 App checks／commit statuses，也不声称已核验所有仓库保护要求；若新增必需检查或改变工作流，必须先更新明确检查契约，不能默默忽略。
+当前只验证 `.github/workflows/ci.yml` 的 `pull_request` 运行：必须匹配精确 head SHA 并与目标 PR 不冲突（已合并 PR 的运行其关联列表可能为空，空关联按 head 绑定接受；显式关联其他 PR 的运行被排除），选最新匹配 run，固定 run attempt、核对任务及回读 run；工作流与全部任务成功且唯一 `validate` 成功才通过。列表超过 100 条或不完整即停止，不漏扫后宣称通过。不读取外部 App checks／commit statuses，也不声称已核验所有仓库保护要求；若新增必需检查或改变工作流，必须先更新明确检查契约，不能默默忽略。
 
 `Contents:write` 与 PR 合并接口权限重叠，不能称为“令牌硬性禁止合并”。`--auto-merge` 默认关闭；开启它还需要具体实验的授权和全部质量门禁，不得使用管理员绕过。[GitHub：合并 PR](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)
 

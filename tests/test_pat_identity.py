@@ -247,3 +247,38 @@ class ResumeIdentityBindingTests(unittest.TestCase):
                 with self.assertRaises(AgentDeliveryError) as raised:
                     resume(orchestration_id="orch-wrong", **common)
                 self.assertIn("identity", str(raised.exception))
+
+
+class VerifyCiCurrentSuccessTests(unittest.TestCase):
+    def test_latest_attempt_is_selected_and_success_path_returns_bindings(self) -> None:
+        from agent_delivery_loop import publish
+
+        identity = GitHubPAT(repository="o/r", expected_login="o", _token=FAKE_PAT)
+
+        def gh(args, *, identity, proxy=None, timeout=60):
+            identity.token_for("o/r")
+            url = args[-1]
+            if "/runs?" in url:
+                return {"total_count": 2, "workflow_runs": [
+                    {"id": 5, "run_attempt": 1, "head_sha": "a" * 40, "event": "pull_request",
+                     "path": ".github/workflows/ci.yml@refs/heads/main", "pull_requests": [],
+                     "status": "completed", "conclusion": "success", "html_url": "u5"},
+                    {"id": 6, "run_attempt": 2, "head_sha": "a" * 40, "event": "pull_request",
+                     "path": ".github/workflows/ci.yml@refs/heads/main", "pull_requests": [],
+                     "status": "completed", "conclusion": "success", "html_url": "u6"},
+                ]}
+            if "/attempts/2/jobs" in url:
+                return {"total_count": 1, "jobs": [
+                    {"name": "validate", "head_sha": "a" * 40, "run_id": 6, "status": "completed",
+                     "conclusion": "success"},
+                ]}
+            if url.endswith("/actions/runs/6"):
+                return {"id": 6, "run_attempt": 2, "head_sha": "a" * 40, "status": "completed",
+                        "conclusion": "success"}
+            raise AssertionError(url)
+
+        with patch.object(publish, "gh_json", side_effect=gh):
+            result = publish.verify_ci_current(identity, repo_slug="o/r", pr_number=7, head_sha="a" * 40)
+        self.assertEqual(result["workflow_run_id"], 6)  # max by (id, attempt) selects the newest run
+        self.assertEqual(result["run_attempt"], 2)
+        self.assertEqual(result["checks"], [("validate", "SUCCESS")])
