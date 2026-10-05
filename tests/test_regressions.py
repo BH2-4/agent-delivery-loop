@@ -666,31 +666,43 @@ class ReworkAndResumeTests(unittest.TestCase):
 
 class CiWaitTests(unittest.TestCase):
     def test_only_full_uppercase_success_with_required_check_passes(self) -> None:
+        import subprocess as _sp
+
         head = "c" * 40
         view = {"headRefOid": head}
-        with patch("agent_delivery_loop.publish.gh_json", side_effect=[
-            [{"name": "validate", "state": "SUCCESS", "link": "https://example.invalid/run/1"}], view,
-        ]):
+        pending = _sp.CompletedProcess([], 8, json.dumps(
+            [{"name": "validate", "state": "PENDING", "link": "https://example.invalid/run/1"}]
+        ), "")
+        passed = _sp.CompletedProcess([], 0, json.dumps(
+            [{"name": "validate", "state": "SUCCESS", "link": "https://example.invalid/run/1"}]
+        ), "")
+        with patch("agent_delivery_loop.publish.run_gh", side_effect=[pending, passed]), patch(
+            "agent_delivery_loop.publish.gh_json", return_value=view
+        ), patch("agent_delivery_loop.publish.CI_POLL_SECONDS", 0):
             outcome = _wait_for_ci(
                 repo_slug="o/r", pr_number=1, head_sha=head, timeout_seconds=5, proxy=None
             )
         self.assertEqual(outcome["checks"], [("validate", "SUCCESS")])
 
     def test_missing_required_check_or_failure_state_stops(self) -> None:
-        with patch("agent_delivery_loop.publish.gh_json", return_value=[
-            {"name": "other", "state": "SUCCESS"},
-        ]):
+        import subprocess as _sp
+
+        def gh(payload, code=0):
+            return _sp.CompletedProcess([], code, json.dumps(payload), "")
+
+        with patch("agent_delivery_loop.publish.run_gh", return_value=gh([{"name": "other", "state": "SUCCESS"}])):
             with self.assertRaises(AgentDeliveryError):
                 _wait_for_ci(repo_slug="o/r", pr_number=1, head_sha="c" * 40, timeout_seconds=5, proxy=None)
-        with patch("agent_delivery_loop.publish.gh_json", return_value=[
-            {"name": "validate", "state": "FAILURE"},
-        ]):
+        with patch("agent_delivery_loop.publish.run_gh", return_value=gh([{"name": "validate", "state": "FAILURE"}], 1)):
             with self.assertRaises(AgentDeliveryError):
                 _wait_for_ci(repo_slug="o/r", pr_number=1, head_sha="c" * 40, timeout_seconds=5, proxy=None)
 
     def test_empty_check_list_never_passes_as_success(self) -> None:
+        import subprocess as _sp
+
+        empty = _sp.CompletedProcess([], 8, "[]", "")
         with patch("agent_delivery_loop.publish.CI_POLL_SECONDS", 0):
-            with patch("agent_delivery_loop.publish.gh_json", return_value=[]):
+            with patch("agent_delivery_loop.publish.run_gh", return_value=empty):
                 with self.assertRaises(AgentDeliveryError):
                     _wait_for_ci(repo_slug="o/r", pr_number=1, head_sha="c" * 40, timeout_seconds=1, proxy=None)
 
