@@ -15,7 +15,6 @@ import os
 import re
 import signal
 import subprocess
-import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -240,53 +239,16 @@ def _preflight_spawn_gates(store: Any) -> None:
             )
 
 
-def _parse_iso_timestamp(value: Any) -> Any:
-    from datetime import datetime
-
-    if not isinstance(value, str):
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-
 def _resolve_spawn_gate(store: Any, task_key_value: str, gate_path: Path, registered_epoch: float) -> bool:
-    """Remove the gate only with trusted safe-end evidence bound to THIS spawn window.
+    """Failure paths never auto-release a spawn gate — kept for explicitness.
 
-    Three independent bindings, all required: (1) the gate's registration timestamp
-    parses and the evidence record's runner-written `started_at` parses and is at or
-    after it (datetime comparison — malformed values fail closed); (2) the evidence
-    file's mtime lies at or after the gate's own last write (the post-Popen flip);
-    (3) that mtime is not in the future beyond a small skew allowance, so a stale
-    record with a clock-shifted mtime can never masquerade as this window. Evidence =
-    a same-task run record with worker_status 'stopped' and a status the safety table
-    accepts. Absent that, the gate stays and blocks every launch path.
+    Gate release is exact-evidence only: the trusted runner releases its own gate right
+    after persisting its verified-safe terminal record (runner._release_own_spawn_gate),
+    and the orchestrator removes the gate idempotently on the success path once
+    _verify_worker_result has verified THIS spawn's record. Any other outcome (timeout,
+    interruption, hard kill, unconfirmed stop, malformed output) keeps the gate
+    blocking every launch path until manual safety review.
     """
-    try:
-        window_start = max(gate_path.stat().st_mtime, registered_epoch)
-        gate = _read_json(gate_path)
-        registered_at = _parse_iso_timestamp(gate.get("registered_at"))
-        if registered_at is None:
-            return False
-        now = time.time()
-        for path in (store.runs / task_key_value).glob("*.json"):
-            if path.name.startswith("spawn-"):
-                continue
-            record = _read_json(path)
-            started_at = _parse_iso_timestamp(record.get("started_at"))
-            mtime = path.stat().st_mtime
-            if (
-                record.get("worker_status") == "stopped"
-                and record.get("status") in {"validating", "local_ready", "delivery_pr_open", "cancelled", "failed"}
-                and started_at is not None
-                and started_at >= registered_at
-                and window_start <= mtime <= now + 5.0
-            ):
-                gate_path.unlink()
-                return True
-    except (OSError, ValueError):
-        return False
     return False
 
 
@@ -566,7 +528,6 @@ def _continue_inner(orchestration: Orchestration, params: _Params, *, fresh: boo
         _preflight_spawn_gates(store)
         gate_path = store.record_path(task_key_value, f"spawn-{orchestration.id[:8]}")
         store.write(task_key_value, gate_path.stem, _spawn_gate_record(orchestration.id, "pending"))
-        gate_registered_epoch = gate_path.stat().st_mtime
         try:
             agent_run_output = _spawn_agent_run(
                 entry=install["agent_run_entry"], repo_root=root, plan_pr=params.plan_pr,
@@ -577,22 +538,22 @@ def _continue_inner(orchestration: Orchestration, params: _Params, *, fresh: boo
                 identity=identity, store=store, task_key_value=task_key_value, gate_path=gate_path,
             )
         except AgentRunNotStartedError:
-            gate_path.unlink(missing_ok=True)  # Popen failed; no child was ever created.
+            gate_path.unlink(missing_ok=True)  # Popen/capture-open failed; no child was ever created.
             raise
         except BaseException:
-            # Unknown safe-end: keep the gate unless this spawn window produced a
-            # trusted 'stopped' run record (e.g. the runner finished its own cleanup).
-            _resolve_spawn_gate(store, task_key_value, gate_path, gate_registered_epoch)
+            # Unknown safe-end: the gate stays. Only the runner's own verified-safe
+            # terminal record (or the verified success path below) can release it.
             raise
         run_id = agent_run_output.get("run_id")
         delivery_branch = agent_run_output.get("delivery_branch")
         delivery_commit = agent_run_output.get("delivery_commit")
         if not isinstance(run_id, str) or not isinstance(delivery_branch, str) or not SHA_RE.fullmatch(str(delivery_commit)):
-            _resolve_spawn_gate(store, task_key_value, gate_path, gate_registered_epoch)
             raise AgentDeliveryError("agent-run did not report a run ID, delivery branch, and full delivery commit.")
         record_path = _worker_record_path(plan_repo.slug, order.task_id, order.revision, run_id)
         worker_record = _verify_worker_result(record_path, run_id, str(delivery_commit), order)
-        _resolve_spawn_gate(store, task_key_value, gate_path, gate_registered_epoch)
+        # Exact-evidence release: THIS spawn's record is verified stopped-complete
+        # (the runner normally already released its own gate; this is idempotent).
+        gate_path.unlink(missing_ok=True)
         worktree = store.root / "worktrees" / run_id
         orchestration.save(
             stage="worker_completed",

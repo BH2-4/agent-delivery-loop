@@ -622,46 +622,25 @@ class SpawnGateTests(unittest.TestCase):
 
         return RunStore(base / "state")
 
-    def test_stale_safe_evidence_cannot_release_a_newer_gate(self) -> None:
+    def test_no_record_content_ever_releases_a_gate_heuristically(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = self._store(Path(temporary))
             key = "k"
-            # A safe record from an EARLIER launch — even with a FUTURE mtime (clock
-            # skew), its runner-written started_at predates this gate's registration.
-            store.write(key, "11111111-1111-1111-1111-111111111111", {
-                "schema_version": 1, "run_id": "11111111-1111-1111-1111-111111111111",
-                "worker_status": "stopped", "status": "local_ready",
-                "started_at": "2020-01-01T00:00:00+00:00",
-            })
-            old = store.record_path(key, "11111111-1111-1111-1111-111111111111")
-            # ...then THIS spawn's gate flips, plus an unconfirmed current record.
+            # Even a perfectly plausible fresh safe record for the same task cannot
+            # release the gate through the orchestrator's failure path: release is
+            # exact-evidence only (the runner's own terminal write, or the verified
+            # success path). Forged, stale, or clock-shifted evidence is irrelevant.
             gate = store.record_path(key, "spawn-abcd1234")
             store.write(key, "spawn-abcd1234", orchestrator._spawn_gate_record("abcd1234-full", "started"))
-            store.write(key, "22222222-2222-2222-2222-222222222222", {
-                "schema_version": 1, "run_id": "22222222-2222-2222-2222-222222222222",
-                "worker_status": "stop_unconfirmed", "status": "cleanup_failed",
-            })
-            import os as _os
-
-            future = _os.stat(old).st_mtime + 3600.0
-            _os.utime(old, (future, future))
-            self.assertFalse(orchestrator._resolve_spawn_gate(
-                store, key, gate, gate.stat().st_mtime - 5.0,
-            ))
-            self.assertTrue(gate.exists())
-            # A malformed started_at must also fail closed even with a fresh mtime.
-            _os.utime(old, (_os.stat(old).st_mtime - 7200.0,) * 2)
             store.write(key, "11111111-1111-1111-1111-111111111111", {
                 "schema_version": 1, "run_id": "11111111-1111-1111-1111-111111111111",
                 "worker_status": "stopped", "status": "local_ready",
-                "started_at": "not-a-timestamp",
+                "started_at": json.loads(gate.read_text(encoding="utf-8"))["registered_at"],
             })
-            self.assertFalse(orchestrator._resolve_spawn_gate(
-                store, key, gate, gate.stat().st_mtime - 5.0,
-            ))
+            self.assertFalse(orchestrator._resolve_spawn_gate(store, key, gate, 0.0))
             self.assertTrue(gate.exists())
 
-    def test_started_gate_actually_blocks_until_trusted_evidence_resolves_it(self) -> None:
+    def test_started_gate_blocks_until_the_runner_releases_its_own_gate(self) -> None:
         from agent_delivery_loop.store import RunStateError
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -669,26 +648,21 @@ class SpawnGateTests(unittest.TestCase):
             key = "k"
             gate = store.record_path(key, "spawn-abcd1234")
             store.write(key, "spawn-abcd1234", orchestrator._spawn_gate_record("abcd1234-full", "started"))
-            registered = gate.stat().st_mtime
             # Real blocking: every launch check refuses while the gate is unresolved.
             with self.assertRaises(RunStateError):
                 store.assert_worker_available()
             with self.assertRaises(AgentDeliveryError):
                 orchestrator._preflight_spawn_gates(store)
-            self.assertFalse(orchestrator._resolve_spawn_gate(store, key, gate, registered))
-            self.assertTrue(gate.exists())
-            with self.assertRaises(RunStateError):
-                store.assert_worker_available()
-            # Trusted evidence from THIS window: a stopped-safe run record whose
-            # runner-written started_at is at or after the gate's registration.
-            gate_registered_at = json.loads(gate.read_text(encoding="utf-8"))["registered_at"]
-            store.write(key, "11111111-1111-1111-1111-111111111111", {
-                "schema_version": 1, "run_id": "11111111-1111-1111-1111-111111111111",
-                "worker_status": "stopped", "status": "local_ready",
-                "started_at": gate_registered_at,
+            # The trusted runner releases exactly its own gate after its verified-safe
+            # terminal write; a different valid record is never touched.
+            store.write(key, "33333333-3333-3333-3333-333333333333", {
+                "schema_version": 1, "run_id": "33333333-3333-3333-3333-333333333333",
+                "worker_status": "not_started", "status": "not_started",
             })
-            self.assertTrue(orchestrator._resolve_spawn_gate(store, key, gate, registered))
+            other = store.record_path(key, "33333333-3333-3333-3333-333333333333")
+            runner._release_own_spawn_gate(gate)
             self.assertFalse(gate.exists())
+            self.assertTrue(other.exists())
             store.assert_worker_available()  # unblocked only now
 
     def test_tracked_runner_may_exempt_exactly_its_own_gate(self) -> None:

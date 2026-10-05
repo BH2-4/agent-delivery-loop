@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import uuid
 from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
@@ -37,6 +38,26 @@ from .github_app import GitHubAppConfig, GitHubAppTokenProvider
 from .github_identity import GitHubPAT
 from .store import RunStateError, RunStore, authorization_key, default_state_dir, now_utc, task_key
 from .work_order import WorkOrder, parse_work_order
+
+
+def _release_own_spawn_gate(gate_path: Path | None) -> None:
+    """Release exactly this launch's spawn gate after persisting a verified-safe end.
+
+    Only the trusted runner that owns the gate calls this, and only right after it has
+    durably written its own safe terminal record (Worker confirmed stopped, or never
+    started). The exact-file binding replaces every time-window heuristic: no record
+    content, mtime, or timestamp can release someone else's gate, and any failure path
+    that never reaches a safe terminal write keeps the gate blocking.
+    """
+    if gate_path is None:
+        return
+    try:
+        record = json.loads(gate_path.read_text(encoding="utf-8"))
+        if isinstance(record, dict) and record.get("kind") == "orchestrator_spawn_gate":
+            gate_path.unlink()
+    except (OSError, ValueError):
+        # An unreadable gate keeps blocking; that is the safe direction.
+        return
 
 
 def _validate_paths(worktree: Path, order: WorkOrder, paths: Sequence[str]) -> list[str]:
@@ -310,6 +331,7 @@ def execute_plan(
                 record["status"] = "delivery_pr_open"
             record["finished_at"] = now_utc()
             store.write(task_identity_key, run_id, record)
+            _release_own_spawn_gate(exempt_record)  # own verified-safe end persisted
             return {
                 **record,
                 "worktree_id": run_id,
@@ -323,6 +345,7 @@ def execute_plan(
                 record,
                 reason=str(exc),
             )
+            _release_own_spawn_gate(exempt_record)  # Worker never started
             raise AgentDeliveryError(f"Work Order was cancelled before the Worker started. Run ID: {run_id}.") from None
         except WorkerCancelled as exc:
             worker_lifecycle.status = "stopped"
@@ -335,6 +358,7 @@ def execute_plan(
                 session_id=exc.session_id,
                 reason="Cancellation completed after the Worker process group stopped.",
             )
+            _release_own_spawn_gate(exempt_record)  # own verified-safe end persisted
             raise AgentDeliveryError(f"Work Order was cancelled after Worker cleanup. Run ID: {run_id}.") from None
         except WorkerCleanupError as exc:
             worker_lifecycle.status = "stop_unconfirmed"
@@ -359,6 +383,7 @@ def execute_plan(
                     record,
                     reason="Cancellation occurred before the Worker started.",
                 )
+                _release_own_spawn_gate(exempt_record)  # Worker never started
                 raise AgentDeliveryError(f"Work Order was cancelled before the Worker started. Run ID: {run_id}.") from None
             if worker_lifecycle.status == "stopped":
                 _record_cancelled_run(
@@ -369,6 +394,7 @@ def execute_plan(
                     session_id=worker_lifecycle.session_id,
                     reason="Run cancelled after the Worker process group was confirmed stopped.",
                 )
+                _release_own_spawn_gate(exempt_record)  # own verified-safe end persisted
                 raise AgentDeliveryError(f"Work Order was cancelled after Worker cleanup. Run ID: {run_id}.") from None
             _record_cleanup_failed_run(
                 store,
@@ -403,6 +429,8 @@ def execute_plan(
                     record["session_id"] = exc.session_id
             record["failure"] = str(exc) if isinstance(exc, AgentDeliveryError) else "Unexpected worker failure; raw output was suppressed."
             store.write(task_identity_key, run_id, record)
+            if worker_lifecycle.status in {"not_started", "stopped"}:
+                _release_own_spawn_gate(exempt_record)  # own verified-safe end persisted
             if isinstance(exc, AgentDeliveryError):
                 raise AgentDeliveryError(f"{exc} Run ID: {run_id}.") from None
             raise AgentDeliveryError(record["failure"]) from None
