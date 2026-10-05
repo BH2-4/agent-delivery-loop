@@ -154,6 +154,7 @@ def execute_plan(
     worker_config: ClaudeConfig,
     publish: bool = False,
     pat_identity: GitHubPAT | None = None,
+    spawn_gate_name: str | None = None,
 ) -> dict[str, Any]:
     root = repository_root(repo_path.expanduser().resolve())
     _validate_worker_config_root(root, worker_config)
@@ -234,7 +235,22 @@ def execute_plan(
     }
     worker_lifecycle = WorkerLifecycle()
 
-    with store.claim(task_identity_key):
+    # The orchestrator's durable spawn gate tracks this launch; exempt exactly that one
+    # record so this runner may start while every other launch path stays blocked by it.
+    exempt_record: Path | None = None
+    if spawn_gate_name is not None:
+        parts = spawn_gate_name.split("/")
+        candidate_gate = store.runs / spawn_gate_name if len(parts) == 2 else None
+        if (
+            candidate_gate is None
+            or not parts[1].startswith("spawn-")
+            or not parts[1].endswith(".json")
+            or not candidate_gate.is_file()
+        ):
+            raise AgentDeliveryError("The orchestrator spawn gate is invalid or missing; refusing to run.")
+        exempt_record = candidate_gate
+
+    with store.claim(task_identity_key, exempt_record=exempt_record):
         # This durable, read-back-verified record is the gate BEFORE any Worker
         # creation. A later failed/interrupted update cannot release it.
         store.write(task_identity_key, run_id, record)

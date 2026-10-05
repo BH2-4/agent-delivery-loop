@@ -117,8 +117,17 @@ class GitHubClient:
         is_read = method.upper() == "GET"
         retries_left = len(READ_RETRY_DELAYS_SECONDS) if is_read else 0
         for attempt in range(retries_left + 1):
+            remaining = deadline - time.monotonic()
+            if remaining < 1.0:
+                # Exhausted (or sub-second) budget never starts a request, and a
+                # per-attempt timeout never exceeds the remaining time. Nothing was
+                # sent, so a write here is a plain failure, not an unknown outcome.
+                raise AgentDeliveryError(
+                    "GitHub API request was not started: the read budget was already exhausted."
+                ) from None
+            attempt_timeout = min(READ_ATTEMPT_TIMEOUT_SECONDS, remaining)
             try:
-                with urllib.request.urlopen(request, timeout=READ_ATTEMPT_TIMEOUT_SECONDS) as response:
+                with urllib.request.urlopen(request, timeout=attempt_timeout) as response:
                     body = response.read()
                 break
             except urllib.error.HTTPError as exc:

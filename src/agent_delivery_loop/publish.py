@@ -40,6 +40,9 @@ CREDENTIAL_ENV_NAMES = (
 # CI deadline, and non-read-only invocations (writes) always stay single-attempt.
 GH_READ_RETRY_DELAYS_SECONDS = (2.0, 8.0)
 GH_READ_BUDGET_SECONDS = 45.0
+# A request starts only while at least this much budget remains; a sub-second
+# remainder is never rounded up into a longer per-attempt timeout.
+GH_READ_MIN_ATTEMPT_SECONDS = 1.0
 # `gh api` GET semantics are proven ONLY by an allowlist: exactly one positional (the
 # endpoint) plus output/header flags. Unknown flags, extra positionals (gh api treats
 # them as key=value fields and switches to POST) and any method/field/input spelling
@@ -72,7 +75,7 @@ def _proxy_env(proxy: str | None) -> dict[str, str]:
 
 def run_gh(
     args: list[str], *, identity: GitHubPAT,
-    proxy: str | None = None, timeout: int = GH_TIMEOUT_SECONDS,
+    proxy: str | None = None, timeout: float = GH_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
     env = {key: value for key, value in os.environ.items() if key not in CREDENTIAL_ENV_NAMES}
     for key in ("GH_DEBUG", "DEBUG", "GH_HOST", "GH_REPO", "GH_CONFIG_DIR"):
@@ -100,7 +103,7 @@ def run_gh(
 
 def gh_json(
     args: list[str], *, identity: GitHubPAT, proxy: str | None = None,
-    timeout: int = GH_TIMEOUT_SECONDS,
+    timeout: float = GH_TIMEOUT_SECONDS,
 ) -> Any:
     result = run_gh_read(args, identity=identity, proxy=proxy, timeout=timeout)
     if result.returncode != 0:
@@ -156,7 +159,7 @@ def _classify_gh_failure(stderr: str) -> str:
 
 def run_gh_read(
     args: list[str], *, identity: GitHubPAT, proxy: str | None = None,
-    timeout: int = GH_TIMEOUT_SECONDS, return_hard_failures: bool = False,
+    timeout: float = GH_TIMEOUT_SECONDS, return_hard_failures: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Run a provably read-only gh invocation with bounded transient-network retries.
 
@@ -164,8 +167,12 @@ def run_gh_read(
     be retried keep using run_gh directly. Rate limiting, authentication/permission denials
     and unrecognised failures stop immediately; only transient transport failures retry,
     inside one monotonic-clock budget shared by all attempts and bounded by `timeout`.
-    `return_hard_failures` lets a caller that must inspect definitive non-transient
-    statuses itself (e.g. 404 handling) receive the raw result instead of an exception.
+    Budget semantics are strict: no request is started when the remaining budget is
+    exhausted or below one second, and a per-attempt timeout never exceeds the remaining
+    time (never rounded up). Backoff also reserves room for one further attempt. The
+    budget derives from this call's `timeout` only, so it can never extend an outer
+    CI deadline. `return_hard_failures` lets a caller that must inspect definitive
+    non-transient statuses itself (e.g. 404 handling) receive the raw result.
     """
     if not _is_read_only_gh_args(args):
         return run_gh(args, identity=identity, proxy=proxy, timeout=timeout)
@@ -174,21 +181,27 @@ def run_gh_read(
     attempts = 0
     result: subprocess.CompletedProcess[str] | None = None
     while attempts < len(GH_READ_RETRY_DELAYS_SECONDS) + 1:
-        attempts += 1
         remaining = deadline - time.monotonic()
-        if remaining <= 0 and attempts > 1:
-            break
-        result = run_gh(args, identity=identity, proxy=proxy, timeout=max(1, int(remaining)) if remaining > 0 else timeout)
+        if remaining < GH_READ_MIN_ATTEMPT_SECONDS:
+            break  # Exhausted (or sub-second) budget never starts a request.
+        attempts += 1
+        result = run_gh(args, identity=identity, proxy=proxy, timeout=min(float(timeout), remaining))
         if result.returncode == 0:
             return result
         category = _classify_gh_failure(result.stderr or "")
         if category != "transient_network" or attempts > len(GH_READ_RETRY_DELAYS_SECONDS):
             break
-        delay = min(GH_READ_RETRY_DELAYS_SECONDS[attempts - 1], max(0.0, deadline - time.monotonic()))
+        delay = min(
+            GH_READ_RETRY_DELAYS_SECONDS[attempts - 1],
+            deadline - time.monotonic() - GH_READ_MIN_ATTEMPT_SECONDS,
+        )
         if delay <= 0:
             break
         time.sleep(delay)
-    assert result is not None
+    if result is None:
+        raise AgentDeliveryError(
+            f"gh {' '.join(args[:2])} was not started: the read budget was already exhausted; no state was assumed."
+        )
     if result.returncode != 0:
         category = _classify_gh_failure(result.stderr or "")
         if return_hard_failures and category != "transient_network":

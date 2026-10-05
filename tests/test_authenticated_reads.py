@@ -5,6 +5,7 @@ network calls, or model subprocesses are used."""
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import subprocess
 import tempfile
@@ -50,7 +51,14 @@ class OrchestratorPatChannelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             stdout = Path(temporary) / "out.json"
             stdout.write_text("{}", encoding="utf-8")
+            gate_path = Path(temporary) / "runs" / "k" / "spawn-abcd1234.json"
+            gate_path.parent.mkdir(parents=True)
             captured: dict[str, object] = {}
+            gate_writes: list[dict] = []
+
+            class FakeStore:
+                def write(self, _key, run_id, record):  # gate flip durability
+                    gate_writes.append({"run_id": run_id, "phase": record.get("phase")})
 
             def fake_popen(argv, **kwargs):  # noqa: ANN001
                 captured["argv"] = argv
@@ -71,15 +79,19 @@ class OrchestratorPatChannelTests(unittest.TestCase):
                     model="m", base_url="https://api.example", effort="max",
                     auth_config=Path("/nowhere"), timeout_seconds=30, proxy=None,
                     stdout_path=stdout, identity=identity,
+                    store=FakeStore(), task_key_value="k", gate_path=gate_path,
                 )
             self.assertEqual(result, {"agent_run_exit_code": 0})
             env = captured["env"]
             self.assertEqual(env["AGENT_DELIVERY_PAT"], FAKE_PAT)
             self.assertEqual(env["AGENT_DELIVERY_PAT_LOGIN"], "o")
+            self.assertEqual(env["AGENT_DELIVERY_SPAWN_GATE"], f"k/{gate_path.name}")
             self.assertNotIn("GH_TOKEN", env)
             self.assertNotIn(FAKE_PAT, " ".join(captured["argv"]))
             # The orchestrator's own environment never carries the channel.
             self.assertNotIn("AGENT_DELIVERY_PAT", os.environ)
+            # The gate was flipped to the blocking phase once the handle existed.
+            self.assertEqual(gate_writes, [{"run_id": "spawn-abcd1234", "phase": "started"}])
 
     def test_cli_consumes_channel_and_closes_it_fail_closed(self) -> None:
         with patch.dict(os.environ, {"AGENT_DELIVERY_PAT": FAKE_PAT, "AGENT_DELIVERY_PAT_LOGIN": "o"}):
@@ -268,15 +280,20 @@ class GhReadOnlyRetryTests(unittest.TestCase):
 class SpawnInterruptionTests(unittest.TestCase):
     def _spawn(self, temporary: Path, stop_result: bool, expected: type[BaseException]):
         stdout = temporary / "out.json"
+        gate_path = temporary / "spawn-abcd1234.json"
 
         class InterruptedProcess:
             def wait(self, timeout=None):  # noqa: ANN001 - subprocess API shape
                 raise KeyboardInterrupt()
 
+        class FakeStore:
+            def write(self, *_args, **_kwargs) -> None:
+                return None
+
         with patch(
             "agent_delivery_loop.orchestrator.subprocess.Popen", return_value=InterruptedProcess(),
         ), patch(
-            "agent_delivery_loop.claude_worker._stop_process_group", return_value=stop_result,
+            "agent_delivery_loop.orchestrator._stop_agent_run_bounded", return_value=stop_result,
         ) as stop:
             with self.assertRaises(expected) as caught:
                 orchestrator._spawn_agent_run(
@@ -286,6 +303,7 @@ class SpawnInterruptionTests(unittest.TestCase):
                     model="m", base_url="https://api.example", effort="max",
                     auth_config=Path("/nowhere"), timeout_seconds=30, proxy=None,
                     stdout_path=stdout, identity=_identity(),
+                    store=FakeStore(), task_key_value="k", gate_path=gate_path,
                 )
         stop.assert_called_once()
         return caught.exception
@@ -298,6 +316,237 @@ class SpawnInterruptionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             raised = self._spawn(Path(temporary), stop_result=False, expected=AgentDeliveryError)
             self.assertIn("could not be confirmed stopped", str(raised))
+
+
+class ReviewIdentityWiringTests(unittest.TestCase):
+    def _repo(self, base: Path) -> Path:
+        repo = base / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "https://github.com/o/r.git"], check=True)
+        (repo / "f.txt").write_text("x", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "c"], check=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+        return repo
+
+    def _record(self, base: Path, run_id: str) -> Path:
+        record_dir = base / "runs"
+        record_dir.mkdir(exist_ok=True)
+        record = {
+            "schema_version": 1, "run_id": run_id, "session_id": "11111111-1111-1111-1111-111111111111",
+            "worker_status": "stopped", "status": "local_ready", "completion_status": "complete",
+            "incomplete_items": [], "failure": None, "finished_at": "2026-10-06T00:00:00+00:00",
+        }
+        path = record_dir / f"{run_id}.json"
+        path.write_text(json.dumps(record), encoding="utf-8")
+        return path
+
+    def test_snapshot_builds_the_authenticated_client_from_the_identity(self) -> None:
+        import agent_delivery_loop.review_handoff as handoff
+
+        class Sentinel(AgentDeliveryError):
+            pass
+
+        seen: dict[str, object] = {}
+
+        class FakeClient:
+            def __init__(self, repo, token=None):  # noqa: ANN001
+                seen["repo"] = repo.slug
+                seen["token"] = token
+                raise Sentinel("stop-before-network")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repo = self._repo(base)
+            record = self._record(base, "22222222-2222-2222-2222-222222222222")
+            head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+            with patch.object(handoff, "GitHubClient", FakeClient):
+                with self.assertRaises(Sentinel):
+                    handoff._snapshot(
+                        repo_path=repo, plan_pr="o/r#26",
+                        work_order_path=".agents/work-orders/WO-X-001-r1.json",
+                        run_record=record, head_sha=head, pat_identity=_identity(),
+                    )
+                self.assertEqual(seen, {"repo": "o/r", "token": FAKE_PAT})
+                seen.clear()
+                with self.assertRaises(Sentinel):
+                    handoff._snapshot(
+                        repo_path=repo, plan_pr="o/r#26",
+                        work_order_path=".agents/work-orders/WO-X-001-r1.json",
+                        run_record=record, head_sha=head,
+                    )
+                # The legacy entry keeps the anonymous client.
+                self.assertEqual(seen, {"repo": "o/r", "token": None})
+
+    def test_review_loop_forwards_identity_to_prepare_and_check(self) -> None:
+        from unittest.mock import Mock
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repo = self._repo(base)
+            branch = "agent/x-r1-abcd1234"
+            subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", branch], check=True)
+            head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+            receipt = base / "res.json"
+            receipt.write_text(json.dumps({"verdict": "pass", "findings": []}), encoding="utf-8")
+            instance = Mock()
+            instance.record = {"candidate": {"sha": head, "origin": "worker", "review_round": 0}}
+            fake_review = {"review_id": "rv", "codex_version": "v", "exit_code": 0,
+                           "stop_status": "confirmed_stopped", "result_path": str(receipt)}
+            identity = _identity()
+            params = orchestrator._Params(
+                plan_pr="o/r#26", work_order_path="wo", review_timeout_seconds=60,
+                review_model="m", review_effort="high", review_bundle_dir=base / "bundle", proxy=None,
+                model="m", base_url="https://x", effort="max", auth_config=base / "a.json",
+            )
+
+            class _Repo:
+                slug = "o/r"
+
+            with patch.object(orchestrator, "prepare_review") as prep, \
+                 patch.object(orchestrator, "run_review_process", return_value=fake_review), \
+                 patch.object(orchestrator, "check_review") as check:
+                state = orchestrator._review_loop(
+                    instance, params, repo, _Repo(), Mock(), None,
+                    base / "rr.json", repo, branch, skill_sha256=None, identity=identity,
+                )
+            self.assertEqual(state, {"candidate": head})
+            self.assertIs(prep.call_args.kwargs["pat_identity"], identity)
+            self.assertIs(check.call_args.kwargs["pat_identity"], identity)
+
+
+class TwoLayerStopTests(unittest.TestCase):
+    """Real local subprocesses, no credentials and no models: prove that stopping the
+    outer Python process group is possible while an inner, separately-sessioned child
+    stays alive — exactly why outer-stop can never prove the inner Worker stopped."""
+
+    OUTER = (
+        "import subprocess,sys,time\n"
+        "inner=subprocess.Popen(['sleep','120'],start_new_session=True)\n"
+        "print(inner.pid,flush=True)\n"
+        "time.sleep(120)\n"
+    )
+
+    def test_sigint_first_stop_confirms_outer_but_not_the_inner_group(self) -> None:
+        import signal as signal_module
+
+        outer = subprocess.Popen(
+            ["python3", "-c", self.OUTER], start_new_session=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        try:
+            inner_pid = int(outer.stdout.readline().strip())
+            confirmed = orchestrator._stop_agent_run_bounded(outer)
+            self.assertTrue(confirmed)  # outer group confirmed stopped
+            self.assertIsNotNone(outer.poll())
+            # The inner group is a separate session: it must still be alive, proving
+            # that an outer-stop confirmation says nothing about the inner program.
+            os.kill(inner_pid, 0)
+        finally:
+            outer.kill()
+            try:
+                os.killpg(inner_pid, signal_module.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            outer.wait(timeout=10)
+
+
+class SpawnGateTests(unittest.TestCase):
+    def _store(self, base: Path):
+        from agent_delivery_loop.store import RunStore
+
+        return RunStore(base / "state")
+
+    def test_started_gate_actually_blocks_until_trusted_evidence_resolves_it(self) -> None:
+        from agent_delivery_loop.store import RunStateError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = self._store(Path(temporary))
+            key = "k"
+            gate = store.record_path(key, "spawn-abcd1234")
+            store.write(key, "spawn-abcd1234", orchestrator._spawn_gate_record("abcd1234-full", "started"))
+            registered = gate.stat().st_mtime
+            # Real blocking: every launch check refuses while the gate is unresolved.
+            with self.assertRaises(RunStateError):
+                store.assert_worker_available()
+            with self.assertRaises(AgentDeliveryError):
+                orchestrator._preflight_spawn_gates(store)
+            self.assertFalse(orchestrator._resolve_spawn_gate(store, key, gate, registered))
+            self.assertTrue(gate.exists())
+            with self.assertRaises(RunStateError):
+                store.assert_worker_available()
+            # Trusted evidence from THIS window: a stopped-safe run record.
+            store.write(key, "11111111-1111-1111-1111-111111111111", {
+                "schema_version": 1, "run_id": "11111111-1111-1111-1111-111111111111",
+                "worker_status": "stopped", "status": "local_ready",
+            })
+            self.assertTrue(orchestrator._resolve_spawn_gate(store, key, gate, registered))
+            self.assertFalse(gate.exists())
+            store.assert_worker_available()  # unblocked only now
+
+    def test_tracked_runner_may_exempt_exactly_its_own_gate(self) -> None:
+        from agent_delivery_loop.store import RunStateError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = self._store(Path(temporary))
+            gate = store.record_path("k", "spawn-abcd1234")
+            store.write("k", "spawn-abcd1234", orchestrator._spawn_gate_record("abcd1234-full", "started"))
+            # The tracked child may start (its own gate is exempted) ...
+            store.assert_worker_available(exempt_record=gate)
+            # ... while every other check keeps blocking.
+            with self.assertRaises(RunStateError):
+                store.assert_worker_available()
+
+    def test_pending_gate_is_nonblocking_and_preflight_still_refuses_new_spawns(self) -> None:
+        from agent_delivery_loop.store import RunStateError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = self._store(Path(temporary))
+            store.write("k", "spawn-abcd1234", orchestrator._spawn_gate_record("abcd1234-full", "pending"))
+            # Pre-start phase is truthful and non-blocking for ordinary safety scans ...
+            store.assert_worker_available()
+            # ... but the orchestrator's spawn preflight still refuses a new spawn.
+            with self.assertRaises(AgentDeliveryError):
+                orchestrator._preflight_spawn_gates(store)
+
+
+class StrictBudgetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        sleeper = patch("agent_delivery_loop.publish.time.sleep", lambda _s: None)
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
+
+    def test_exhausted_or_subsecond_budget_starts_no_request(self) -> None:
+        identity = _identity()
+        for timeout in (0.0, 0.5, 0.999):
+            with patch("agent_delivery_loop.publish.run_gh") as raw:
+                with self.assertRaises(AgentDeliveryError) as caught:
+                    publish.run_gh_read(["api", "user"], identity=identity, timeout=timeout)
+            self.assertEqual(raw.call_count, 0)
+            self.assertIn("was not started", str(caught.exception))
+
+    def test_per_attempt_timeout_never_exceeds_the_remaining_budget(self) -> None:
+        identity = _identity()
+        captured: list[float] = []
+
+        def fake_run_gh(args, *, identity=None, proxy=None, timeout=0):  # noqa: ANN001
+            captured.append(float(timeout))
+            return _completed(1, stderr="net/http: TLS handshake timeout")
+
+        with patch("agent_delivery_loop.publish.run_gh", side_effect=fake_run_gh):
+            with self.assertRaises(AgentDeliveryError):
+                publish.run_gh_read(["api", "user"], identity=identity, timeout=3.5)
+        self.assertTrue(1 <= len(captured) <= 3)
+        self.assertLessEqual(max(captured), 3.5)
+        # Attempts never get a longer timeout than the budget that is left,
+        # and never more than the single-call ceiling.
+        self.assertLessEqual(max(captured), 3.5 + 1e-9)
+        for value in captured:
+            self.assertGreater(value, 0.0)
 
 
 if __name__ == "__main__":

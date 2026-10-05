@@ -82,7 +82,7 @@ def _report_error(exc: Exception) -> int:
 
 
 def _take_orchestrator_pat(plan_pr: str) -> GitHubPAT | None:
-    """Consume the orchestrator's one-shot PAT channel for the trusted runner.
+    """Consume the orchestrator's one-shot credential channel for the trusted runner.
 
     The channel is read once and closed immediately: the variables leave os.environ before
     any model subprocess can exist, and an invalid value fails closed rather than falling
@@ -98,6 +98,14 @@ def _take_orchestrator_pat(plan_pr: str) -> GitHubPAT | None:
     return GitHubPAT.from_value(repository=repository, expected_login=login, token=token)
 
 
+def _take_spawn_gate_name(pat_present: bool) -> str | None:
+    """Consume the one-shot spawn-gate name (not a credential) for the trusted runner."""
+    gate = os.environ.pop("AGENT_DELIVERY_SPAWN_GATE", None)
+    if gate is not None and not pat_present:
+        raise AgentDeliveryError("The orchestrator spawn gate was set without a PAT channel; refusing to run.")
+    return gate
+
+
 def agent_run_main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agent-run", description="Run one Work Order authorized by a merged Plan PR.")
     parser.add_argument("--plan-pr", required=True, help="Merged Plan PR URL or OWNER/REPO#NUMBER")
@@ -109,6 +117,7 @@ def agent_run_main(argv: Sequence[str] | None = None) -> int:
     try:
         repo_root, worker_config = _worker_config(args)
         pat_identity = _take_orchestrator_pat(args.plan_pr)
+        spawn_gate_name = _take_spawn_gate_name(pat_present=pat_identity is not None)
         _print_result(
             execute_plan(
                 repo_path=repo_root,
@@ -117,6 +126,7 @@ def agent_run_main(argv: Sequence[str] | None = None) -> int:
                 worker_config=worker_config,
                 publish=args.publish,
                 pat_identity=pat_identity,
+                spawn_gate_name=spawn_gate_name,
             )
         )
         return 0
