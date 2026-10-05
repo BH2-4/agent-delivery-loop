@@ -529,6 +529,77 @@ class TwoLayerStopTests(unittest.TestCase):
                     runner.execute_plan(**run_kwargs, spawn_gate_name=f"{right_key}/{gate.name}")
                 self.assertEqual(reached_worktree, [True])
 
+    def test_gate_swapped_before_claim_is_rejected_and_never_released(self) -> None:
+        from types import SimpleNamespace
+        from agent_delivery_loop.store import RunStore, task_key as store_task_key
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repo = base / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+            (repo / "f").write_text("x", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "c"], check=True,
+                           env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+            subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "https://github.com/o/r.git"], check=True)
+            merge_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                                       capture_output=True, text=True).stdout.strip()
+            config = ClaudeConfig(
+                executable="claude", model="m", base_url="https://api.example",
+                provider_host="api.example", auth_name="ANTHROPIC_AUTH_TOKEN",
+                auth_value="x", effort="max", target_repo_root=repo.resolve(),
+            )
+            right_key = store_task_key("o/r", "WO-X-001", 1)
+
+            class FakeClient:
+                def __init__(self, repo_arg, token=None):  # noqa: ANN001
+                    pass
+
+                def authorized_plan(self, _number, _path, _url):  # noqa: ANN001
+                    return SimpleNamespace(order_path=".agents/work-orders/WO-X-001-r1.json",
+                                           order_bytes=b"{}", merge_sha=merge_sha)
+
+                def content(self, _ref, _sha):  # noqa: ANN001
+                    return b"skill body\n"
+
+            order = SimpleNamespace(task_id="WO-X-001", revision=1, allows_path=lambda _p: True,
+                                    identity="t", skill_ref="skill.md", worker_profile="p",
+                                    sha256="0" * 64)
+            real_store = RunStore(base / "state")
+            gate = real_store.record_path(right_key, "spawn-abcd1234")
+            real_store.write(right_key, "spawn-abcd1234",
+                             orchestrator._spawn_gate_record("abcd1234-full", right_key, "o/r"))
+
+            class SwappingStore(RunStore):
+                def claim(self, key, *, exempt_record=None):
+                    # Swap the gate for a VALID gate bound to a DIFFERENT task at the
+                    # last moment, exercising the in-claim final validation.
+                    self.write(right_key, "spawn-abcd1234",
+                               orchestrator._spawn_gate_record("abcd1234-full", "another-task", "o/r"))
+                    return super().claim(key, exempt_record=exempt_record)
+
+            with patch("agent_delivery_loop.runner.default_state_dir", return_value=base / "state"), \
+                 patch("agent_delivery_loop.runner.RunStore", SwappingStore), \
+                 patch("agent_delivery_loop.runner.GitHubClient", FakeClient), \
+                 patch("agent_delivery_loop.runner.preflight", return_value=(0, 1, 0)), \
+                 patch("agent_delivery_loop.runner.parse_work_order", return_value=order), \
+                 patch("agent_delivery_loop.runner.ensure_plan_is_on_main"):
+                with self.assertRaises(AgentDeliveryError) as caught:
+                    runner.execute_plan(
+                        repo_path=repo, plan_pr="o/r#26",
+                        work_order_path=".agents/work-orders/WO-X-001-r1.json",
+                        worker_config=config, pat_identity=_identity(),
+                        spawn_gate_name=f"{right_key}/{gate.name}",
+                    )
+            self.assertIn("different task", str(caught.exception))
+            # The swapped (someone else's) gate is NOT released and keeps blocking.
+            self.assertTrue(gate.exists())
+            self.assertEqual(
+                json.loads(gate.read_text(encoding="utf-8"))["task_key"], "another-task",
+            )
+
     def test_stdout_open_failure_is_not_started_and_removes_no_child_assumptions(self) -> None:
         identity = _identity()
         with tempfile.TemporaryDirectory() as temporary:

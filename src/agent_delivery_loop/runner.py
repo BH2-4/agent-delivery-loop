@@ -300,16 +300,6 @@ def execute_plan(
         raise AgentDeliveryError("The authorized Delivery Skill is empty or exceeds the 64 KiB limit.")
 
     task_identity_key = task_key(plan_repo.slug, order.task_id, order.revision)
-    # Late binding check: the exempted gate must also name THIS authorized task.
-    if exempt_record is not None:
-        try:
-            gate_record = _read_spawn_gate(exempt_record)
-        except (OSError, ValueError):
-            raise AgentDeliveryError("The orchestrator spawn gate became invalid; refusing to run.") from None
-        if gate_record.get("task_key") != task_identity_key:
-            raise AgentDeliveryError(
-                "The orchestrator spawn gate is bound to a different task; refusing to run."
-            )
     auth_key = authorization_key(plan_repo.slug, number, authorization.merge_sha, order.sha256)
     branch = f"agent/{order.task_id.lower()}-r{order.revision}-{run_id[:8]}"
     worktree = store.root / "worktrees" / run_id
@@ -349,7 +339,29 @@ def execute_plan(
     worker_lifecycle = WorkerLifecycle()
 
     # exempt_record was validated before the preflight above and covers the claim too.
+    gate_release_allowed = exempt_record is None  # no gate -> release calls are no-ops anyway
     with store.claim(task_identity_key, exempt_record=exempt_record):
+        # FINAL exemption validation, inside the claim's host+task flock: with the
+        # locks held no other writer can touch the gate, so this re-read closes every
+        # swap window (deletion, replacement, hard-link content change, or re-binding
+        # to a different task/repository) that could have slipped between the earlier
+        # checks and the claim. Any drift fails closed before anything is created.
+        if exempt_record is not None:
+            try:
+                gate_record = _read_spawn_gate(exempt_record)
+            except (OSError, ValueError):
+                raise AgentDeliveryError(
+                    "The orchestrator spawn gate is invalid or missing; refusing to run."
+                ) from None
+            if gate_record.get("task_key") != task_identity_key:
+                raise AgentDeliveryError(
+                    "The orchestrator spawn gate is bound to a different task; refusing to run."
+                )
+            if str(gate_record.get("repository", "")).casefold() != plan_repo.slug.casefold():
+                raise AgentDeliveryError(
+                    "The orchestrator spawn gate is bound to a different repository; refusing to run."
+                )
+            gate_release_allowed = True
         # This durable, read-back-verified record is the gate BEFORE any Worker
         # creation. A later failed/interrupted update cannot release it.
         store.write(task_identity_key, run_id, record)
@@ -408,7 +420,7 @@ def execute_plan(
                 record["status"] = "delivery_pr_open"
             record["finished_at"] = now_utc()
             store.write(task_identity_key, run_id, record)
-            _release_own_spawn_gate(exempt_record)  # own verified-safe end persisted
+            _release_own_spawn_gate(exempt_record if gate_release_allowed else None)  # own verified-safe end persisted
             return {
                 **record,
                 "worktree_id": run_id,
@@ -422,7 +434,7 @@ def execute_plan(
                 record,
                 reason=str(exc),
             )
-            _release_own_spawn_gate(exempt_record)  # Worker never started
+            _release_own_spawn_gate(exempt_record if gate_release_allowed else None)  # Worker never started
             raise AgentDeliveryError(f"Work Order was cancelled before the Worker started. Run ID: {run_id}.") from None
         except WorkerCancelled as exc:
             worker_lifecycle.status = "stopped"
@@ -435,7 +447,7 @@ def execute_plan(
                 session_id=exc.session_id,
                 reason="Cancellation completed after the Worker process group stopped.",
             )
-            _release_own_spawn_gate(exempt_record)  # own verified-safe end persisted
+            _release_own_spawn_gate(exempt_record if gate_release_allowed else None)  # own verified-safe end persisted
             raise AgentDeliveryError(f"Work Order was cancelled after Worker cleanup. Run ID: {run_id}.") from None
         except WorkerCleanupError as exc:
             worker_lifecycle.status = "stop_unconfirmed"
@@ -460,7 +472,7 @@ def execute_plan(
                     record,
                     reason="Cancellation occurred before the Worker started.",
                 )
-                _release_own_spawn_gate(exempt_record)  # Worker never started
+                _release_own_spawn_gate(exempt_record if gate_release_allowed else None)  # Worker never started
                 raise AgentDeliveryError(f"Work Order was cancelled before the Worker started. Run ID: {run_id}.") from None
             if worker_lifecycle.status == "stopped":
                 _record_cancelled_run(
@@ -471,7 +483,7 @@ def execute_plan(
                     session_id=worker_lifecycle.session_id,
                     reason="Run cancelled after the Worker process group was confirmed stopped.",
                 )
-                _release_own_spawn_gate(exempt_record)  # own verified-safe end persisted
+                _release_own_spawn_gate(exempt_record if gate_release_allowed else None)  # own verified-safe end persisted
                 raise AgentDeliveryError(f"Work Order was cancelled after Worker cleanup. Run ID: {run_id}.") from None
             _record_cleanup_failed_run(
                 store,
@@ -507,7 +519,7 @@ def execute_plan(
             record["failure"] = str(exc) if isinstance(exc, AgentDeliveryError) else "Unexpected worker failure; raw output was suppressed."
             store.write(task_identity_key, run_id, record)
             if worker_lifecycle.status in {"not_started", "stopped"}:
-                _release_own_spawn_gate(exempt_record)  # own verified-safe end persisted
+                _release_own_spawn_gate(exempt_record if gate_release_allowed else None)  # own verified-safe end persisted
             if isinstance(exc, AgentDeliveryError):
                 raise AgentDeliveryError(f"{exc} Run ID: {run_id}.") from None
             raise AgentDeliveryError(record["failure"]) from None
