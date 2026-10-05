@@ -40,7 +40,12 @@ CREDENTIAL_ENV_NAMES = (
 # CI deadline, and non-read-only invocations (writes) always stay single-attempt.
 GH_READ_RETRY_DELAYS_SECONDS = (2.0, 8.0)
 GH_READ_BUDGET_SECONDS = 45.0
-_GH_WRITE_SHAPES = ("-X", "--method", "-f", "--field", "-F", "--raw-field", "--input")
+# `gh api` GET semantics are proven ONLY by an allowlist: exactly one positional (the
+# endpoint) plus output/header flags. Unknown flags, extra positionals (gh api treats
+# them as key=value fields and switches to POST) and any method/field/input spelling
+# — separated, --flag=value, or short-flag-attached — all disable retry (fail closed).
+_GH_API_FLAGS_WITH_VALUE = {"-H", "--header", "--jq", "--slurp"}
+_GH_API_SELF_CONTAINED_FLAGS = {"--verbose", "--paginate"}
 _GH_TRANSIENT_PATTERNS = (
     "tls handshake timeout", "connection reset", "connection refused", "connection closed",
     "i/o timeout", "net/http", "dial tcp", "context deadline", "unexpected eof",
@@ -88,7 +93,9 @@ def run_gh(
                 env=env, stdin=subprocess.DEVNULL,
             )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise AgentDeliveryError(f"A gh command could not run or timed out: gh {args[0]}.") from exc
+        raise AgentDeliveryError(
+            f"A gh command could not run or timed out: gh {args[0] if args else '(no arguments)'}."
+        ) from exc
 
 
 def gh_json(
@@ -105,11 +112,36 @@ def gh_json(
 
 
 def _is_read_only_gh_args(args: list[str]) -> bool:
-    """Only invocations whose actual HTTP semantics are provably GET may be retried."""
+    """Only invocations whose actual HTTP semantics are provably GET may be retried.
+
+    `gh api` is read-only only with exactly one positional endpoint and nothing beyond
+    the allowlisted output/header flags; anything else — including every method/field
+    spelling that would flip the request to POST — fails closed to single-attempt.
+    """
     if not args:
         return False
     if args[0] == "api":
-        return not any(flag in args for flag in _GH_WRITE_SHAPES)
+        positionals = 0
+        tokens = args[1:]
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if token == "--":
+                positionals += len(tokens) - index - 1
+                break
+            if token.startswith("-"):
+                name, _, _value = token.partition("=")
+                if name in _GH_API_FLAGS_WITH_VALUE:
+                    if "=" not in token:
+                        index += 1  # the flag consumes the next token as its value
+                elif name in _GH_API_SELF_CONTAINED_FLAGS:
+                    pass
+                else:
+                    return False
+            else:
+                positionals += 1
+            index += 1
+        return positionals == 1
     return args[:2] == ["pr", "view"]
 
 

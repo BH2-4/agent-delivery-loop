@@ -216,6 +216,15 @@ def _spawn_agent_run(
                         "The spawned agent-run exceeded its time limit and its process group could not be confirmed stopped; runs are blocked."
                     )
                 raise AgentDeliveryError("The spawned agent-run exceeded its time limit and was stopped; no delivery continued.")
+            except BaseException:
+                # Interruption or cancellation must not leave the trusted child (and its
+                # one-shot PAT channel) running unconfirmed. A confirmed stop re-raises the
+                # interruption; an unconfirmed stop blocks future runs pending inspection.
+                if not _stop_process_group(process):
+                    raise AgentDeliveryError(
+                        "agent-run was interrupted and its process group could not be confirmed stopped; runs are blocked."
+                    ) from None
+                raise
     except OSError as exc:
         raise AgentDeliveryError("The installed agent-run entry could not be started.") from exc
     output = stdout_path.read_bytes()[:MAX_AGENT_RUN_OUTPUT_BYTES]

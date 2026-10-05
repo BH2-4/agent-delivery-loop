@@ -210,7 +210,12 @@ class GhReadOnlyRetryTests(unittest.TestCase):
         identity = _identity()
         for args in (
             ["api", "-X", "POST", "repos/o/r/pulls"],
+            ["api", "-XPOST", "repos/o/r/pulls"],
+            ["api", "--method=POST", "repos/o/r/pulls"],
             ["api", "repos/o/r/pulls", "-f", "title=x"],
+            ["api", "repos/o/r/pulls", "--field=title=x"],
+            # gh api treats extra positionals as key=value fields and switches to POST.
+            ["api", "repos/o/r/pulls", "title=x"],
             ["pr", "merge", "26", "--repo", "o/r", "--merge"],
         ):
             with patch(
@@ -218,8 +223,27 @@ class GhReadOnlyRetryTests(unittest.TestCase):
                 return_value=_completed(1, stderr="net/http: TLS handshake timeout"),
             ) as raw:
                 result = publish.run_gh_read(args, identity=identity)
-            self.assertEqual(raw.call_count, 1)
+            self.assertEqual(raw.call_count, 1, msg=str(args))
             self.assertEqual(result.returncode, 1)
+
+    def test_allowlisted_get_flags_still_retry(self) -> None:
+        identity = _identity()
+        outcomes = [
+            _completed(1, stderr="net/http: TLS handshake timeout"),
+            _completed(0, stdout='"login"'),
+        ]
+        args = ["api", "user", "--jq", ".login"]
+        with patch("agent_delivery_loop.publish.run_gh", side_effect=outcomes) as raw:
+            result = publish.gh_json(args, identity=identity)
+        self.assertEqual(result, "login")
+        self.assertEqual(raw.call_count, 2)
+
+    def test_empty_gh_args_report_sanitized_error(self) -> None:
+        identity = _identity()
+        with patch("agent_delivery_loop.publish.subprocess.run", side_effect=OSError("boom")):
+            with self.assertRaises(AgentDeliveryError) as caught:
+                publish.run_gh_read([], identity=identity)
+        self.assertIn("no arguments", str(caught.exception))
 
     def test_remote_branch_404_still_maps_to_none_without_retry(self) -> None:
         identity = _identity()
@@ -229,6 +253,41 @@ class GhReadOnlyRetryTests(unittest.TestCase):
         ) as raw:
             self.assertIsNone(publish.remote_branch_sha("o/r", "agent/x", identity=identity))
         self.assertEqual(raw.call_count, 1)
+
+
+class SpawnInterruptionTests(unittest.TestCase):
+    def _spawn(self, temporary: Path, stop_result: bool, expected: type[BaseException]):
+        stdout = temporary / "out.json"
+
+        class InterruptedProcess:
+            def wait(self, timeout=None):  # noqa: ANN001 - subprocess API shape
+                raise KeyboardInterrupt()
+
+        with patch(
+            "agent_delivery_loop.orchestrator.subprocess.Popen", return_value=InterruptedProcess(),
+        ), patch(
+            "agent_delivery_loop.claude_worker._stop_process_group", return_value=stop_result,
+        ) as stop:
+            with self.assertRaises(expected) as caught:
+                orchestrator._spawn_agent_run(
+                    entry="agent-run", repo_root=temporary,
+                    plan_pr="https://github.com/o/r/pull/26",
+                    work_order_path=".agents/work-orders/WO-X-001-r1.json",
+                    model="m", base_url="https://api.example", effort="max",
+                    auth_config=Path("/nowhere"), timeout_seconds=30, proxy=None,
+                    stdout_path=stdout, identity=_identity(),
+                )
+        stop.assert_called_once()
+        return caught.exception
+
+    def test_interrupt_with_confirmed_stop_propagates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            self._spawn(Path(temporary), stop_result=True, expected=KeyboardInterrupt)
+
+    def test_interrupt_with_unconfirmed_stop_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            raised = self._spawn(Path(temporary), stop_result=False, expected=AgentDeliveryError)
+            self.assertIn("could not be confirmed stopped", str(raised))
 
 
 if __name__ == "__main__":
