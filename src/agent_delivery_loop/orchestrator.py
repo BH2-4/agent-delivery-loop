@@ -240,24 +240,31 @@ def _preflight_spawn_gates(store: Any) -> None:
 
 
 def _resolve_spawn_gate(store: Any, task_key_value: str, gate_path: Path, registered_epoch: float) -> bool:
-    """Remove the gate only with trusted safe-end evidence for THIS spawn window.
+    """Remove the gate only with trusted safe-end evidence bound to THIS spawn window.
 
-    The window starts at the gate's own last write (the post-Popen flip to the blocking
-    phase): run records strictly older than the flip — even by a fraction of a second —
-    belong to earlier launches and can never release this gate. Evidence = a run record
-    of the same task, written at or after the flip, whose worker_status is 'stopped'
-    with a status the safety table accepts. Absent that, the gate stays and continues
-    blocking every launch path.
+    Two independent bindings, both required: the evidence record's mtime must be at or
+    after the gate's flip (the gate file's own last write), and its runner-written
+    `started_at` timestamp must be at or after the gate's registration — a stale record
+    with a skewed or future mtime carries an older started_at and can never qualify.
+    Evidence = a same-task run record with worker_status 'stopped' and a status the
+    safety table accepts. Absent that, the gate stays and blocks every launch path.
     """
     try:
         window_start = max(gate_path.stat().st_mtime, registered_epoch)
+        gate = _read_json(gate_path)
+        registered_at = gate.get("registered_at")
+        if not isinstance(registered_at, str) or not registered_at:
+            return False
         for path in (store.runs / task_key_value).glob("*.json"):
             if path.name.startswith("spawn-"):
                 continue
             record = _read_json(path)
+            started_at = record.get("started_at")
             if (
                 record.get("worker_status") == "stopped"
                 and record.get("status") in {"validating", "local_ready", "delivery_pr_open", "cancelled", "failed"}
+                and isinstance(started_at, str)
+                and started_at >= registered_at
                 and path.stat().st_mtime >= window_start
             ):
                 gate_path.unlink()
@@ -293,9 +300,14 @@ def _spawn_agent_run(
     # The child is told which durable spawn gate tracks it so its own availability
     # check can exempt exactly that one record (name only; not a credential).
     env["AGENT_DELIVERY_SPAWN_GATE"] = f"{task_key_value}/{gate_path.name}"
-    with open(stdout_path, "wb") as captured:
-        # Only a Popen failure proves no child was created; every later OSError is an
-        # unknown outcome and must keep the gate, so the conversion is scoped here.
+    # A stdout-capture open failure also proves no child was created; both it and a
+    # Popen failure convert to AgentRunNotStartedError so the caller removes the gate.
+    # Every later OSError is an unknown outcome and keeps the gate.
+    try:
+        captured = open(stdout_path, "wb")
+    except OSError as exc:
+        raise AgentRunNotStartedError("The agent-run output capture could not be opened.") from exc
+    with captured:
         try:
             process = subprocess.Popen(
                 argv, stdin=subprocess.DEVNULL, stdout=captured, stderr=subprocess.STDOUT,
