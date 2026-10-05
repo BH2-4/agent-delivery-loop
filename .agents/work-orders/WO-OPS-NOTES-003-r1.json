@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "task_id": "WO-OPS-NOTES-003",
+  "revision": 1,
+  "objective": "仅新增一个文件 docs/write-safety-and-resume-notes.md：用简体中文写给仓库使用者，说明三项新能力的使用语义：(1) GitHub 写操作结果核对——推送/创建 Delivery PR/合并前先持久化意图与目标身份，响应丢失时用只读查询核对远端真实状态，已成功则接纳不重复执行，绝不盲目重放写请求；(2) 有界返修——changes_required 才触发，最多两轮，每轮是全新 Worker 会话、独立返修记录并关联原始运行，blocked 不触发返修；(3) 安全续接——resume 从已确认阶段继续、重核各版本绑定、不重跑原 agent-run、已完成的审查回执不重掷。文中出现的每个命令名、参数名与数值上限都必须能在所附证据中找到一致出处。",
+  "out_of_scope": [
+    "不修改任何 Python 源码、测试、CI、打包或 .agents/ 下任何文件",
+    "不修改既有文档（README、docs/ 全部现有文件）",
+    "不执行真实 agent-run、审查 CLI 或任何 GitHub 写操作",
+    "不描述未在所附证据中体现的行为、参数或数值"
+  ],
+  "acceptance_criteria": [
+    "仓库中存在且仅存在一个新文件 docs/write-safety-and-resume-notes.md，为简体中文",
+    "包含四个小节：写操作核对、有界返修、安全续接、边界与未验证项",
+    "写明：写前持久化意图；丢失响应用只读核对；已成功不重复执行；合并绑定审查通过的精确 head；唯一匹配的 Delivery PR 被复用而非重复创建",
+    "写明：返修上限两轮；每轮全新会话与独立返修记录；blocked 不返修",
+    "写明：resume 从已确认安全完成的阶段续接且不重跑原 agent-run",
+    "每个命令名、参数名、数值上限都能在资料包附带证据中找到一致出处",
+    "结尾明确本轮属限次个人 gh 实验例外（ADR-0006），并列出未验证项（App 线路、OS 凭据隔离、真实异常停止、账单硬上限、部署）",
+    "全文不超过 120 行，不含任何认证值或本机私有路径"
+  ],
+  "allowed_paths": ["docs/write-safety-and-resume-notes.md"],
+  "worker_profile": "claude-code-v1",
+  "skill_ref": ".agents/policies/delivery-skill/SKILL.md",
+  "stop_conditions": [
+    "验收所需信息在可读取的仓库文件中不存在时停止并报告 blocked，不得编造行为细节",
+    "需要修改 allowed_paths 之外任何文件时停止",
+    "对证据内容与要写内容的一致性不确定时停止，不猜测"
+  ],
+  "limits": {"max_turns": 24, "timeout_seconds": 900, "max_budget_usd": 5},
+  "review_evidence": [
+    {"path": "src/agent_delivery_loop/publish.py", "ref": "0e98d73ff822948b6cc5421b4771ac68558da226", "purpose": "写意图持久化、只读调和、不重复执行与合并 head 绑定的实现"},
+    {"path": "src/agent_delivery_loop/rework.py", "ref": "0e98d73ff822948b6cc5421b4771ac68558da226", "purpose": "有界返修实现：两轮上限、新会话、独立返修记录与 Skill 摘要绑定"},
+    {"path": "docs/adr/0006-write-verification-rework-resume.md", "ref": "0e98d73ff822948b6cc5421b4771ac68558da226", "purpose": "本轮限次实验范围、resume 语义、命令与未验证项声明"}
+  ]
+}
