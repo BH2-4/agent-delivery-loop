@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "task_id": "WO-PAT-TRIAL-001",
+  "revision": 1,
+  "objective": "仅新增一个文件 docs/pat-delivery-runbook.md：用简体中文写给仓库使用者，说明 PAT 身份下从预检到交付的完整操作顺序：(1) 顺序——先安装来源核对，再 agent-delivery check-github-auth 只读预检（账号/仓库/PR/Actions 读取），预检通过后才由安装版 deliver 执行写操作链（推送/建 Delivery PR/等 CI/合并）；(2) 区别——Plan PR 是用户对固定任务的预先授权（独立审查确认工单无扩大范围+精确 head CI 通过后由 Steward 合并），Delivery PR 是 Worker 成果的质量门禁（独立 pass 绑定候选完整 head、唯一 validate 成功、match-head-commit 合并），Worker 不批准自己的工单；(3) PAT 不进入 Worker——令牌仅由外层受信执行器在必要的 gh/git 调用中经临时 GH_CONFIG_DIR 使用，Worker 与独立审查子进程不获得 PAT 文件参数或令牌值；(4) local_ready、merged、deployed 的区别——本地结构化完成≠Delivery PR 已合入 main≠已部署验证，本阶段不存在 deployed，不得混称；(5) 精确 SHA 门禁——工程与交付审查都绑定完整 40 位 head，CI 只认 .github/workflows/ci.yml 的 pull_request 运行、精确 head SHA、固定 attempt 的全部任务成功且唯一 validate 成功，空检查列表不是成功；(6) 失败停止——PAT 缺失、权限不足、账号错配、CI 失败/缺失、远端结果不明时停止并给出最小人工配置步骤，不回退日常 gh 登录、classic PAT 或匿名身份，不盲目重放写操作。文中链接已有 PAT 说明（docs/pat-setup.md），不复制凭据，不承诺未验证能力。",
+  "out_of_scope": [
+    "不修改任何 Python 源码、测试、CI、打包或 .agents/ 下任何文件",
+    "不修改既有文档（README、docs/ 全部现有文件）",
+    "不执行真实 agent-run、审查 CLI 或任何 GitHub 写操作",
+    "不描述未在所附证据中体现的命令、参数或行为",
+    "不写入任何令牌值、令牌摘要或本机私有路径"
+  ],
+  "acceptance_criteria": [
+    "仓库中存在且仅存在一个新文件 docs/pat-delivery-runbook.md，为简体中文",
+    "包含六个小节：预检与交付顺序、Plan 授权与 Delivery 审查的区别、PAT 不进入 Worker、完成状态的区别（local_ready/merged/deployed）、精确 SHA 审查与 CI 门禁、失败停止与人工配置边界",
+    "写明：预检只读成功不能证明写权限；write_permissions_verified/protection_verified/delivery_verified 在预检中为假",
+    "写明：Plan 合并是预授权例外且不构成对后续任务的自动批准；Delivery 合并需独立 pass、唯一 validate 成功、match-head-commit 且远端 head 未漂移",
+    "写明：本阶段无 deployed 状态，不得把 local_ready 或 merged 称为部署完成",
+    "写明：CI 契约为精确 head 的 ci.yml pull_request 运行、固定 attempt 任务全部成功且唯一 validate，空列表不通过",
+    "写明：失败时停止并给出最小人工步骤，不换身份、不重放写操作",
+    "链接已有 PAT 说明（docs/pat-setup.md），不含任何认证值或本机私有路径"
+  ],
+  "allowed_paths": [
+    "docs/pat-delivery-runbook.md"
+  ],
+  "worker_profile": "claude-code-v1",
+  "skill_ref": ".agents/policies/delivery-skill/SKILL.md",
+  "stop_conditions": [
+    "验收所需信息在可读取的仓库文件或资料包证据中不存在时停止并报告 blocked，不得编造行为细节",
+    "需要修改 allowed_paths 之外任何文件时停止",
+    "对证据内容与要写内容的一致性不确定时停止，不猜测"
+  ],
+  "limits": {
+    "max_turns": 24,
+    "timeout_seconds": 900,
+    "max_budget_usd": 5
+  },
+  "review_evidence": [
+    {
+      "path": "docs/pat-setup.md",
+      "ref": "b3811928bc480721d9ccf0e989dd583f41dcc51c",
+      "purpose": "PAT 接入、推荐权限、check-github-auth 预检语义与失败停止边界"
+    },
+    {
+      "path": "docs/adr/0007-fine-grained-pat-stage.md",
+      "ref": "b3811928bc480721d9ccf0e989dd583f41dcc51c",
+      "purpose": "当前阶段 PAT 身份决策、不进入 Worker/审查、备选保留与未验证项"
+    },
+    {
+      "path": "src/agent_delivery_loop/github_identity.py",
+      "ref": "b3811928bc480721d9ccf0e989dd583f41dcc51c",
+      "purpose": "显式身份文件校验、仓库/账号绑定与不回退的实现"
+    },
+    {
+      "path": "src/agent_delivery_loop/publish.py",
+      "ref": "b3811928bc480721d9ccf0e989dd583f41dcc51c",
+      "purpose": "意图持久化、只读核对、Actions REST CI 契约（精确 head/固定 attempt/唯一 validate）与 match-head-commit 合并"
+    },
+    {
+      "path": "docs/goal-pat-trial.md",
+      "ref": "b3811928bc480721d9ccf0e989dd583f41dcc51c",
+      "purpose": "固定任务规格原文：local_ready/merged/deployed 区别、精确 SHA 与 ci.yml/validate 门禁、失败停止与人工配置边界的措辞出处"
+    }
+  ]
+}
