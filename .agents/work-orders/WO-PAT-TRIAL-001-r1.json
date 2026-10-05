@@ -20,7 +20,9 @@
     "写明：失败时停止并给出最小人工步骤，不换身份、不重放写操作",
     "链接 docs/pat-setup.md 与 docs/adr/0007-fine-grained-pat-stage.md，全文不超过 140 行，不含任何认证值或本机私有路径"
   ],
-  "allowed_paths": ["docs/pat-delivery-runbook.md"],
+  "allowed_paths": [
+    "docs/pat-delivery-runbook.md"
+  ],
   "worker_profile": "claude-code-v1",
   "skill_ref": ".agents/policies/delivery-skill/SKILL.md",
   "stop_conditions": [
@@ -28,12 +30,36 @@
     "需要修改 allowed_paths 之外任何文件时停止",
     "对证据内容与要写内容的一致性不确定时停止，不猜测"
   ],
-  "limits": {"max_turns": 24, "timeout_seconds": 900, "max_budget_usd": 5},
+  "limits": {
+    "max_turns": 24,
+    "timeout_seconds": 900,
+    "max_budget_usd": 5
+  },
   "review_evidence": [
-    {"path": "docs/pat-setup.md", "ref": "b3811928bc480721d9ccf0e989dd583f41dcc51c", "purpose": "PAT 接入、推荐权限、check-github-auth 预检语义与失败停止边界"},
-    {"path": "docs/adr/0007-fine-grained-pat-stage.md", "ref": "b3811928bc480721d9ccf0e989dd583f41dcc51c", "purpose": "当前阶段 PAT 身份决策、不进入 Worker/审查、备选保留与未验证项"},
-    {"path": "src/agent_delivery_loop/github_identity.py", "ref": "b3811928bc480721d9ccf0e989dd583f41dcc51c", "purpose": "显式身份文件校验、仓库/账号绑定与不回退的实现"},
-    {"path": "src/agent_delivery_loop/publish.py", "ref": "b3811928bc480721d9ccf0e989dd583f41dcc51c", "purpose": "意图持久化、只读核对、Actions REST CI 契约（精确 head/固定 attempt/唯一 validate）与 match-head-commit 合并"},
-    {"path": "src/agent_delivery_loop/orchestrator.py", "ref": "b3811928bc480721d9ccf0e989dd583f41dcc51c", "purpose": "阶段状态机（local_ready/merged 等完成状态语义）、deliver/resume 显式 PAT 参数与 Worker/审查身份隔离"}
+    {
+      "path": "docs/pat-setup.md",
+      "ref": "b3811928bc480721d9ccf0e989dd583f41dcc51c",
+      "purpose": "PAT 接入、推荐权限、check-github-auth 预检语义与失败停止边界"
+    },
+    {
+      "path": "docs/adr/0007-fine-grained-pat-stage.md",
+      "ref": "b3811928bc480721d9ccf0e989dd583f41dcc51c",
+      "purpose": "当前阶段 PAT 身份决策、不进入 Worker/审查、备选保留与未验证项"
+    },
+    {
+      "path": "src/agent_delivery_loop/github_identity.py",
+      "ref": "b3811928bc480721d9ccf0e989dd583f41dcc51c",
+      "purpose": "显式身份文件校验、仓库/账号绑定与不回退的实现"
+    },
+    {
+      "path": "src/agent_delivery_loop/publish.py",
+      "ref": "b3811928bc480721d9ccf0e989dd583f41dcc51c",
+      "purpose": "意图持久化、只读核对、Actions REST CI 契约（精确 head/固定 attempt/唯一 validate）与 match-head-commit 合并"
+    },
+    {
+      "path": "docs/goal-pat-trial.md",
+      "ref": "b3811928bc480721d9ccf0e989dd583f41dcc51c",
+      "purpose": "固定任务规格原文：local_ready/merged/deployed 区别、精确 SHA 与 ci.yml/validate 门禁、失败停止与人工配置边界的措辞出处"
+    }
   ]
 }
