@@ -422,7 +422,10 @@ def _continue_inner(orchestration: Orchestration, params: _Params, *, fresh: boo
         delivery_commit = candidate["sha"]
 
     # Review / rework loop: candidate is always the current local branch head.
-    review_state = _review_loop(orchestration, params, root, plan_repo, order, authorization, record_path, worktree, delivery_branch)
+    review_state = _review_loop(
+        orchestration, params, root, plan_repo, order, authorization, record_path, worktree, delivery_branch,
+        skill_sha256=worker_record.get("skill_sha256"),
+    )
     candidate = review_state["candidate"]
 
     # Publish chain: intent-persisted writes, read-only reconciliation.
@@ -487,6 +490,7 @@ def _changed(record_path: Path, candidate: str, orchestration: Orchestration) ->
 def _review_loop(
     orchestration: Orchestration, params: _Params, root: Path, plan_repo, order,
     authorization, record_path: Path, worktree: Path, delivery_branch: str,
+    skill_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Run reviews until pass, bounded rework in between; never re-runs the Worker."""
     from .store import RunStore as _RunStore
@@ -566,7 +570,7 @@ def _review_loop(
             )
             outcome = run_bounded_rework(
                 store=store, repo_slug=plan_repo.slug, worktree=worktree, order=order,
-                expected_skill_sha256=worker_record.get("skill_sha256"),
+                expected_skill_sha256=skill_sha256,
                 worker_config=ClaudeConfig.from_explicit(
                     model=params.model, base_url=params.base_url, effort=params.effort,
                     auth_config=params.auth_config, repo_root=root,

@@ -546,6 +546,124 @@ class ReworkAndResumeTests(unittest.TestCase):
                 client.request("POST", "/repos/x/y/pulls", {"title": "t"})
 
 
+    def test_changes_required_path_reaches_rework_with_bound_skill(self) -> None:
+        """Regression: the changes_required branch must actually execute (a past
+        scoping bug made it raise NameError, silently disabling all rework)."""
+        from agent_delivery_loop import orchestrator as orch
+        from agent_delivery_loop.errors import AgentDeliveryError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            with patch.dict(os.environ, {"AGENT_STATE_DIR": str(base / "state")}):
+                repo = base / "repo"
+                repo.mkdir()
+
+                def raw(*args: str) -> None:
+                    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True)
+
+                raw("init", "-q")
+                raw("config", "user.name", "T")
+                raw("config", "user.email", "t@example.invalid")
+                (repo / "skill.md").write_text("skill\n", encoding="utf-8")
+                raw("add", ".")
+                raw("commit", "-m", "base")
+                # Delivery branch at a known head.
+                raw("checkout", "-q", "-b", "agent/x-r1-abcd1234")
+                (repo / "doc.md").write_text("deliverable\n", encoding="utf-8")
+                raw("add", ".")
+                raw("commit", "-m", "candidate")
+                head = subprocess.run(
+                    ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+                ).stdout.strip()
+
+                instance = orch.Orchestration("orch-cr")
+                instance.record["stage"] = "worker_completed"
+                instance.record["worker"] = {
+                    "run_id": "r", "delivery_branch": "agent/x-r1-abcd1234",
+                    "worker_commit": head, "record_path": str(base / "rr.json"),
+                }
+                instance.record["candidate"] = {"sha": head, "origin": "worker", "review_round": 0}
+                instance.record["rework"] = {"count": 0, "entries": []}
+
+                order = Mock()
+                order.review_evidence = ()
+                receipt_dir = base / "receipts"
+                receipt_dir.mkdir()
+                receipt = {
+                    "verdict": "changes_required",
+                    "findings": [{"severity": "P2", "file": "doc.md", "line": 1,
+                                  "problem": "typo", "recommendation": "fix"}],
+                }
+                result_path = receipt_dir / "res.json"
+                result_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+                fake_review = {"review_id": "rv1", "codex_version": "codex-cli x",
+                               "exit_code": 0, "stop_status": "confirmed_stopped",
+                               "result_path": str(result_path)}
+
+                rework_calls: list[dict] = []
+
+                def fake_rework(**kwargs):
+                    rework_calls.append(kwargs)
+                    # Produce a real commit on the delivery branch so the loop's
+                    # branch-head invariant keeps holding for the next round.
+                    (repo / "doc.md").write_text("deliverable fixed\n", encoding="utf-8")
+                    subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
+                    subprocess.run(
+                        ["git", "-C", str(repo), "commit", "-m", "rework r1"], check=True, capture_output=True
+                    )
+                    new_head = subprocess.run(
+                        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+                    ).stdout.strip()
+                    return {"rework_id": "rw1", "rework_index": kwargs["rework_index"],
+                            "session_id": "s", "parent_commit": kwargs["parent_sha"],
+                            "rework_commit": new_head, "changed_paths": ["doc.md"]}
+
+                class _Repo:
+                    slug = "o/r"
+
+                params = orch._Params(
+                    plan_pr="https://github.com/o/r/pull/1", work_order_path="wo",
+                    review_timeout_seconds=900, review_model="m", review_effort="high",
+                    review_bundle_dir=base / "bundle", proxy=None,
+                    model="m", base_url="https://x", effort="max", auth_config=base / "a.json",
+                )
+                with patch.object(orch, "prepare_review"), patch.object(
+                    orch, "run_review_process", return_value=fake_review
+                ), patch.object(orch, "run_bounded_rework", side_effect=fake_rework), patch.object(
+                    orch, "check_review"
+                ), patch.object(
+                    orch.ClaudeConfig, "from_explicit", return_value=Mock()
+                ), patch.object(
+                    orch, "RunStore", return_value=Mock()
+                ):
+                    # First pass: changes_required -> rework r1 -> loop continues to a pass.
+                    verdicts = iter(["changes_required", "pass"])
+
+                    def fake_read(path):
+                        verdict = next(verdicts)
+                        receipt = {"verdict": verdict}
+                        if verdict == "changes_required":
+                            receipt["findings"] = [{
+                                "severity": "P2", "file": "doc.md", "line": 1,
+                                "problem": "typo", "recommendation": "fix",
+                            }]
+                        return receipt
+
+                    with patch.object(orch, "_read_json", side_effect=fake_read):
+                        state = orch._review_loop(
+                            instance, params, repo, _Repo(), order, None,
+                            base / "rr.json", repo, "agent/x-r1-abcd1234",
+                            skill_sha256="deadbeef",
+                        )
+                self.assertEqual(state["candidate"], instance.record["candidate"]["sha"])
+                self.assertEqual(len(rework_calls), 1)
+                self.assertEqual(rework_calls[0]["expected_skill_sha256"], "deadbeef")
+                self.assertEqual(instance.record["rework"]["count"], 1)
+                self.assertEqual(instance.record["stage"], "review_passed")
+                self.assertEqual(instance.record["candidate"]["origin"], "rework")
+
+
 class CiWaitTests(unittest.TestCase):
     def test_only_full_uppercase_success_with_required_check_passes(self) -> None:
         head = "c" * 40
