@@ -15,6 +15,7 @@ import os
 import re
 import signal
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -239,33 +240,48 @@ def _preflight_spawn_gates(store: Any) -> None:
             )
 
 
+def _parse_iso_timestamp(value: Any) -> Any:
+    from datetime import datetime
+
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 def _resolve_spawn_gate(store: Any, task_key_value: str, gate_path: Path, registered_epoch: float) -> bool:
     """Remove the gate only with trusted safe-end evidence bound to THIS spawn window.
 
-    Two independent bindings, both required: the evidence record's mtime must be at or
-    after the gate's flip (the gate file's own last write), and its runner-written
-    `started_at` timestamp must be at or after the gate's registration — a stale record
-    with a skewed or future mtime carries an older started_at and can never qualify.
-    Evidence = a same-task run record with worker_status 'stopped' and a status the
-    safety table accepts. Absent that, the gate stays and blocks every launch path.
+    Three independent bindings, all required: (1) the gate's registration timestamp
+    parses and the evidence record's runner-written `started_at` parses and is at or
+    after it (datetime comparison — malformed values fail closed); (2) the evidence
+    file's mtime lies at or after the gate's own last write (the post-Popen flip);
+    (3) that mtime is not in the future beyond a small skew allowance, so a stale
+    record with a clock-shifted mtime can never masquerade as this window. Evidence =
+    a same-task run record with worker_status 'stopped' and a status the safety table
+    accepts. Absent that, the gate stays and blocks every launch path.
     """
     try:
         window_start = max(gate_path.stat().st_mtime, registered_epoch)
         gate = _read_json(gate_path)
-        registered_at = gate.get("registered_at")
-        if not isinstance(registered_at, str) or not registered_at:
+        registered_at = _parse_iso_timestamp(gate.get("registered_at"))
+        if registered_at is None:
             return False
+        now = time.time()
         for path in (store.runs / task_key_value).glob("*.json"):
             if path.name.startswith("spawn-"):
                 continue
             record = _read_json(path)
-            started_at = record.get("started_at")
+            started_at = _parse_iso_timestamp(record.get("started_at"))
+            mtime = path.stat().st_mtime
             if (
                 record.get("worker_status") == "stopped"
                 and record.get("status") in {"validating", "local_ready", "delivery_pr_open", "cancelled", "failed"}
-                and isinstance(started_at, str)
+                and started_at is not None
                 and started_at >= registered_at
-                and path.stat().st_mtime >= window_start
+                and window_start <= mtime <= now + 5.0
             ):
                 gate_path.unlink()
                 return True

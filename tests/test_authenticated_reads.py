@@ -649,6 +649,17 @@ class SpawnGateTests(unittest.TestCase):
                 store, key, gate, gate.stat().st_mtime - 5.0,
             ))
             self.assertTrue(gate.exists())
+            # A malformed started_at must also fail closed even with a fresh mtime.
+            _os.utime(old, (_os.stat(old).st_mtime - 7200.0,) * 2)
+            store.write(key, "11111111-1111-1111-1111-111111111111", {
+                "schema_version": 1, "run_id": "11111111-1111-1111-1111-111111111111",
+                "worker_status": "stopped", "status": "local_ready",
+                "started_at": "not-a-timestamp",
+            })
+            self.assertFalse(orchestrator._resolve_spawn_gate(
+                store, key, gate, gate.stat().st_mtime - 5.0,
+            ))
+            self.assertTrue(gate.exists())
 
     def test_started_gate_actually_blocks_until_trusted_evidence_resolves_it(self) -> None:
         from agent_delivery_loop.store import RunStateError
