@@ -1,12 +1,16 @@
 # 写结果核对、有界返修与安全续接说明
 
-本文面向仓库使用者，概述本轮新增的三项能力：GitHub 写操作结果核对、有界返修与安全续接。事实依据为资料包内附带的 `src/agent_delivery_loop/publish.py`、`src/agent_delivery_loop/rework.py` 与 ADR-0006。
+本文面向仓库使用者，概述本轮新增的三项能力：GitHub 写操作结果核对、有界返修与安全续接。事实依据为资料包内附带的 `src/agent_delivery_loop/publish.py`、`src/agent_delivery_loop/rework.py`、`src/agent_delivery_loop/github.py` 与 ADR-0006。
 
 ## 写操作核对
 
-- 读/写分离：只有只读 GET 享受分类重试；`gh` 写请求单次执行，响应丢失（网络断开、5xx）一律归为 `GitHubWritePendingError`，绝不自动重放。
+- 两条链路分开：读/写分离与 `GitHubWritePendingError` 是 ADR 记录的 GitHub API 客户端策略（`GitHubClient.request()`：只有 GET 享受分类重试，POST 等写请求单次执行，响应丢失——网络断开、5xx——归为该异常，绝不自动重放）；发布链的 `gh` 子进程不使用该异常——`run_gh` 超时或启动失败抛 `AgentDeliveryError`，写请求的真实结果一律交由只读核对判定。
 - 写前持久化意图：每个外部写（推送分支 / 创建 Delivery PR / 合并 PR）先持久化操作意图与完整身份（仓库、任务与修订、分支、目标分支、候选 SHA、操作类型）；检查点保存失败即不执行写。
-- 丢失响应用只读核对：写后用只读 `gh` 查询（`gh api`、`gh pr list`、`gh pr view`）核对远端真实状态——已成功则接纳真实结果且不重复执行；远端明确不存在（404）才允许一次有界重试；其余歧义一律以 `WriteReconciliationError` 停止。
+- 丢失响应用只读核对：写后用只读 `gh` 查询（`gh api`、`gh pr list`、`gh pr view`）核对远端真实状态——已成功则接纳真实结果且不重复执行；重试条件按操作区分，核对不清即停止，不统一到单一异常：
+  - 推送：远端分支明确不存在（404）且推送未报告成功时，允许一次有界重推（分支确不存在，重复安全）；
+  - 建 PR：创建结果不明时先只读核对，找不到唯一匹配绝不再次创建；
+  - 合并：合并响应丢失后重读 PR，重新确认仍为 OPEN 且 head 等于审查候选 SHA 才再次尝试合并（有界次数）；
+  - 其余无法确认远端真实结果的歧义以 `WriteReconciliationError` 停止；只读查询自身失败（如非 0 退出码）抛 `AgentDeliveryError`。
 - 推送确认只认远端事实：远端分支指向审查候选 SHA 才算确认；指向其他提交则拒绝覆盖任何内容。
 - 合并绑定审查通过的精确 head：PR 不是 OPEN、或 head 不是审查通过的候选 SHA 时不执行合并；已 MERGED 但 head 不符同样报错。合并后核验 PR 状态与 main 包含关系。
 - 唯一匹配的 Delivery PR 被复用而非重复创建：查到唯一 open 且 head 等于候选 SHA 的 PR 即复用（记录 `reused`）；匹配多于一条或 head 不符即停止；创建结果不明时先只读核对，找不到唯一匹配绝不再次创建。
