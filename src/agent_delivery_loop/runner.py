@@ -347,6 +347,13 @@ def execute_plan(
         # to a different task/repository) that could have slipped between the earlier
         # checks and the claim. Any drift fails closed before anything is created.
         if exempt_record is not None:
+            # The exempted gate must live under THIS authorized task's run directory:
+            # a valid gate parked in another directory with matching embedded bindings
+            # is still someone else's and must fail closed.
+            if exempt_record.parent != store.runs / task_identity_key:
+                raise AgentDeliveryError(
+                    "The orchestrator spawn gate is not in this task's run directory; refusing to run."
+                )
             try:
                 gate_record = _read_spawn_gate(exempt_record)
             except (OSError, ValueError):
