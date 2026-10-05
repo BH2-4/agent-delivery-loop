@@ -249,7 +249,19 @@ def wait_for_ci(
     deadline = time.monotonic() + timeout_seconds
     last: list[dict[str, Any]] = []
     while time.monotonic() < deadline:
-        checks = gh_json(["pr", "checks", str(pr_number), "--repo", repo_slug, "--json", "name,state,link"], proxy=proxy)
+        # gh pr checks exits 0 (all pass), 1 (any failed), or 8 (pending) while still
+        # printing the JSON list; pending must poll, not abort.
+        checks_result = run_gh(
+            ["pr", "checks", str(pr_number), "--repo", repo_slug, "--json", "name,state,link"], proxy=proxy
+        )
+        if checks_result.returncode not in (0, 1, 8):
+            raise AgentDeliveryError(
+                f"gh pr checks exited with {checks_result.returncode}; no CI state was assumed."
+            )
+        try:
+            checks = json.loads(checks_result.stdout)
+        except ValueError as exc:
+            raise AgentDeliveryError("gh pr checks did not return a parsable check list.") from exc
         if not isinstance(checks, list):
             raise AgentDeliveryError("gh pr checks did not return a check list.")
         last = [item for item in checks if isinstance(item, dict)]
