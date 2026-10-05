@@ -496,12 +496,18 @@ class TwoLayerStopTests(unittest.TestCase):
             class StopBeforeWorktree(AgentDeliveryError):
                 pass
 
+            reached_worktree: list[bool] = []
+
+            def fake_create_worktree(*_args, **_kwargs):
+                reached_worktree.append(True)  # proves the exempted claim was passed
+                raise StopBeforeWorktree("stop")
+
             with patch("agent_delivery_loop.runner.default_state_dir", return_value=base / "state"), \
                  patch("agent_delivery_loop.runner.GitHubClient", FakeClient), \
                  patch("agent_delivery_loop.runner.preflight", return_value=(0, 1, 0)), \
                  patch("agent_delivery_loop.runner.parse_work_order", return_value=order), \
                  patch("agent_delivery_loop.runner.ensure_plan_is_on_main"), \
-                 patch("agent_delivery_loop.runner.create_worktree", side_effect=StopBeforeWorktree("stop")):
+                 patch("agent_delivery_loop.runner.create_worktree", side_effect=fake_create_worktree):
                 store = RunStore(base / "state")
                 run_kwargs = dict(
                     repo_path=repo, plan_pr="o/r#26",
@@ -515,11 +521,13 @@ class TwoLayerStopTests(unittest.TestCase):
                 with self.assertRaises(AgentDeliveryError) as caught:
                     runner.execute_plan(**run_kwargs, spawn_gate_name=f"{right_key}/{gate.name}")
                 self.assertIn("different task", str(caught.exception))
+                self.assertEqual(reached_worktree, [])
                 # The correctly bound gate passes the late check AND the exempted claim.
                 store.write(right_key, "spawn-abcd1234",
                             orchestrator._spawn_gate_record("abcd1234-full", right_key, "o/r"))
-                with self.assertRaises(StopBeforeWorktree):
+                with self.assertRaises(AgentDeliveryError):
                     runner.execute_plan(**run_kwargs, spawn_gate_name=f"{right_key}/{gate.name}")
+                self.assertEqual(reached_worktree, [True])
 
     def test_stdout_open_failure_is_not_started_and_removes_no_child_assumptions(self) -> None:
         identity = _identity()
