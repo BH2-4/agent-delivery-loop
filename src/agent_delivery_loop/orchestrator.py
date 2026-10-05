@@ -1,39 +1,50 @@
-"""Deterministic single-shot delivery orchestration: fixed inputs, real captured results, fail-closed gates."""
+"""Deterministic single-shot delivery orchestration with bounded rework and safe resume.
+
+Stage machine with reliable checkpoints. Every external write goes through the
+intent-persisted, read-only-reconciled publish path. Reviews are classified:
+pass proceeds, changes_required enters the bounded rework loop (max two rounds,
+persisted across resume), blocked stops without weakening anything, and
+infrastructure failures keep the captured receipt for re-verification instead of
+re-running the Worker or the review model.
+"""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
 import subprocess
-import tempfile
-import time
 import uuid
 from pathlib import Path
 from typing import Any
 
-from .claude_worker import _stop_process_group
+from .claude_worker import ClaudeConfig
 from .errors import AgentDeliveryError
 from .git_ops import git, repository_remote, repository_root
 from .github import GitHubClient, parse_plan_pr_ref
+from .publish import (
+    ensure_delivery_pr,
+    merge_delivery_pr,
+    push_delivery_branch,
+    run_gh,
+    wait_for_ci,
+)
 from .review_cli import (
     CREDENTIAL_ENV_NAMES,
     MAX_REVIEW_TIMEOUT_SECONDS,
     MIN_REVIEW_TIMEOUT_SECONDS,
     run_review_process,
 )
-from .review_handoff import check_review, prepare_review, resolve_review_evidence
-from .runner import _delivery_body  # reuse the authorized Delivery PR body format
-from .store import default_state_dir, now_utc, task_key
+from .review_handoff import _read_json, check_review, prepare_review, resolve_review_evidence
+from .rework import MAX_REWORK_ROUNDS, ReworkLimitError, bounded_rework_directive, run_bounded_rework
+from .runner import _delivery_body
+from .store import RunStore, default_state_dir, task_key
 from .work_order import parse_work_order
 
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 MAX_AGENT_RUN_OUTPUT_BYTES = 64 * 1024
-GH_TIMEOUT_SECONDS = 60
-CI_POLL_SECONDS = 20
-REQUIRED_CHECK_NAME = "validate"
+PRE_WORKER_STAGES = {"created", "install_verified", "evidence_ready"}
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -51,34 +62,60 @@ class Orchestration:
         self.record_dir = default_state_dir() / "orchestrations"
         self.record_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.output_dir = self.record_dir / f"{orchestration_id}.output"
-        self.output_dir.mkdir(mode=0o700)
+        self.output_dir.mkdir(exist_ok=True, mode=0o700)
         self.record: dict[str, Any] = {
             "schema_version": 1,
             "orchestration_id": orchestration_id,
             "mode": "single_shot_delivery",
-            "stage": "starting",
-            "started_at": now_utc(),
+            "stage": "created",
+            "started_at": _now(),
             "finished_at": None,
             "failure": None,
+            "rework": {"count": 0, "entries": []},
+            "candidate": None,
         }
+
+    def load(self) -> None:
+        path = self.record_dir / f"{self.id}.json"
+        record = _read_json(path)
+        if not isinstance(record, dict) or record.get("orchestration_id") != self.id:
+            raise AgentDeliveryError("The orchestration record is unreadable or mismatched; resume is blocked.")
+        self.record = record
+        self.output_dir.mkdir(exist_ok=True, mode=0o700)
 
     def save(self, **updates: Any) -> None:
         self.record.update(updates)
         payload = json.dumps(self.record, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8") + b"\n"
         path = self.record_dir / f"{self.id}.json"
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        descriptor = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        try:
+            descriptor = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        except OSError as exc:
+            # A failed checkpoint must block dependent external writes, not pass silently.
+            raise AgentDeliveryError("The orchestration checkpoint could not be persisted; stopping before further effects.") from exc
 
-    def fail(self, stage: str, message: str) -> None:
-        self.save(stage=stage, failure=message, finished_at=now_utc())
+    def write_intent_sink(self, intent: dict[str, Any]) -> None:
+        self.save(write_intent=intent)
+
+    def fail(self, message: str) -> None:
+        try:
+            self.save(failure=message, finished_at=_now())
+        except AgentDeliveryError:
+            pass
 
     def finish(self, stage: str, **updates: Any) -> None:
-        self.save(stage=stage, finished_at=now_utc(), **updates)
+        self.save(stage=stage, finished_at=_now(), **updates)
+
+
+def _now() -> str:
+    from .store import now_utc
+
+    return now_utc()
 
 
 def _run_bounded(argv: list[str], *, timeout: int, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -91,27 +128,10 @@ def _run_bounded(argv: list[str], *, timeout: int, env: dict[str, str] | None = 
         raise AgentDeliveryError(f"A required command could not run or timed out: {argv[0]}.") from exc
 
 
-def _gh(args: list[str], *, timeout: int = GH_TIMEOUT_SECONDS, proxy: str | None = None) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    if proxy:
-        env.update({"HTTPS_PROXY": proxy, "HTTP_PROXY": proxy, "https_proxy": proxy, "http_proxy": proxy})
-    result = _run_bounded(["gh", *args], timeout=timeout, env=env)
-    if result.returncode != 0:
-        raise AgentDeliveryError(f"gh {' '.join(args[:2])} failed with exit code {result.returncode}; no state was assumed.")
-    return result
-
-
-def _gh_json(args: list[str], *, proxy: str | None = None, timeout: int = GH_TIMEOUT_SECONDS) -> Any:
-    """Run gh with an explicit --json field list already in argv and parse unique-key JSON."""
-    result = _gh(args, proxy=proxy, timeout=timeout)
-    try:
-        return json.loads(result.stdout, object_pairs_hook=_unique_object)
-    except ValueError as exc:
-        raise AgentDeliveryError("gh returned output that is not unique-key JSON.") from exc
-
-
 def verify_installation(*, receipt_path: Path, expected_source_sha: str, expected_wheel_sha256: str) -> dict[str, Any]:
     """The installed entry must match the approved source and wheel, and must not be an editable checkout."""
+    import hashlib
+
     if not SHA_RE.fullmatch(expected_source_sha) or not SHA256_RE.fullmatch(expected_wheel_sha256):
         raise AgentDeliveryError("Expected install provenance must be full SHA-256/40-hex values.")
     try:
@@ -160,6 +180,8 @@ def _spawn_agent_run(
     model: str, base_url: str, effort: str, auth_config: Path,
     timeout_seconds: int, proxy: str | None, stdout_path: Path,
 ) -> dict[str, Any]:
+    from .claude_worker import _stop_process_group
+
     argv = [
         entry, "--plan-pr", plan_pr, "--work-order-path", work_order_path,
         "--repo-path", str(repo_root),
@@ -196,34 +218,35 @@ def _spawn_agent_run(
     return result
 
 
-def _wait_for_ci(*, repo_slug: str, pr_number: int, head_sha: str, timeout_seconds: int, proxy: str | None) -> dict[str, Any]:
-    """Poll real gh check data; missing, pending-forever, cancelled, or failing checks never pass."""
-    deadline = time.monotonic() + timeout_seconds
-    last: list[dict[str, Any]] = []
-    while time.monotonic() < deadline:
-        checks = _gh_json(["pr", "checks", str(pr_number), "--repo", repo_slug, "--json", "name,state,link"], proxy=proxy)
-        if not isinstance(checks, list):
-            raise AgentDeliveryError("gh pr checks did not return a check list.")
-        last = [item for item in checks if isinstance(item, dict)]
-        states = {str(item.get("state", "")).upper() for item in last}
-        if last and states == {"SUCCESS"}:
-            required = [item for item in last if item.get("name") == REQUIRED_CHECK_NAME]
-            if len(required) != 1:
-                raise AgentDeliveryError(f"The required '{REQUIRED_CHECK_NAME}' check is missing from the PR checks.")
-            current_head = _gh_json(
-                ["pr", "view", str(pr_number), "--repo", repo_slug, "--json", "headRefOid"], proxy=proxy
-            )
-            if not isinstance(current_head, dict) or current_head.get("headRefOid") != head_sha:
-                raise AgentDeliveryError("PR head changed while waiting for CI; the checked version is no longer current.")
-            return {
-                "checks": sorted((item.get("name"), str(item.get("state")).upper()) for item in last),
-                "links": [item.get("link") for item in last],
-            }
-        if last and states & {"FAILURE", "CANCELLED", "TIMED_OUT", "SKIPPED"}:
-            failed = [(item.get("name"), str(item.get("state")).upper()) for item in last]
-            raise AgentDeliveryError(f"CI reported a non-success terminal state: {failed}.")
-        time.sleep(CI_POLL_SECONDS)
-    raise AgentDeliveryError(f"CI did not reach a terminal state within {timeout_seconds} seconds; nothing was merged.")
+def _proxy_hygiene(proxy: str | None) -> None:
+    if not proxy:
+        return
+    for legacy in ("ALL_PROXY", "all_proxy"):
+        os.environ.pop(legacy, None)
+    os.environ.update({"HTTPS_PROXY": proxy, "HTTP_PROXY": proxy, "https_proxy": proxy, "http_proxy": proxy})
+
+
+def _worker_record_path(repo_slug: str, order_task_id: str, revision: int, run_id: str) -> Path:
+    return default_state_dir() / "runs" / task_key(repo_slug, order_task_id, revision) / f"{run_id}.json"
+
+
+def _verify_worker_result(record_path: Path, run_id: str, delivery_commit: str, order) -> dict[str, Any]:
+    record = _read_json(record_path)
+    if (
+        record.get("run_id") != run_id or record.get("worker_status") != "stopped"
+        or record.get("status") != "local_ready" or record.get("completion_status") != "complete"
+        or record.get("failure") is not None or record.get("delivery_commit") != delivery_commit
+    ):
+        raise AgentDeliveryError("The run record does not prove a stopped Worker with a completed local candidate.")
+    for path in record.get("changed_paths", []):
+        if not order.allows_path(path):
+            raise AgentDeliveryError(f"Changed path is outside the authorized Work Order scope: {path}.")
+    return record
+
+
+class _Params:
+    def __init__(self, **kwargs: Any) -> None:
+        self.__dict__.update(kwargs)
 
 
 def deliver(
@@ -238,51 +261,133 @@ def deliver(
     if not MIN_REVIEW_TIMEOUT_SECONDS <= review_timeout_seconds <= MAX_REVIEW_TIMEOUT_SECONDS:
         raise AgentDeliveryError("Review timeout is out of the allowed range.")
     orchestration = Orchestration(str(uuid.uuid4()))
+    params = _Params(
+        repo_path=repo_path, plan_pr=plan_pr, work_order_path=work_order_path,
+        model=model, base_url=base_url, effort=effort, auth_config=auth_config,
+        install_receipt=install_receipt, expected_source_sha=expected_source_sha,
+        expected_wheel_sha256=expected_wheel_sha256, review_model=review_model,
+        review_effort=review_effort, review_timeout_seconds=review_timeout_seconds,
+        review_bundle_dir=review_bundle_dir, proxy=proxy,
+        ci_timeout_seconds=ci_timeout_seconds, auto_merge=auto_merge,
+    )
+    orchestration.save(
+        parameters={
+            "plan_pr": plan_pr, "work_order_path": work_order_path,
+            "expected_source_sha": expected_source_sha, "expected_wheel_sha256": expected_wheel_sha256,
+            "review_model": review_model, "review_effort": review_effort,
+            "review_timeout_seconds": review_timeout_seconds,
+            "review_bundle_dir": str(review_bundle_dir), "proxy": proxy,
+            "ci_timeout_seconds": ci_timeout_seconds, "auto_merge": auto_merge,
+            "model": model, "base_url": base_url, "effort": effort,
+            "auth_config": str(auth_config), "repo_path": str(repo_path),
+            "install_receipt": str(install_receipt),
+        }
+    )
+    return _continue(orchestration, params, fresh=True)
+
+
+def resume(
+    *,
+    orchestration_id: str,
+    repo_path: Path, plan_pr: str, work_order_path: str,
+    model: str, base_url: str, effort: str, auth_config: Path,
+    install_receipt: Path, expected_source_sha: str, expected_wheel_sha256: str,
+    review_model: str, review_effort: str, review_timeout_seconds: int,
+    review_bundle_dir: Path, proxy: str | None = None,
+    ci_timeout_seconds: int = 900, auto_merge: bool = False,
+) -> dict[str, Any]:
+    if not MIN_REVIEW_TIMEOUT_SECONDS <= review_timeout_seconds <= MAX_REVIEW_TIMEOUT_SECONDS:
+        raise AgentDeliveryError("Review timeout is out of the allowed range.")
+    orchestration = Orchestration(orchestration_id)
+    orchestration.load()
+    if orchestration.record.get("mode") != "single_shot_delivery":
+        raise AgentDeliveryError("The record does not belong to a single-shot delivery orchestration.")
+    if orchestration.record.get("finished_at") and orchestration.record.get("stage") == "completed":
+        raise AgentDeliveryError("This orchestration already completed; start a new one instead of resuming.")
+    if orchestration.record.get("stage") in PRE_WORKER_STAGES:
+        raise AgentDeliveryError(
+            "No Worker result exists yet for this orchestration; run a fresh deliver instead of resuming."
+        )
+    recorded = orchestration.record.get("parameters") or {}
+    strict_keys = (
+        ("plan_pr", plan_pr), ("work_order_path", work_order_path),
+        ("expected_source_sha", expected_source_sha), ("expected_wheel_sha256", expected_wheel_sha256),
+    )
+    advisory_keys = (
+        ("review_model", review_model), ("review_effort", review_effort),
+        ("review_timeout_seconds", review_timeout_seconds), ("ci_timeout_seconds", ci_timeout_seconds),
+        ("auto_merge", auto_merge),
+    )
+    for key, expected in strict_keys:
+        if recorded.get(key) != expected:
+            raise AgentDeliveryError(f"Resume parameter mismatch for '{key}'; the recorded orchestration binds different values.")
+    for key, expected in advisory_keys:
+        if key in recorded and recorded[key] != expected:
+            raise AgentDeliveryError(f"Resume parameter mismatch for '{key}'; the recorded orchestration binds different values.")
+    params = _Params(
+        repo_path=repo_path, plan_pr=plan_pr, work_order_path=work_order_path,
+        model=model, base_url=base_url, effort=effort, auth_config=auth_config,
+        install_receipt=install_receipt, expected_source_sha=expected_source_sha,
+        expected_wheel_sha256=expected_wheel_sha256, review_model=review_model,
+        review_effort=review_effort, review_timeout_seconds=review_timeout_seconds,
+        review_bundle_dir=review_bundle_dir, proxy=proxy,
+        ci_timeout_seconds=ci_timeout_seconds, auto_merge=auto_merge,
+    )
+    orchestration.save(stage=orchestration.record["stage"], resumed_at=_now(), failure=None)
+    return _continue(orchestration, params, fresh=False)
+
+
+def _continue(orchestration: Orchestration, params: _Params, *, fresh: bool) -> dict[str, Any]:
     try:
-        # Stage 1: the running orchestration entry must be the reviewed, installed wheel.
-        install = verify_installation(
-            receipt_path=install_receipt, expected_source_sha=expected_source_sha,
-            expected_wheel_sha256=expected_wheel_sha256,
-        )
-        orchestration.save(stage="install_verified", install=install)
+        return _continue_inner(orchestration, params, fresh=fresh)
+    except AgentDeliveryError as exc:
+        orchestration.fail(str(exc))
+        raise
+    except Exception as exc:
+        orchestration.fail("Unexpected orchestration failure; sensitive output suppressed.")
+        raise AgentDeliveryError("Unexpected orchestration failure; sensitive output suppressed.") from exc
 
-        if proxy:
-            # An inherited ALL_PROXY can override scheme-specific settings in some
-            # HTTP stacks; when an explicit proxy is given it must be the only route.
-            for legacy in ("ALL_PROXY", "all_proxy"):
-                os.environ.pop(legacy, None)
-            os.environ.update({"HTTPS_PROXY": proxy, "HTTP_PROXY": proxy, "https_proxy": proxy, "http_proxy": proxy})
-        root = repository_root(repo_path.expanduser().resolve())
-        local_repo = repository_remote(root)
-        plan_repo, number, plan_url = parse_plan_pr_ref(plan_pr)
-        if local_repo.slug.casefold() != plan_repo.slug.casefold():
-            raise AgentDeliveryError("The Plan PR and the local repository origin must refer to the same repository.")
-        client = GitHubClient(plan_repo)
-        authorization = client.authorized_plan(number, work_order_path, plan_url)
-        order = parse_work_order(authorization.order_bytes, expected_path=authorization.order_path)
-        # Deterministic evidence readiness BEFORE any Worker spend: pinned refs must
-        # resolve locally so the review packet can carry the acceptance basis.
-        git(root, "fetch", "--no-tags", plan_repo.https_url, "+refs/heads/main:refs/remotes/adl-main")
-        evidence_ready = resolve_review_evidence(root, order.review_evidence)
-        orchestration.save(
-            stage="authorization_verified",
-            authorization={
-                "plan_pr": plan_url, "plan_merge_sha": authorization.merge_sha,
-                "work_order_path": authorization.order_path, "work_order_sha256": order.sha256,
-                "task_id": order.task_id, "revision": order.revision,
-            },
-            evidence_ready={
-                "entries": [{key: item[key] for key in ("path", "ref", "sha256")} for item in evidence_ready],
-                "total_evidence_bytes": sum(item["bytes"] for item in evidence_ready),
-            },
-        )
 
-        # Stage 2: run the real Worker through the installed entry; capture its exit code.
+def _continue_inner(orchestration: Orchestration, params: _Params, *, fresh: bool) -> dict[str, Any]:
+    # Stage 1: provenance of the running entry (re-verified on every resume).
+    install = verify_installation(
+        receipt_path=params.install_receipt, expected_source_sha=params.expected_source_sha,
+        expected_wheel_sha256=params.expected_wheel_sha256,
+    )
+    orchestration.save(stage="install_verified", install=install)
+    _proxy_hygiene(params.proxy)
+
+    root = repository_root(params.repo_path.expanduser().resolve())
+    local_repo = repository_remote(root)
+    plan_repo, number, plan_url = parse_plan_pr_ref(params.plan_pr)
+    if local_repo.slug.casefold() != plan_repo.slug.casefold():
+        raise AgentDeliveryError("The Plan PR and the local repository origin must refer to the same repository.")
+    client = GitHubClient(plan_repo)
+    authorization = client.authorized_plan(number, params.work_order_path, plan_url)
+    order = parse_work_order(authorization.order_bytes, expected_path=authorization.order_path)
+    git(root, "fetch", "--no-tags", plan_repo.https_url, "+refs/heads/main:refs/remotes/adl-main")
+    evidence_ready = resolve_review_evidence(root, order.review_evidence)
+    orchestration.save(
+        stage="evidence_ready",
+        authorization={
+            "plan_pr": plan_url, "plan_merge_sha": authorization.merge_sha,
+            "work_order_path": authorization.order_path, "work_order_sha256": order.sha256,
+            "task_id": order.task_id, "revision": order.revision,
+        },
+        evidence_ready={
+            "entries": [{key: item[key] for key in ("path", "ref", "sha256")} for item in evidence_ready],
+            "total_evidence_bytes": sum(item["bytes"] for item in evidence_ready),
+        },
+    )
+
+    store = RunStore(default_state_dir())
+    worktree = None
+    if fresh:
         agent_run_output = _spawn_agent_run(
-            entry=install["agent_run_entry"], repo_root=root, plan_pr=plan_pr,
-            work_order_path=work_order_path, model=model, base_url=base_url,
-            effort=effort, auth_config=auth_config,
-            timeout_seconds=order.timeout_seconds + 300, proxy=proxy,
+            entry=install["agent_run_entry"], repo_root=root, plan_pr=params.plan_pr,
+            work_order_path=params.work_order_path, model=params.model, base_url=params.base_url,
+            effort=params.effort, auth_config=params.auth_config,
+            timeout_seconds=order.timeout_seconds + 300, proxy=params.proxy,
             stdout_path=orchestration.output_dir / "agent-run-stdout.json",
         )
         run_id = agent_run_output.get("run_id")
@@ -290,149 +395,208 @@ def deliver(
         delivery_commit = agent_run_output.get("delivery_commit")
         if not isinstance(run_id, str) or not isinstance(delivery_branch, str) or not SHA_RE.fullmatch(str(delivery_commit)):
             raise AgentDeliveryError("agent-run did not report a run ID, delivery branch, and full delivery commit.")
-        record_path = default_state_dir() / "runs" / task_key(plan_repo.slug, order.task_id, order.revision) / f"{run_id}.json"
-        record = json.loads(record_path.read_bytes(), object_pairs_hook=_unique_object)
-        if (
-            record.get("run_id") != run_id or record.get("worker_status") != "stopped"
-            or record.get("status") != "local_ready" or record.get("completion_status") != "complete"
-            or record.get("failure") is not None or record.get("delivery_commit") != delivery_commit
-        ):
-            raise AgentDeliveryError("The run record does not prove a stopped Worker with a completed local candidate.")
-        for path in record.get("changed_paths", []):
-            if not order.allows_path(path):
-                raise AgentDeliveryError(f"Changed path is outside the authorized Work Order scope: {path}.")
+        record_path = _worker_record_path(plan_repo.slug, order.task_id, order.revision, run_id)
+        worker_record = _verify_worker_result(record_path, run_id, str(delivery_commit), order)
+        worktree = store.root / "worktrees" / run_id
         orchestration.save(
             stage="worker_completed",
             worker={
-                "run_id": run_id, "session_id": record.get("session_id"),
+                "run_id": run_id, "session_id": worker_record.get("session_id"),
                 "agent_run_exit_code": agent_run_output["agent_run_exit_code"],
-                "delivery_branch": delivery_branch, "delivery_commit": delivery_commit,
-                "changed_paths": record.get("changed_paths"),
+                "delivery_branch": delivery_branch, "worker_commit": delivery_commit,
+                "changed_paths": worker_record.get("changed_paths"),
+                "record_path": str(record_path),
             },
+            candidate={"sha": delivery_commit, "origin": "worker", "review_round": 0},
         )
+    else:
+        worker = orchestration.record.get("worker")
+        candidate = orchestration.record.get("candidate")
+        if not isinstance(worker, dict) or not isinstance(candidate, dict) or not SHA_RE.fullmatch(str(candidate.get("sha", ""))):
+            raise AgentDeliveryError("The resumed record lacks a usable Worker result and candidate; resume is blocked.")
+        run_id = worker["run_id"]
+        delivery_branch = worker["delivery_branch"]
+        record_path = Path(worker["record_path"])
+        worker_record = _verify_worker_result(record_path, run_id, worker["worker_commit"], order)
+        worktree = store.root / "worktrees" / run_id
+        delivery_commit = candidate["sha"]
 
-        # Stage 3: bounded real review through the read-only CLI, with a captured exit code.
-        bundle = prepare_review(
-            output_dir=review_bundle_dir, repo_path=root, plan_pr=plan_pr,
-            work_order_path=work_order_path, run_record=record_path, head_sha=str(delivery_commit),
-        )
-        review_run = run_review_process(
-            bundle_dir=review_bundle_dir, timeout_seconds=review_timeout_seconds,
-            review_model=review_model, review_effort=review_effort, proxy=proxy,
-        )
-        # Persist the captured receipt linkage BEFORE the network-bound re-verification,
-        # so a transient check failure never forces a redundant model re-run.
-        review_linkage = {
-            "review_id": review_run["review_id"], "codex_version": review_run["codex_version"],
-            "exit_code": review_run["exit_code"], "stop_status": review_run["stop_status"],
-            "result_path": review_run["result_path"],
-            "context_sha256": bundle.get("context_sha256"),
-        }
-        orchestration.save(stage="review_completed_pending_check", review=review_linkage)
-        checked = check_review(
-            bundle_dir=review_bundle_dir, result_path=Path(review_run["result_path"]),
-            review_exit_code=review_run["exit_code"],
-            repo_path=root, plan_pr=plan_pr, work_order_path=work_order_path,
-            run_record=record_path, head_sha=str(delivery_commit),
-            exit_code_source="captured_by_orchestrator",
-        )
-        if checked.get("verdict") != "pass":
-            raise AgentDeliveryError("The independent review did not pass; nothing was published.")
-        orchestration.save(
-            stage="review_passed",
-            review={**review_linkage, "unverified_count": checked.get("unverified_count")},
-        )
+    # Review / rework loop: candidate is always the current local branch head.
+    review_state = _review_loop(
+        orchestration, params, root, plan_repo, order, authorization, record_path, worktree, delivery_branch,
+        skill_sha256=worker_record.get("skill_sha256"),
+    )
+    candidate = review_state["candidate"]
 
-        # Stage 4: publish with the one-shot personal gh identity (never passed to the Worker).
-        token = _gh(["auth", "token"], proxy=proxy).stdout.strip()
-        if not token:
-            raise AgentDeliveryError("gh did not provide an authentication token for the one-shot push.")
-        with tempfile.TemporaryDirectory(prefix="adl-askpass-") as temporary:
-            askpass = Path(temporary) / "askpass"
-            askpass.write_text(
-                '#!/bin/sh\ncase "$1" in *Username*) printf \'%s\\n\' "x-access-token" ;;'
-                ' *Password*) printf \'%s\\n\' "$AGENT_GIT_PASSWORD" ;; *) exit 1 ;; esac\n',
-                encoding="utf-8",
-            )
-            askpass.chmod(0o700)
-            push_env = {key: value for key, value in os.environ.items() if key not in CREDENTIAL_ENV_NAMES}
-            push_env.update({"GIT_ASKPASS": str(askpass), "GIT_TERMINAL_PROMPT": "0", "AGENT_GIT_PASSWORD": token})
-            if proxy:
-                push_env.update({"https_proxy": proxy, "http_proxy": proxy})
-            worktree = default_state_dir() / "worktrees" / run_id
-            pushed = git(
-                worktree, "-c", "credential.helper=", "push", plan_repo.https_url,
-                f"HEAD:refs/heads/{delivery_branch}", env=push_env, check=False,
-            )
-        if pushed.returncode != 0:
-            raise AgentDeliveryError("The delivery branch could not be pushed with the one-shot identity.")
-        remote_head = _gh(
-            ["api", f"repos/{plan_repo.slug}/git/ref/heads/{delivery_branch}", "--jq", ".object.sha"], proxy=proxy
-        ).stdout.strip()
-        if not SHA_RE.fullmatch(remote_head) or remote_head != delivery_commit:
-            raise AgentDeliveryError("Remote delivery branch does not match the reviewed head; publishing stopped.")
-        pulls = _gh_json(
-            ["pr", "list", "--repo", plan_repo.slug, "--head", delivery_branch, "--base", "main", "--state", "open",
-             "--json", "number,url"],
-            proxy=proxy,
+    # Publish chain: intent-persisted writes, read-only reconciliation.
+    token_result = run_gh(["auth", "token"], proxy=params.proxy)
+    if token_result.returncode != 0 or not token_result.stdout.strip():
+        raise AgentDeliveryError("gh did not provide an authentication token for the one-shot push.")
+    push_delivery_branch(
+        worktree=worktree, repo_slug=plan_repo.slug, repo_url=plan_repo.https_url,
+        branch=delivery_branch, candidate_sha=candidate,
+        intent_sink=orchestration.write_intent_sink,
+        token_provider=lambda: token_result.stdout.strip(), proxy=params.proxy,
+    )
+    orchestration.save(stage="pushed", pushed={"branch": delivery_branch, "head": candidate})
+    body_path = orchestration.output_dir / "delivery-pr-body.md"
+    rework_entries = orchestration.record.get("rework", {}).get("entries", [])
+    body_path.write_text(
+        _delivery_body(order, plan_url, authorization.merge_sha, run_id, worker_record.get("skill_sha256", ""), _changed(record_path, candidate, orchestration))
+        + "".join(
+            f"\n- Bounded rework r{entry['rework_index']}: `{entry['rework_commit']}` (session `{entry['session_id']}`)\n"
+            for entry in rework_entries
         )
-        if isinstance(pulls, list) and len(pulls) == 1 and isinstance(pulls[0], dict):
-            pr_number = pulls[0]["number"]
-            pr_url = pulls[0]["url"]
-        elif isinstance(pulls, list) and not pulls:
-            body_path = orchestration.output_dir / "delivery-pr-body.md"
-            body_path.write_text(
-                _delivery_body(order, plan_url, authorization.merge_sha, run_id, record["skill_sha256"], record["changed_paths"])
-                + "\n\nOrchestrated single-shot delivery; review and CI gates verified before merge.\n",
-                encoding="utf-8",
-            )
-            created = _gh(["pr", "create", "--repo", plan_repo.slug, "--head", delivery_branch, "--base", "main",
-                           "--title", f"Delivery: {order.task_id} r{order.revision}", "--body-file", str(body_path)], proxy=proxy)
-            match = re.search(r"https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9_.-]+/pull/[0-9]+", created.stdout)
-            if not match:
-                raise AgentDeliveryError("Delivery PR creation result was uncertain; inspect GitHub before retrying.")
-            pr_url = match.group(0)
-            pr_number = int(pr_url.rsplit("/", 1)[1])
-        else:
-            raise AgentDeliveryError("Delivery PR lookup was ambiguous; inspect GitHub before retrying.")
-        orchestration.save(stage="delivery_pr_open", delivery_pr={"number": pr_number, "url": pr_url, "head": delivery_commit})
-
-        # Stage 5: wait for the real CI bound to this head.
-        ci = _wait_for_ci(
-            repo_slug=plan_repo.slug, pr_number=pr_number, head_sha=delivery_commit,
-            timeout_seconds=ci_timeout_seconds, proxy=proxy,
+        + "\n\nOrchestrated single-shot delivery; review and CI gates verified before merge.\n",
+        encoding="utf-8",
+    )
+    pr = ensure_delivery_pr(
+        repo_slug=plan_repo.slug, branch=delivery_branch, candidate_sha=candidate,
+        title=f"Delivery: {order.task_id} r{order.revision}", body_file=body_path,
+        intent_sink=orchestration.write_intent_sink, proxy=params.proxy,
+    )
+    orchestration.save(stage="pr_open", delivery_pr={**pr, "head": candidate})
+    ci = wait_for_ci(
+        repo_slug=plan_repo.slug, pr_number=pr["number"], head_sha=candidate,
+        timeout_seconds=params.ci_timeout_seconds, proxy=params.proxy,
+    )
+    orchestration.save(stage="ci_passed", ci=ci)
+    merge = {"merged": False, "merge_sha": None, "main_contains_head": False}
+    if params.auto_merge:
+        merge = merge_delivery_pr(
+            repo_slug=plan_repo.slug, pr_number=pr["number"], candidate_sha=candidate,
+            intent_sink=orchestration.write_intent_sink, proxy=params.proxy,
         )
-        orchestration.save(stage="ci_passed", ci=ci)
+        git(root, "fetch", "--no-tags", plan_repo.https_url, "refs/heads/main:refs/remotes/adl-main")
+        if git(root, "merge-base", "--is-ancestor", candidate, "refs/remotes/adl-main", check=False).returncode != 0:
+            raise AgentDeliveryError("Merged PR head is not reachable from the fetched main; verify on GitHub.")
+        merge["main_contains_head"] = True
+    result = orchestration.finish(
+        "completed" if merge.get("merged") else "awaiting_user_merge",
+        delivery_pr={**pr, "head": candidate}, merge=merge, auto_merge_requested=params.auto_merge,
+    )
+    return {**orchestration.record, "orchestration_id": orchestration.id}
 
-        # Stage 6: conditional merge, then verify the actual GitHub result.
-        merge = {"merged": False, "merge_sha": None, "main_contains_head": False}
-        if auto_merge:
-            _gh(["pr", "merge", str(pr_number), "--repo", plan_repo.slug, "--merge"], proxy=proxy, timeout=120)
-            detail = _gh_json(
-                ["pr", "view", str(pr_number), "--repo", plan_repo.slug, "--json", "state,mergeCommit"], proxy=proxy
+
+def _changed(record_path: Path, candidate: str, orchestration: Orchestration) -> list[str]:
+    paths: list[str] = list(_read_json(record_path).get("changed_paths", []))
+    for entry in orchestration.record.get("rework", {}).get("entries", []):
+        for path in entry.get("changed_paths", []):
+            if path not in paths:
+                paths.append(path)
+    return paths
+
+
+def _review_loop(
+    orchestration: Orchestration, params: _Params, root: Path, plan_repo, order,
+    authorization, record_path: Path, worktree: Path, delivery_branch: str,
+    skill_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Run reviews until pass, bounded rework in between; never re-runs the Worker."""
+    from .store import RunStore as _RunStore
+
+    store = _RunStore(default_state_dir())
+    round_index = int((orchestration.record.get("candidate") or {}).get("review_round", 0))
+    while True:
+        candidate = orchestration.record["candidate"]["sha"]
+        branch_head = git(worktree, "rev-parse", "--verify", f"refs/heads/{delivery_branch}").stdout.strip()
+        if branch_head != candidate:
+            raise AgentDeliveryError(
+                f"Local Delivery branch head {branch_head} does not match the tracked candidate {candidate}."
             )
-            merged = isinstance(detail, dict) and detail.get("state") == "MERGED"
-            if not merged:
-                raise AgentDeliveryError("Merge was requested but GitHub does not report the Delivery PR as merged.")
-            merge_commit = detail.get("mergeCommit")
-            merge = {
-                "merged": True,
-                "merge_sha": merge_commit.get("oid") if isinstance(merge_commit, dict) else None,
-                "main_contains_head": False,
+        bundle_dir = params.review_bundle_dir.with_name(params.review_bundle_dir.name + ("" if round_index == 0 else f"-r{round_index}"))
+        bump = round_index
+        while bundle_dir.exists():  # Never overwrite; a resumed round moves to a fresh bundle.
+            bump += 1
+            bundle_dir = params.review_bundle_dir.with_name(params.review_bundle_dir.name + f"-r{bump}")
+        prior = orchestration.record.get("review") or {}
+        reusable = (
+            prior.get("candidate") == candidate
+            and prior.get("review_round") == round_index
+            and prior.get("verdict") in {"pass", "changes_required", "blocked"}
+            and Path(str(prior.get("result_path", ""))).is_file()
+        )
+        if reusable:
+            # A completed review for THIS candidate and round is never re-rolled on resume,
+            # whatever stage the orchestration stopped at: pass re-verifies the same receipt,
+            # changes_required proceeds to the rework decision, blocked keeps stopping.
+            if prior.get("bundle_dir"):
+                bundle_dir = Path(prior["bundle_dir"])
+            review_run = {
+                "review_id": prior["review_id"], "codex_version": prior.get("codex_version"),
+                "exit_code": prior["exit_code"], "stop_status": prior["stop_status"],
+                "result_path": prior["result_path"],
             }
-            git(root, "fetch", "--no-tags", plan_repo.https_url, "refs/heads/main:refs/remotes/adl-main")
-            if git(root, "merge-base", "--is-ancestor", delivery_commit, "refs/remotes/adl-main", check=False).returncode != 0:
-                raise AgentDeliveryError("Merged PR head is not reachable from the fetched main; verify on GitHub.")
-            merge["main_contains_head"] = True
-        result = orchestration.finish(
-            "completed" if merge["merged"] else "awaiting_user_merge",
-            delivery_pr={"number": pr_number, "url": pr_url, "head": delivery_commit},
-            merge=merge, auto_merge_requested=auto_merge,
-        )
-        return {**orchestration.record, "orchestration_id": orchestration.id}
-    except AgentDeliveryError as exc:
-        orchestration.fail(orchestration.record.get("stage", "starting"), str(exc))
-        raise
-    except Exception as exc:
-        orchestration.fail(orchestration.record.get("stage", "starting"), "Unexpected orchestration failure; sensitive output suppressed.")
-        raise AgentDeliveryError("Unexpected orchestration failure; sensitive output suppressed.") from exc
+        else:
+            prepare_review(
+                output_dir=bundle_dir, repo_path=root, plan_pr=params.plan_pr,
+                work_order_path=params.work_order_path, run_record=record_path, head_sha=candidate,
+            )
+            review_run = run_review_process(
+                bundle_dir=bundle_dir, timeout_seconds=params.review_timeout_seconds,
+                review_model=params.review_model, review_effort=params.review_effort, proxy=params.proxy,
+            )
+            review_run = {key: review_run[key] for key in ("review_id", "codex_version", "exit_code", "stop_status", "result_path")}
+        linkage = {
+            **review_run, "review_round": round_index, "candidate": candidate, "verdict": None,
+            "bundle_dir": str(bundle_dir),
+        }
+        receipt = _read_json(Path(review_run["result_path"]))
+        verdict = receipt.get("verdict")
+        linkage["verdict"] = verdict
+        orchestration.save(stage="review_completed_pending_check", review=linkage)
+        if verdict == "pass":
+            check_review(
+                bundle_dir=bundle_dir, result_path=Path(review_run["result_path"]),
+                review_exit_code=review_run["exit_code"],
+                repo_path=root, plan_pr=params.plan_pr, work_order_path=params.work_order_path,
+                run_record=record_path, head_sha=candidate,
+                exit_code_source="captured_by_orchestrator",
+            )
+            orchestration.save(stage="review_passed", review={**linkage, "verdict": "pass"})
+            return {"candidate": candidate}
+        if verdict == "changes_required":
+            rework_state = orchestration.record.get("rework") or {"count": 0, "entries": []}
+            if rework_state["count"] >= MAX_REWORK_ROUNDS:
+                raise ReworkLimitError(
+                    "The review requested changes but the bounded rework budget (2) is exhausted; stopping without merging."
+                )
+            directive = bounded_rework_directive(receipt)
+            rework_index = rework_state["count"] + 1
+            orchestration.save(
+                stage=f"rework_r{rework_index}_started",
+                review={**linkage, "verdict": "changes_required"},
+                rework={**rework_state, "count": rework_index},
+            )
+            outcome = run_bounded_rework(
+                store=store, repo_slug=plan_repo.slug, worktree=worktree, order=order,
+                expected_skill_sha256=skill_sha256,
+                worker_config=ClaudeConfig.from_explicit(
+                    model=params.model, base_url=params.base_url, effort=params.effort,
+                    auth_config=params.auth_config, repo_root=root,
+                ),
+                original_run_id=orchestration.record["worker"]["run_id"],
+                delivery_branch=delivery_branch, parent_sha=candidate,
+                rework_index=rework_index, directive=directive,
+                rework_count_so_far=rework_state["count"],
+            )
+            entries = orchestration.record["rework"]["entries"]
+            entries.append({
+                "rework_index": rework_index, "rework_id": outcome["rework_id"],
+                "session_id": outcome["session_id"], "parent_commit": outcome["parent_commit"],
+                "rework_commit": outcome["rework_commit"], "changed_paths": outcome["changed_paths"],
+            })
+            orchestration.save(
+                stage=f"rework_r{rework_index}_completed",
+                rework={"count": rework_index, "entries": entries},
+                candidate={"sha": outcome["rework_commit"], "origin": "rework", "review_round": round_index + 1},
+            )
+            round_index += 1
+            continue
+        if verdict == "blocked":
+            orchestration.save(stage="review_blocked", review={**linkage, "verdict": "blocked"})
+            raise AgentDeliveryError(
+                "The independent review returned blocked: evidence, authorization, or infrastructure is insufficient. "
+                "No rework is run on blocked; inspect the receipt and stop."
+            )
+        raise AgentDeliveryError(f"The review receipt carried an unknown verdict: {verdict!r}.")

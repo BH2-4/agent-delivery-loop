@@ -35,6 +35,10 @@ class GitHubReadError(AgentDeliveryError):
     """A read-only query stayed failed after bounded, classified retries."""
 
 
+class GitHubWritePendingError(AgentDeliveryError):
+    """A write request's outcome is unknown; it must never be blindly replayed."""
+
+
 def _rate_reset_remaining(headers: Any) -> int | None:
     if headers is None or not hasattr(headers, "get"):
         return None
@@ -110,7 +114,9 @@ class GitHubClient:
         deadline = time.monotonic() + READ_TOTAL_BUDGET_SECONDS
         last_failure = "unknown"
         waited_for_rate = False
-        for attempt in range(len(READ_RETRY_DELAYS_SECONDS) + 1):
+        is_read = method.upper() == "GET"
+        retries_left = len(READ_RETRY_DELAYS_SECONDS) if is_read else 0
+        for attempt in range(retries_left + 1):
             try:
                 with urllib.request.urlopen(request, timeout=READ_ATTEMPT_TIMEOUT_SECONDS) as response:
                     body = response.read()
@@ -124,29 +130,38 @@ class GitHubClient:
                 rate_reset = _rate_reset_remaining(exc.headers)
                 if exc.code in (401, 403) and rate_reset is not None:
                     wait = rate_reset - int(time.time()) + 1
-                    if not waited_for_rate and 0 < wait <= deadline - time.monotonic() and attempt < len(READ_RETRY_DELAYS_SECONDS):
+                    if is_read and not waited_for_rate and 0 < wait <= deadline - time.monotonic() and attempt < retries_left:
                         waited_for_rate = True
                         time.sleep(wait)
                         last_failure = f"rate limited (resets in ~{wait}s); waited once"
                         continue
                     raise GitHubReadError(f"GitHub rate limit persists beyond the bounded wait (HTTP {exc.code}).") from None
-                if exc.code in (429,) or (exc.code == 403 and "rate limit" in body_text.lower()):
-                    if attempt < len(READ_RETRY_DELAYS_SECONDS) and time.monotonic() < deadline:
+                if is_read and (exc.code in (429,) or (exc.code == 403 and "rate limit" in body_text.lower())):
+                    if attempt < retries_left and time.monotonic() < deadline:
                         time.sleep(READ_RETRY_DELAYS_SECONDS[attempt])
                         last_failure = f"rate limited (HTTP {exc.code})"
                         continue
                     raise GitHubReadError(f"GitHub rate limiting persisted after bounded retries (HTTP {exc.code}).") from None
-                if exc.code >= 500 and attempt < len(READ_RETRY_DELAYS_SECONDS) and time.monotonic() < deadline:
+                if is_read and exc.code >= 500 and attempt < retries_left and time.monotonic() < deadline:
                     time.sleep(READ_RETRY_DELAYS_SECONDS[attempt])
                     last_failure = f"server error (HTTP {exc.code})"
                     continue
+                if not is_read and exc.code >= 500:
+                    # The write may have been applied before the server error; outcome unknown.
+                    raise GitHubWritePendingError(
+                        f"GitHub write (HTTP {exc.code}) returned a server error; the remote result must be verified read-only."
+                    ) from None
                 # 404, 401/403 without rate-limit markers, 4xx: real errors, never retried.
                 raise GitHubReadError(f"GitHub API request failed with HTTP {exc.code}.") from None
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_failure = f"network ({type(exc).__name__})"
-                if attempt < len(READ_RETRY_DELAYS_SECONDS) and time.monotonic() < deadline:
+                if attempt < retries_left and time.monotonic() < deadline:
                     time.sleep(READ_RETRY_DELAYS_SECONDS[attempt])
                     continue
+                if not is_read:
+                    raise GitHubWritePendingError(
+                        "GitHub write lost its response; the remote result must be verified read-only before any repeat."
+                    ) from exc
                 raise GitHubReadError(
                     f"GitHub API could not be reached after bounded retries; last failure: {last_failure}."
                 ) from exc

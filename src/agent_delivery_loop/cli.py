@@ -154,20 +154,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         "deliver",
         help="Single-shot deterministic orchestration: verify install and authorization, run the Worker, review, publish, wait for CI, and optionally merge"
     )
-    deliver_parser.add_argument("--plan-pr", required=True)
-    deliver_parser.add_argument("--work-order-path", required=True)
-    deliver_parser.add_argument("--repo-path", type=Path, default=Path.cwd())
-    _add_worker_arguments(deliver_parser)
-    deliver_parser.add_argument("--install-receipt", required=True, type=Path, help="Install provenance receipt for the running entry")
-    deliver_parser.add_argument("--expected-source-sha", required=True, help="Approved full source SHA the installation must match")
-    deliver_parser.add_argument("--expected-wheel-sha256", required=True, help="Approved wheel SHA-256 the installation must match")
-    deliver_parser.add_argument("--review-model", required=True)
-    deliver_parser.add_argument("--review-effort", required=True)
-    deliver_parser.add_argument("--review-timeout", type=int, default=900)
-    deliver_parser.add_argument("--review-bundle-dir", required=True, type=Path)
-    deliver_parser.add_argument("--proxy", default=None)
-    deliver_parser.add_argument("--ci-timeout", type=int, default=900)
-    deliver_parser.add_argument("--auto-merge", action="store_true", help="Merge the Delivery PR only after every gate passes")
+    resume_parser = subparsers.add_parser(
+        "resume",
+        help="Safely continue a delivery orchestration from its last confirmed stage; never re-runs the Worker"
+    )
+    resume_parser.add_argument("--orchestration-id", required=True)
+    for pipeline_parser in (deliver_parser, resume_parser):
+        pipeline_parser.add_argument("--plan-pr", required=True)
+        pipeline_parser.add_argument("--work-order-path", required=True)
+        pipeline_parser.add_argument("--repo-path", type=Path, default=Path.cwd())
+        _add_worker_arguments(pipeline_parser)
+        pipeline_parser.add_argument("--install-receipt", required=True, type=Path, help="Install provenance receipt for the running entry")
+        pipeline_parser.add_argument("--expected-source-sha", required=True, help="Approved full source SHA the installation must match")
+        pipeline_parser.add_argument("--expected-wheel-sha256", required=True, help="Approved wheel SHA-256 the installation must match")
+        pipeline_parser.add_argument("--review-model", required=True)
+        pipeline_parser.add_argument("--review-effort", required=True)
+        pipeline_parser.add_argument("--review-timeout", type=int, default=900)
+        pipeline_parser.add_argument("--review-bundle-dir", required=True, type=Path)
+        pipeline_parser.add_argument("--proxy", default=None)
+        pipeline_parser.add_argument("--ci-timeout", type=int, default=900)
+        pipeline_parser.add_argument("--auto-merge", action="store_true", help="Merge the Delivery PR only after every gate passes")
     evidence_parser = subparsers.add_parser(
         "check-evidence",
         help="Verify a Work Order's pinned review evidence resolves before any Worker runs"
@@ -229,11 +235,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _report_error(exc)
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
-    if args.command == "deliver":
-        from .orchestrator import deliver
+    if args.command in {"deliver", "resume"}:
+        from .orchestrator import deliver, resume
 
         try:
-            result = deliver(
+            common = dict(
                 repo_path=args.repo_path, plan_pr=args.plan_pr, work_order_path=args.work_order_path,
                 model=args.model, base_url=args.base_url, effort=args.effort, auth_config=args.auth_config,
                 install_receipt=args.install_receipt, expected_source_sha=args.expected_source_sha,
@@ -242,6 +248,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 review_timeout_seconds=args.review_timeout, review_bundle_dir=args.review_bundle_dir,
                 proxy=args.proxy, ci_timeout_seconds=args.ci_timeout, auto_merge=args.auto_merge,
             )
+            if args.command == "deliver":
+                result = deliver(**common)
+            else:
+                result = resume(orchestration_id=args.orchestration_id, **common)
         except Exception as exc:
             return _report_error(exc)
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))

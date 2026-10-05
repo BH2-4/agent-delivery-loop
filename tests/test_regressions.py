@@ -38,7 +38,8 @@ from agent_delivery_loop.github import GitHubClient, Repo
 from agent_delivery_loop.git_ops import DeliveryCommit, StagedSnapshot, commit_changes, git, stage_changes
 from agent_delivery_loop.runner import _record_cancelled_run, _safe_changed_paths, execute_plan
 from agent_delivery_loop.review_cli import ReviewGateError, assert_review_processes_settled, run_review_process
-from agent_delivery_loop.orchestrator import _wait_for_ci, verify_installation
+from agent_delivery_loop.orchestrator import verify_installation
+from agent_delivery_loop.publish import wait_for_ci as _wait_for_ci
 from agent_delivery_loop.store import RunStateError, RunStore, task_key
 from agent_delivery_loop.work_order import parse_work_order
 
@@ -388,11 +389,286 @@ class VerifyReviewGateTests(unittest.TestCase):
                         load_verified_review_record(path)
 
 
+class PublishReconciliationTests(unittest.TestCase):
+    def test_lost_push_response_accepts_real_remote_state_without_repush(self) -> None:
+        from agent_delivery_loop import publish
+
+        candidate = "a" * 40
+        pushes = {"n": 0}
+
+        def fake_push(worktree, repo_url, branch, token, proxy):
+            pushes["n"] += 1
+            raise AgentDeliveryError("connection lost")  # response never arrived
+
+        with tempfile.TemporaryDirectory() as temporary:
+            worktree = Path(temporary) / "wt"
+            worktree.mkdir()
+            intents: list[dict] = []
+            with patch.object(publish, "_push_once", fake_push), patch.object(
+                publish, "remote_branch_sha", return_value=candidate
+            ):
+                result = publish.push_delivery_branch(
+                    worktree=worktree, repo_slug="o/r", repo_url="https://github.com/o/r.git",
+                    branch="b", candidate_sha=candidate, intent_sink=intents.append,
+                    token_provider=lambda: "t",
+                )
+            self.assertTrue(result["confirmed"])
+            self.assertEqual(pushes["n"], 1, "a confirmed remote head must never be re-pushed")
+            self.assertEqual(intents[-1]["state"], "confirmed")
+
+    def test_merge_bound_to_reviewed_head_and_accepts_already_merged(self) -> None:
+        from agent_delivery_loop import publish
+
+        candidate = "b" * 40
+        intents: list[dict] = []
+        merges = {"n": 0}
+
+        def fake_run_gh(args, proxy=None, timeout=60):
+            if args[0] == "pr" and args[1] == "merge":
+                merges["n"] += 1
+                return subprocess.CompletedProcess(args, 1, "", "connection lost")
+            raise AssertionError("unexpected gh call")
+
+        def fake_json(args, proxy=None):
+            if args[0] == "pr" and args[1] == "view":
+                if fake_json.views == 0:
+                    fake_json.views += 1
+                    return {"state": "OPEN", "headRefOid": candidate}
+                return {"state": "MERGED", "mergeCommit": {"oid": "c" * 40}, "headRefOid": candidate}
+            raise AssertionError("unexpected gh json call")
+
+        fake_json.views = 0
+        with patch.object(publish, "run_gh", fake_run_gh), patch.object(publish, "gh_json", fake_json):
+            merged = publish.merge_delivery_pr(
+                repo_slug="o/r", pr_number=7, candidate_sha=candidate,
+                intent_sink=intents.append,
+            )
+        self.assertTrue(merged["merged"])
+        self.assertEqual(merged["merge_sha"], "c" * 40)
+        self.assertEqual(merges["n"], 1, "an already-merged PR must not be merged again")
+
+        # A PR whose head drifted away from the reviewed candidate is never merged.
+        with patch.object(publish, "gh_json", return_value={"state": "OPEN", "headRefOid": "d" * 40}):
+            with self.assertRaises(publish.WriteReconciliationError):
+                publish.merge_delivery_pr(
+                    repo_slug="o/r", pr_number=7, candidate_sha=candidate,
+                    intent_sink=lambda i: None,
+                )
+
+    def test_pr_creation_reuses_unique_match_and_stops_on_ambiguity(self) -> None:
+        from agent_delivery_loop import publish
+
+        pulls = [{"number": 9, "url": "https://github.com/o/r/pull/9", "headRefOid": "e" * 40}]
+        with patch.object(publish, "gh_json", return_value=list(pulls)):
+            found = publish.ensure_delivery_pr(
+                repo_slug="o/r", branch="b", candidate_sha="e" * 40, title="t",
+                body_file=Path("/tmp/x.md"), intent_sink=lambda i: None,
+            )
+        self.assertEqual(found["number"], 9)
+        self.assertTrue(found["reused"])
+        with patch.object(publish, "gh_json", return_value=pulls + [dict(pulls[0], number=10)]):
+            with self.assertRaises(publish.WriteReconciliationError):
+                publish.ensure_delivery_pr(
+                    repo_slug="o/r", branch="b", candidate_sha="e" * 40, title="t",
+                    body_file=Path("/tmp/x.md"), intent_sink=lambda i: None,
+                )
+
+
+class ReworkAndResumeTests(unittest.TestCase):
+    def test_rework_limit_blocks_before_any_worker_activity(self) -> None:
+        from agent_delivery_loop.rework import ReworkLimitError, run_bounded_rework
+
+        with self.assertRaises(ReworkLimitError):
+            run_bounded_rework(
+                store=None, repo_slug="o/r", worktree=Path("/tmp"), order=Mock(),
+                worker_config=Mock(), original_run_id="r", delivery_branch="b",
+                parent_sha="a" * 40, rework_index=3, directive="d",
+                rework_count_so_far=2,
+            )
+
+    def test_resume_gates_preworker_completed_and_mismatched_parameters(self) -> None:
+        from agent_delivery_loop.orchestrator import Orchestration, resume
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.dict(os.environ, {"AGENT_STATE_DIR": str(Path(temporary) / "state")}):
+                base = {
+                    "plan_pr": "https://github.com/o/r/pull/1", "work_order_path": ".agents/work-orders/WO-X-r1.json",
+                    "expected_source_sha": "f" * 40, "expected_wheel_sha256": "0" * 64,
+                    "review_model": "m", "review_effort": "high", "review_timeout_seconds": 900,
+                    "review_bundle_dir": "/tmp/b", "proxy": None, "ci_timeout_seconds": 900,
+                    "auto_merge": True, "model": "m", "base_url": "https://x", "effort": "max",
+                    "auth_config": "/tmp/a.json", "repo_path": ".", "install_receipt": "/tmp/r.json",
+                }
+                common = dict(
+                    repo_path=Path.cwd(), plan_pr=base["plan_pr"], work_order_path=base["work_order_path"],
+                    model="m", base_url="https://x", effort="max", auth_config=Path("/tmp/a.json"),
+                    install_receipt=Path("/tmp/r.json"), expected_source_sha=base["expected_source_sha"],
+                    expected_wheel_sha256=base["expected_wheel_sha256"], review_model="m",
+                    review_effort="high", review_timeout_seconds=900,
+                    review_bundle_dir=Path("/tmp/b"), proxy=None, ci_timeout_seconds=900, auto_merge=True,
+                )
+                pre_worker = Orchestration("orch-pre")
+                pre_worker.save(**base)
+                with self.assertRaises(AgentDeliveryError) as raised:
+                    resume(orchestration_id="orch-pre", **common)
+                self.assertIn("fresh deliver", str(raised.exception))
+
+                mismatch = Orchestration("orch-mis")
+                mismatch.record["stage"] = "worker_completed"
+                mismatch.record["worker"] = {"run_id": "r", "delivery_branch": "b", "worker_commit": "a" * 40, "record_path": "/tmp/r.json"}
+                mismatch.record["candidate"] = {"sha": "a" * 40, "origin": "worker", "review_round": 0}
+                mismatch.save(**base)
+                bad = {k: v for k, v in common.items() if k != "expected_source_sha"}
+                with self.assertRaises(AgentDeliveryError) as raised:
+                    resume(orchestration_id="orch-mis", expected_source_sha="9" * 40, **bad)
+                self.assertIn("mismatch", str(raised.exception))
+
+                done = Orchestration("orch-done")
+                done.record["stage"] = "completed"
+                done.record["finished_at"] = "2026-10-05T00:00:00+00:00"
+                done.save(**base)
+                with self.assertRaises(AgentDeliveryError) as raised:
+                    resume(orchestration_id="orch-done", **common)
+                self.assertIn("already completed", str(raised.exception))
+
+    def test_write_pending_error_classifies_lost_write_responses(self) -> None:
+        from agent_delivery_loop.github import GitHubClient, GitHubWritePendingError, Repo
+
+        client = GitHubClient(Repo("example", "repo"))
+        with patch("agent_delivery_loop.github.time.sleep"), patch(
+            "urllib.request.urlopen", side_effect=urllib.error.URLError("reset")
+        ):
+            with self.assertRaises(GitHubWritePendingError):
+                client.request("POST", "/repos/x/y/pulls", {"title": "t"})
+        error = urllib.error.HTTPError("u", 502, "bad gateway", None, io.BytesIO(b"{}"))
+        with patch("agent_delivery_loop.github.time.sleep"), patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(GitHubWritePendingError):
+                client.request("POST", "/repos/x/y/pulls", {"title": "t"})
+
+
+    def test_changes_required_path_reaches_rework_with_bound_skill(self) -> None:
+        """Regression: the changes_required branch must actually execute (a past
+        scoping bug made it raise NameError, silently disabling all rework)."""
+        from agent_delivery_loop import orchestrator as orch
+        from agent_delivery_loop.errors import AgentDeliveryError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            with patch.dict(os.environ, {"AGENT_STATE_DIR": str(base / "state")}):
+                repo = base / "repo"
+                repo.mkdir()
+
+                def raw(*args: str) -> None:
+                    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True)
+
+                raw("init", "-q")
+                raw("config", "user.name", "T")
+                raw("config", "user.email", "t@example.invalid")
+                (repo / "skill.md").write_text("skill\n", encoding="utf-8")
+                raw("add", ".")
+                raw("commit", "-m", "base")
+                # Delivery branch at a known head.
+                raw("checkout", "-q", "-b", "agent/x-r1-abcd1234")
+                (repo / "doc.md").write_text("deliverable\n", encoding="utf-8")
+                raw("add", ".")
+                raw("commit", "-m", "candidate")
+                head = subprocess.run(
+                    ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+                ).stdout.strip()
+
+                instance = orch.Orchestration("orch-cr")
+                instance.record["stage"] = "worker_completed"
+                instance.record["worker"] = {
+                    "run_id": "r", "delivery_branch": "agent/x-r1-abcd1234",
+                    "worker_commit": head, "record_path": str(base / "rr.json"),
+                }
+                instance.record["candidate"] = {"sha": head, "origin": "worker", "review_round": 0}
+                instance.record["rework"] = {"count": 0, "entries": []}
+
+                order = Mock()
+                order.review_evidence = ()
+                receipt_dir = base / "receipts"
+                receipt_dir.mkdir()
+                receipt = {
+                    "verdict": "changes_required",
+                    "findings": [{"severity": "P2", "file": "doc.md", "line": 1,
+                                  "problem": "typo", "recommendation": "fix"}],
+                }
+                result_path = receipt_dir / "res.json"
+                result_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+                fake_review = {"review_id": "rv1", "codex_version": "codex-cli x",
+                               "exit_code": 0, "stop_status": "confirmed_stopped",
+                               "result_path": str(result_path)}
+
+                rework_calls: list[dict] = []
+
+                def fake_rework(**kwargs):
+                    rework_calls.append(kwargs)
+                    # Produce a real commit on the delivery branch so the loop's
+                    # branch-head invariant keeps holding for the next round.
+                    (repo / "doc.md").write_text("deliverable fixed\n", encoding="utf-8")
+                    subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
+                    subprocess.run(
+                        ["git", "-C", str(repo), "commit", "-m", "rework r1"], check=True, capture_output=True
+                    )
+                    new_head = subprocess.run(
+                        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+                    ).stdout.strip()
+                    return {"rework_id": "rw1", "rework_index": kwargs["rework_index"],
+                            "session_id": "s", "parent_commit": kwargs["parent_sha"],
+                            "rework_commit": new_head, "changed_paths": ["doc.md"]}
+
+                class _Repo:
+                    slug = "o/r"
+
+                params = orch._Params(
+                    plan_pr="https://github.com/o/r/pull/1", work_order_path="wo",
+                    review_timeout_seconds=900, review_model="m", review_effort="high",
+                    review_bundle_dir=base / "bundle", proxy=None,
+                    model="m", base_url="https://x", effort="max", auth_config=base / "a.json",
+                )
+                with patch.object(orch, "prepare_review"), patch.object(
+                    orch, "run_review_process", return_value=fake_review
+                ), patch.object(orch, "run_bounded_rework", side_effect=fake_rework), patch.object(
+                    orch, "check_review"
+                ), patch.object(
+                    orch.ClaudeConfig, "from_explicit", return_value=Mock()
+                ), patch.object(
+                    orch, "RunStore", return_value=Mock()
+                ):
+                    # First pass: changes_required -> rework r1 -> loop continues to a pass.
+                    verdicts = iter(["changes_required", "pass"])
+
+                    def fake_read(path):
+                        verdict = next(verdicts)
+                        receipt = {"verdict": verdict}
+                        if verdict == "changes_required":
+                            receipt["findings"] = [{
+                                "severity": "P2", "file": "doc.md", "line": 1,
+                                "problem": "typo", "recommendation": "fix",
+                            }]
+                        return receipt
+
+                    with patch.object(orch, "_read_json", side_effect=fake_read):
+                        state = orch._review_loop(
+                            instance, params, repo, _Repo(), order, None,
+                            base / "rr.json", repo, "agent/x-r1-abcd1234",
+                            skill_sha256="deadbeef",
+                        )
+                self.assertEqual(state["candidate"], instance.record["candidate"]["sha"])
+                self.assertEqual(len(rework_calls), 1)
+                self.assertEqual(rework_calls[0]["expected_skill_sha256"], "deadbeef")
+                self.assertEqual(instance.record["rework"]["count"], 1)
+                self.assertEqual(instance.record["stage"], "review_passed")
+                self.assertEqual(instance.record["candidate"]["origin"], "rework")
+
+
 class CiWaitTests(unittest.TestCase):
     def test_only_full_uppercase_success_with_required_check_passes(self) -> None:
         head = "c" * 40
         view = {"headRefOid": head}
-        with patch("agent_delivery_loop.orchestrator._gh_json", side_effect=[
+        with patch("agent_delivery_loop.publish.gh_json", side_effect=[
             [{"name": "validate", "state": "SUCCESS", "link": "https://example.invalid/run/1"}], view,
         ]):
             outcome = _wait_for_ci(
@@ -401,20 +677,20 @@ class CiWaitTests(unittest.TestCase):
         self.assertEqual(outcome["checks"], [("validate", "SUCCESS")])
 
     def test_missing_required_check_or_failure_state_stops(self) -> None:
-        with patch("agent_delivery_loop.orchestrator._gh_json", return_value=[
+        with patch("agent_delivery_loop.publish.gh_json", return_value=[
             {"name": "other", "state": "SUCCESS"},
         ]):
             with self.assertRaises(AgentDeliveryError):
                 _wait_for_ci(repo_slug="o/r", pr_number=1, head_sha="c" * 40, timeout_seconds=5, proxy=None)
-        with patch("agent_delivery_loop.orchestrator._gh_json", return_value=[
+        with patch("agent_delivery_loop.publish.gh_json", return_value=[
             {"name": "validate", "state": "FAILURE"},
         ]):
             with self.assertRaises(AgentDeliveryError):
                 _wait_for_ci(repo_slug="o/r", pr_number=1, head_sha="c" * 40, timeout_seconds=5, proxy=None)
 
     def test_empty_check_list_never_passes_as_success(self) -> None:
-        with patch("agent_delivery_loop.orchestrator.CI_POLL_SECONDS", 0):
-            with patch("agent_delivery_loop.orchestrator._gh_json", return_value=[]):
+        with patch("agent_delivery_loop.publish.CI_POLL_SECONDS", 0):
+            with patch("agent_delivery_loop.publish.gh_json", return_value=[]):
                 with self.assertRaises(AgentDeliveryError):
                     _wait_for_ci(repo_slug="o/r", pr_number=1, head_sha="c" * 40, timeout_seconds=1, proxy=None)
 
