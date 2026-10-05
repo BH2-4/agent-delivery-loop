@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -282,3 +283,42 @@ class VerifyCiCurrentSuccessTests(unittest.TestCase):
         self.assertEqual(result["workflow_run_id"], 6)  # max by (id, attempt) selects the newest run
         self.assertEqual(result["run_attempt"], 2)
         self.assertEqual(result["checks"], [("validate", "SUCCESS")])
+
+
+class GhJsonTimeoutForwardingTests(unittest.TestCase):
+    """Signature-honesty regression: real gh_json must accept and forward the
+    per-request timeout (an earlier fix passed timeout= to gh_json mocks while
+    the production signature rejected it; only run_gh was mocked here so the
+    real gh_json path is exercised)."""
+
+    def test_verify_ci_current_forwards_per_call_timeouts(self) -> None:
+        from agent_delivery_loop import publish
+
+        identity = GitHubPAT(repository="o/r", expected_login="o", _token=FAKE_PAT)
+        recorded: list[dict] = []
+
+        def fake_run(args, *, identity, proxy=None, timeout=60):
+            identity.token_for("o/r")
+            recorded.append({"path": args[-1], "timeout": timeout})
+            url = args[-1]
+            if "/runs?" in url:
+                body = {"total_count": 1, "workflow_runs": [
+                    {"id": 6, "run_attempt": 2, "head_sha": "a" * 40, "event": "pull_request",
+                     "path": ".github/workflows/ci.yml@refs/heads/main", "pull_requests": [],
+                     "status": "completed", "conclusion": "success", "html_url": "u"}]}
+            elif "/attempts/2/jobs" in url:
+                body = {"total_count": 1, "jobs": [
+                    {"name": "validate", "head_sha": "a" * 40, "run_id": 6, "status": "completed",
+                     "conclusion": "success"}]}
+            elif url.endswith("/actions/runs/6"):
+                body = {"id": 6, "run_attempt": 2, "head_sha": "a" * 40, "status": "completed",
+                        "conclusion": "success"}
+            else:
+                raise AssertionError(url)
+            return subprocess.CompletedProcess(args, 0, json.dumps(body), "")
+
+        with patch.object(publish, "run_gh", side_effect=fake_run):
+            result = publish.verify_ci_current(identity, repo_slug="o/r", pr_number=7, head_sha="a" * 40)
+        self.assertEqual(result["workflow_run_id"], 6)
+        self.assertEqual(len(recorded), 3)
+        self.assertTrue(all(item["timeout"] and item["timeout"] <= 60 for item in recorded))

@@ -77,8 +77,11 @@ def run_gh(
         raise AgentDeliveryError(f"A gh command could not run or timed out: gh {args[0]}.") from exc
 
 
-def gh_json(args: list[str], *, identity: GitHubPAT, proxy: str | None = None) -> Any:
-    result = run_gh(args, identity=identity, proxy=proxy)
+def gh_json(
+    args: list[str], *, identity: GitHubPAT, proxy: str | None = None,
+    timeout: int = GH_TIMEOUT_SECONDS,
+) -> Any:
+    result = run_gh(args, identity=identity, proxy=proxy, timeout=timeout)
     if result.returncode != 0:
         raise AgentDeliveryError(f"gh {' '.join(args[:2])} failed with exit code {result.returncode}; no state was assumed.")
     try:
@@ -139,13 +142,15 @@ def _bounded_items(payload: Any, key: str) -> list[dict[str, Any]]:
 
 def _ci_snapshot(
     identity: GitHubPAT, *, pr_number: int, head_sha: str, proxy: str | None,
-    request_timeout: int = GH_TIMEOUT_SECONDS,
+    request_timeout=None,
 ) -> dict[str, Any]:
+    def per_call() -> int:
+        return request_timeout() if callable(request_timeout) else GH_TIMEOUT_SECONDS
     """Read the fixed workflow's newest run for this exact PR/head, then its latest jobs."""
     query = urlencode({"event": "pull_request", "head_sha": head_sha, "per_page": CI_PAGE_LIMIT})
     runs = _bounded_items(gh_json(
         ["api", f"repos/{identity.repository}/actions/workflows/{REQUIRED_WORKFLOW}/runs?{query}"],
-        identity=identity, proxy=proxy, timeout=request_timeout,
+        identity=identity, proxy=proxy, timeout=per_call(),
     ), "workflow_runs")
     matches = []
     for run in runs:
@@ -172,7 +177,7 @@ def _ci_snapshot(
     run = max(matches, key=lambda item: (item["id"], item["run_attempt"]))
     jobs = _bounded_items(gh_json(
         ["api", f"repos/{identity.repository}/actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page={CI_PAGE_LIMIT}"],
-        identity=identity, proxy=proxy, timeout=request_timeout,
+        identity=identity, proxy=proxy, timeout=per_call(),
     ), "jobs")
     checks = []
     for job in jobs:
@@ -188,7 +193,7 @@ def _ci_snapshot(
         checks.append((job["name"], state))
     confirmed = gh_json(
         ["api", f"repos/{identity.repository}/actions/runs/{run['id']}"],
-        identity=identity, proxy=proxy, timeout=request_timeout,
+        identity=identity, proxy=proxy, timeout=per_call(),
     )
     if not isinstance(confirmed, dict) or any(
         confirmed.get(key) != run.get(key) for key in ("id", "head_sha", "run_attempt", "status", "conclusion")
@@ -433,7 +438,7 @@ def wait_for_ci(
             raise AgentDeliveryError("PR head/target changed while waiting for CI; nothing was merged.")
         snapshot = _ci_snapshot(
             identity, pr_number=pr_number, head_sha=head_sha, proxy=proxy,
-            request_timeout=remaining_timeout(),
+            request_timeout=remaining_timeout,
         )
         if time.monotonic() >= deadline:
             raise AgentDeliveryError("CI wait exceeded its total time budget before completion.")
@@ -450,6 +455,8 @@ def wait_for_ci(
                 ["pr", "view", str(pr_number), "--repo", repo_slug, "--json", "headRefOid,baseRefName"],
                 identity=identity, proxy=proxy, timeout=remaining_timeout(),
             )
+            if time.monotonic() >= deadline:
+                raise AgentDeliveryError("CI wait exceeded its total time budget before completion.")
             if after != current:
                 raise AgentDeliveryError("PR identity changed during CI verification; nothing was merged.")
             return {**snapshot, "source": "github_actions_rest", "head_sha": head_sha, "workflow": REQUIRED_WORKFLOW}
