@@ -215,21 +215,29 @@ def _stop_agent_run_bounded(process: subprocess.Popen[str]) -> bool:
     return _stop_process_group(process)
 
 
-def _spawn_gate_record(orchestration_id: str, phase: str) -> dict[str, Any]:
+def _spawn_gate_record(orchestration_id: str, task_key_value: str, repository: str) -> dict[str, Any]:
+    """Single-phase BLOCKING gate: written and read-back verified before Popen begins.
+
+    There is no non-blocking pending phase and no post-Popen flip: every RunStore
+    launch entry sees an unconfirmed start from the moment creation is attempted. The
+    task_key/repository fields bind the gate to one authorized task so the tracked
+    child can validate the exemption it receives.
+    """
     return {
         "schema_version": 1,
         "run_id": f"spawn-{orchestration_id[:8]}",
-        "status": {"pending": "not_started", "started": "starting"}[phase],
-        "worker_status": {"pending": "not_started", "started": "start_unconfirmed"}[phase],
+        "status": "starting",
+        "worker_status": "start_unconfirmed",
         "kind": "orchestrator_spawn_gate",
-        "phase": phase,
         "orchestration_id": orchestration_id,
+        "task_key": task_key_value,
+        "repository": repository,
         "registered_at": _now(),
     }
 
 
 def _preflight_spawn_gates(store: Any) -> None:
-    """Refuse to spawn while ANY unresolved spawn gate remains (any task, either phase)."""
+    """Refuse to spawn while ANY unresolved spawn gate remains (any task)."""
     for directory in store.runs.iterdir():
         if not directory.is_dir():
             continue
@@ -278,9 +286,14 @@ def _spawn_agent_run(
     # The child is told which durable spawn gate tracks it so its own availability
     # check can exempt exactly that one record (name only; not a credential).
     env["AGENT_DELIVERY_SPAWN_GATE"] = f"{task_key_value}/{gate_path.name}"
-    # A stdout-capture open failure also proves no child was created; both it and a
-    # Popen failure convert to AgentRunNotStartedError so the caller removes the gate.
-    # Every later OSError is an unknown outcome and keeps the gate.
+    # The blocking gate was written and read-back verified by the caller BEFORE this
+    # function was entered, so the creation phase already starts under a durable block.
+    # A stdout-capture open failure happens strictly before creation begins, so it
+    # provably leaves no child and may release the gate. Once creation itself is
+    # entered, an exception without a handle (including a Popen OSError) leaves the
+    # outcome UNCERTAIN: the gate stays and every launch entry keeps blocking until
+    # the runner's verified-safe terminal record releases it or a human intervenes.
+    # No timestamp, record age, or PID guess participates in this decision.
     try:
         captured = open(stdout_path, "wb")
     except OSError as exc:
@@ -292,17 +305,10 @@ def _spawn_agent_run(
                 env=env, start_new_session=True,
             )
         except OSError as exc:
-            raise AgentRunNotStartedError("The installed agent-run entry could not be started.") from exc
-        # The handle exists: flip the durable gate to the blocking phase before the
-        # child can do real work, so every later launch sees an unconfirmed spawn.
-        # If the flip cannot be persisted, stop the child and leave the pending gate.
-        try:
-            store.write(task_key_value, gate_path.stem, _spawn_gate_record(
-                gate_path.stem.removeprefix("spawn-"), "started",
-            ))
-        except BaseException:
-            _stop_agent_run_bounded(process)
-            raise
+            raise AgentDeliveryError(
+                "The agent-run creation attempt failed without a handle; the spawn outcome is "
+                "uncertain and the spawn gate remains blocking."
+            ) from exc
         try:
             exit_code = process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
@@ -522,12 +528,17 @@ def _continue_inner(orchestration: Orchestration, params: _Params, *, fresh: boo
     worktree = None
     if fresh:
         task_key_value = task_key(plan_repo.slug, order.task_id, order.revision)
-        # Durable, read-back-verified gate BEFORE any child exists; a later launch on
-        # this host sees it and refuses until trusted safe-end evidence resolves it.
+        # Every RunStore launch entry must reject unconfirmed starts, so the blocking
+        # gate is written and read-back verified BEFORE the creation phase is entered;
+        # there is no non-blocking pending phase and no post-Popen flip. Later launches
+        # refuse until the runner's verified-safe terminal record releases it.
         store.assert_worker_available()
         _preflight_spawn_gates(store)
         gate_path = store.record_path(task_key_value, f"spawn-{orchestration.id[:8]}")
-        store.write(task_key_value, gate_path.stem, _spawn_gate_record(orchestration.id, "pending"))
+        store.write(
+            task_key_value, gate_path.stem,
+            _spawn_gate_record(orchestration.id, task_key_value, plan_repo.slug),
+        )
         try:
             agent_run_output = _spawn_agent_run(
                 entry=install["agent_run_entry"], repo_root=root, plan_pr=params.plan_pr,
@@ -538,7 +549,9 @@ def _continue_inner(orchestration: Orchestration, params: _Params, *, fresh: boo
                 identity=identity, store=store, task_key_value=task_key_value, gate_path=gate_path,
             )
         except AgentRunNotStartedError:
-            gate_path.unlink(missing_ok=True)  # Popen/capture-open failed; no child was ever created.
+            # Only a failure strictly before creation began (capture open) can land
+            # here; it provably created no child, so the gate may be removed.
+            gate_path.unlink(missing_ok=True)
             raise
         except BaseException:
             # Unknown safe-end: the gate stays. Only the runner's own verified-safe

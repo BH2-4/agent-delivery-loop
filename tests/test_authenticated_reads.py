@@ -54,11 +54,10 @@ class OrchestratorPatChannelTests(unittest.TestCase):
             gate_path = Path(temporary) / "runs" / "k" / "spawn-abcd1234.json"
             gate_path.parent.mkdir(parents=True)
             captured: dict[str, object] = {}
-            gate_writes: list[dict] = []
 
             class FakeStore:
-                def write(self, _key, run_id, record):  # gate flip durability
-                    gate_writes.append({"run_id": run_id, "phase": record.get("phase")})
+                def write(self, *_args, **_kwargs) -> None:
+                    return None
 
             def fake_popen(argv, **kwargs):  # noqa: ANN001
                 captured["argv"] = argv
@@ -90,8 +89,6 @@ class OrchestratorPatChannelTests(unittest.TestCase):
             self.assertNotIn(FAKE_PAT, " ".join(captured["argv"]))
             # The orchestrator's own environment never carries the channel.
             self.assertNotIn("AGENT_DELIVERY_PAT", os.environ)
-            # The gate was flipped to the blocking phase once the handle existed.
-            self.assertEqual(gate_writes, [{"run_id": "spawn-abcd1234", "phase": "started"}])
 
     def test_cli_consumes_channel_and_closes_it_fail_closed(self) -> None:
         with patch.dict(os.environ, {"AGENT_DELIVERY_PAT": FAKE_PAT, "AGENT_DELIVERY_PAT_LOGIN": "o"}):
@@ -424,21 +421,23 @@ class TwoLayerStopTests(unittest.TestCase):
     outer Python process group is possible while an inner, separately-sessioned child
     stays alive — exactly why outer-stop can never prove the inner Worker stopped."""
 
-    def test_flip_failure_stops_the_child_and_keeps_the_gate(self) -> None:
+    def test_popen_oserror_keeps_the_gate_as_uncertain(self) -> None:
+        """Once creation is entered, a failure without a handle is UNCERTAIN: the gate
+        stays blocking and the error is not the not-started class."""
         identity = _identity()
         with tempfile.TemporaryDirectory() as temporary:
             stdout = Path(temporary) / "out.json"
             gate_path = Path(temporary) / "spawn-abcd1234.json"
-            gate_path.write_text("{}", encoding="utf-8")  # the pending gate on disk
+            gate_path.write_text("{}", encoding="utf-8")  # pre-written blocking gate on disk
 
-            class FlipFailureStore:
-                def write(self, *_args, **_kwargs):
-                    raise RuntimeError("disk full")
+            class FakeStore:
+                def write(self, *_args, **_kwargs) -> None:
+                    return None
 
-            with patch("agent_delivery_loop.orchestrator.subprocess.Popen") as popen, \
-                 patch("agent_delivery_loop.orchestrator._stop_agent_run_bounded", return_value=True) as stop:
-                popen.return_value.wait.return_value = 0
-                with self.assertRaises(RuntimeError):
+            with patch(
+                "agent_delivery_loop.orchestrator.subprocess.Popen", side_effect=OSError("boom"),
+            ) as popen:
+                with self.assertRaises(AgentDeliveryError) as caught:
                     orchestrator._spawn_agent_run(
                         entry="agent-run", repo_root=Path(temporary),
                         plan_pr="https://github.com/o/r/pull/26",
@@ -446,10 +445,12 @@ class TwoLayerStopTests(unittest.TestCase):
                         model="m", base_url="https://api.example", effort="max",
                         auth_config=Path("/nowhere"), timeout_seconds=30, proxy=None,
                         stdout_path=stdout, identity=identity,
-                        store=FlipFailureStore(), task_key_value="k", gate_path=gate_path,
+                        store=FakeStore(), task_key_value="k", gate_path=gate_path,
                     )
-            stop.assert_called_once()
-            self.assertTrue(gate_path.exists())  # durably retained, not removed
+            popen.assert_called_once()
+            self.assertNotIsInstance(caught.exception, orchestrator.AgentRunNotStartedError)
+            self.assertIn("uncertain", str(caught.exception))
+            self.assertTrue(gate_path.exists())  # the gate keeps blocking
 
     def test_stdout_open_failure_is_not_started_and_removes_no_child_assumptions(self) -> None:
         identity = _identity()
@@ -474,7 +475,7 @@ class TwoLayerStopTests(unittest.TestCase):
                     )
             popen.assert_not_called()
 
-    def test_execute_plan_passes_its_gate_exemption_to_the_first_availability_check(self) -> None:
+    def test_execute_plan_gate_exemption_validates_and_binds_the_gate(self) -> None:
         from agent_delivery_loop.store import RunStore
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -488,37 +489,59 @@ class TwoLayerStopTests(unittest.TestCase):
                 provider_host="api.example", auth_name="ANTHROPIC_AUTH_TOKEN",
                 auth_value="x", effort="max", target_repo_root=repo.resolve(),
             )
-            with patch("agent_delivery_loop.runner.default_state_dir", return_value=base / "state"):
+
+            class Sentinel(AgentDeliveryError):
+                pass
+
+            def fake_client(repo_arg, token=None):  # noqa: ANN001
+                raise Sentinel("stop")
+
+            with patch("agent_delivery_loop.runner.default_state_dir", return_value=base / "state"), \
+                 patch("agent_delivery_loop.runner.GitHubClient", side_effect=fake_client), \
+                 patch("agent_delivery_loop.runner.preflight", return_value=(0, 1, 0)):
                 store = RunStore(base / "state")
                 gate = store.record_path("k", "spawn-abcd1234")
-                store.write("k", "spawn-abcd1234", orchestrator._spawn_gate_record("abcd1234-full", "started"))
-
-                class Sentinel(AgentDeliveryError):
-                    pass
-
-                def fake_client(repo_arg, token=None):  # noqa: ANN001
-                    raise Sentinel("stop")
-
-                with patch("agent_delivery_loop.runner.GitHubClient", side_effect=fake_client), \
-                     patch("agent_delivery_loop.runner.preflight", return_value=(0, 1, 0)):
-                    # With the gate present, a runner WITHOUT its exemption is blocked;
-                    # passing the gate name must carry the exemption past the FIRST check.
-                    with self.assertRaises(Sentinel):
-                        runner.execute_plan(
-                            repo_path=repo, plan_pr="o/r#26",
-                            work_order_path=".agents/work-orders/WO-X-001-r1.json",
-                            worker_config=config, pat_identity=_identity(),
-                            spawn_gate_name=f"k/{gate.name}",
-                        )
-                    # An invalid or missing gate name fails closed instead.
-                    with self.assertRaises(AgentDeliveryError) as caught:
-                        runner.execute_plan(
-                            repo_path=repo, plan_pr="o/r#26",
-                            work_order_path=".agents/work-orders/WO-X-001-r1.json",
-                            worker_config=config, pat_identity=_identity(),
-                            spawn_gate_name="k/spawn-not-there.json",
-                        )
-                    self.assertIn("spawn gate is invalid or missing", str(caught.exception))
+                store.write("k", "spawn-abcd1234", orchestrator._spawn_gate_record("abcd1234-full", "k", "o/r"))
+                run_kwargs = dict(
+                    repo_path=repo, plan_pr="o/r#26",
+                    work_order_path=".agents/work-orders/WO-X-001-r1.json",
+                    worker_config=config, pat_identity=_identity(),
+                )
+                # A VALID gate carries the exemption past the FIRST availability check.
+                with self.assertRaises(Sentinel):
+                    runner.execute_plan(**run_kwargs, spawn_gate_name=f"k/{gate.name}")
+                # Missing name, corrupt JSON, duplicate keys, symlinks, wrong kind,
+                # and wrong repository binding all fail closed before any start.
+                with self.assertRaises(AgentDeliveryError) as caught:
+                    runner.execute_plan(**run_kwargs, spawn_gate_name="k/spawn-not-there.json")
+                self.assertIn("invalid or missing", str(caught.exception))
+                corrupt = store.record_path("k", "spawn-corrupt0")
+                corrupt.write_text("{not json", encoding="utf-8")
+                with self.assertRaises(AgentDeliveryError):
+                    runner.execute_plan(**run_kwargs, spawn_gate_name=f"k/{corrupt.name}")
+                duped = store.record_path("k", "spawn-dupe0000")
+                duped.write_text(
+                    '{"kind": "other", "kind": "orchestrator_spawn_gate"}', encoding="utf-8",
+                )
+                with self.assertRaises(AgentDeliveryError):
+                    runner.execute_plan(**run_kwargs, spawn_gate_name=f"k/{duped.name}")
+                linked = store.record_path("k", "spawn-link0000")
+                linked.symlink_to(gate)
+                with self.assertRaises(AgentDeliveryError):
+                    runner.execute_plan(**run_kwargs, spawn_gate_name=f"k/{linked.name}")
+                wrong_kind = store.record_path("k", "spawn-kind0000")
+                wrong_kind.write_text(
+                    json.dumps({"schema_version": 1, "run_id": "spawn-kind0000", "status": "starting",
+                                "worker_status": "start_unconfirmed", "kind": "something_else"}),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(AgentDeliveryError):
+                    runner.execute_plan(**run_kwargs, spawn_gate_name=f"k/{wrong_kind.name}")
+                wrong_repo = store.record_path("k", "spawn-repo0000")
+                store.write("k", "spawn-repo0000", orchestrator._spawn_gate_record("repo0000-full", "k", "other/r"))
+                with self.assertRaises(AgentDeliveryError) as caught:
+                    runner.execute_plan(**run_kwargs, spawn_gate_name=f"k/{wrong_repo.name}")
+                self.assertIn("different repository", str(caught.exception))
 
     def test_sigint_ignoring_same_group_descendant_is_hard_stopped(self) -> None:
         import signal as signal_module
@@ -631,7 +654,7 @@ class SpawnGateTests(unittest.TestCase):
             # exact-evidence only (the runner's own terminal write, or the verified
             # success path). Forged, stale, or clock-shifted evidence is irrelevant.
             gate = store.record_path(key, "spawn-abcd1234")
-            store.write(key, "spawn-abcd1234", orchestrator._spawn_gate_record("abcd1234-full", "started"))
+            store.write(key, "spawn-abcd1234", orchestrator._spawn_gate_record("abcd1234-full", key, "o/r"))
             store.write(key, "11111111-1111-1111-1111-111111111111", {
                 "schema_version": 1, "run_id": "11111111-1111-1111-1111-111111111111",
                 "worker_status": "stopped", "status": "local_ready",
@@ -647,7 +670,7 @@ class SpawnGateTests(unittest.TestCase):
             store = self._store(Path(temporary))
             key = "k"
             gate = store.record_path(key, "spawn-abcd1234")
-            store.write(key, "spawn-abcd1234", orchestrator._spawn_gate_record("abcd1234-full", "started"))
+            store.write(key, "spawn-abcd1234", orchestrator._spawn_gate_record("abcd1234-full", key, "o/r"))
             # Real blocking: every launch check refuses while the gate is unresolved.
             with self.assertRaises(RunStateError):
                 store.assert_worker_available()
@@ -677,22 +700,29 @@ class SpawnGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             store = self._store(Path(temporary))
             gate = store.record_path("k", "spawn-abcd1234")
-            store.write("k", "spawn-abcd1234", orchestrator._spawn_gate_record("abcd1234-full", "started"))
+            store.write("k", "spawn-abcd1234", orchestrator._spawn_gate_record("abcd1234-full", "k", "o/r"))
             # The tracked child may start (its own gate is exempted) ...
             store.assert_worker_available(exempt_record=gate)
             # ... while every other check keeps blocking.
             with self.assertRaises(RunStateError):
                 store.assert_worker_available()
 
-    def test_pending_gate_is_nonblocking_and_preflight_still_refuses_new_spawns(self) -> None:
+    def test_single_phase_gate_blocks_every_entry_before_creation(self) -> None:
         from agent_delivery_loop.store import RunStateError
 
         with tempfile.TemporaryDirectory() as temporary:
             store = self._store(Path(temporary))
-            store.write("k", "spawn-abcd1234", orchestrator._spawn_gate_record("abcd1234-full", "pending"))
-            # Pre-start phase is truthful and non-blocking for ordinary safety scans ...
-            store.assert_worker_available()
-            # ... but the orchestrator's spawn preflight still refuses a new spawn.
+            # There is no non-blocking pending phase: the gate written BEFORE the
+            # creation phase blocks every ordinary safety scan immediately, and the
+            # record binds itself to one authorized task and repository.
+            record = orchestrator._spawn_gate_record("abcd1234-full", "k", "o/r")
+            self.assertEqual(record["worker_status"], "start_unconfirmed")
+            self.assertEqual(record["status"], "starting")
+            self.assertEqual(record["task_key"], "k")
+            self.assertEqual(record["repository"], "o/r")
+            store.write("k", "spawn-abcd1234", record)
+            with self.assertRaises(RunStateError):
+                store.assert_worker_available()
             with self.assertRaises(AgentDeliveryError):
                 orchestrator._preflight_spawn_gates(store)
 

@@ -176,6 +176,28 @@ def _validate_worker_config_root(root: Path, config: ClaudeConfig) -> None:
         raise AgentDeliveryError("Explicit Claude configuration was not bound to this repository.")
 
 
+def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate field")
+        result[key] = value
+    return result
+
+
+def _read_spawn_gate(gate_path: Path) -> dict[str, Any]:
+    """Read one spawn gate, rejecting symlinks, non-regular files, and duplicate keys."""
+    import stat as stat_module
+
+    info = gate_path.lstat()
+    if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISREG(info.st_mode):
+        raise ValueError("not a regular file")
+    record = json.loads(gate_path.read_text(encoding="utf-8"), object_pairs_hook=_unique_keys)
+    if not isinstance(record, dict) or record.get("kind") != "orchestrator_spawn_gate":
+        raise ValueError("not a spawn gate")
+    return record
+
+
 def execute_plan(
     *,
     repo_path: Path,
@@ -203,9 +225,11 @@ def execute_plan(
 
     config = worker_config
     store = RunStore(default_state_dir())
-    # The orchestrator's durable spawn gate tracks this launch; exempt exactly that one
-    # record in EVERY availability check (including the preflight below) so this runner
-    # may start while every other launch path stays blocked by the gate.
+    # The orchestrator's durable BLOCKING gate was written and read-back verified before
+    # this child was created; the exemption applies to exactly that one validated record
+    # in EVERY availability check (including the preflight below). A gate that is
+    # missing, misnamed, a symlink, corrupt JSON, duplicate-keyed, or of the wrong kind
+    # is rejected — never silently exempted.
     exempt_record: Path | None = None
     if spawn_gate_name is not None:
         parts = spawn_gate_name.split("/")
@@ -214,9 +238,18 @@ def execute_plan(
             candidate_gate is None
             or not parts[1].startswith("spawn-")
             or not parts[1].endswith(".json")
-            or not candidate_gate.is_file()
         ):
             raise AgentDeliveryError("The orchestrator spawn gate is invalid or missing; refusing to run.")
+        try:
+            gate_record = _read_spawn_gate(candidate_gate)
+        except (OSError, ValueError):
+            raise AgentDeliveryError(
+                "The orchestrator spawn gate is invalid or missing; refusing to run."
+            ) from None
+        if str(gate_record.get("repository", "")).casefold() != plan_repo.slug.casefold():
+            raise AgentDeliveryError(
+                "The orchestrator spawn gate is bound to a different repository; refusing to run."
+            )
         exempt_record = candidate_gate
     store.assert_worker_available(exempt_record=exempt_record)
     run_id = str(uuid.uuid4())
@@ -242,6 +275,16 @@ def execute_plan(
         raise AgentDeliveryError("The authorized Delivery Skill is empty or exceeds the 64 KiB limit.")
 
     task_identity_key = task_key(plan_repo.slug, order.task_id, order.revision)
+    # Late binding check: the exempted gate must also name THIS authorized task.
+    if exempt_record is not None:
+        try:
+            gate_record = _read_spawn_gate(exempt_record)
+        except (OSError, ValueError):
+            raise AgentDeliveryError("The orchestrator spawn gate became invalid; refusing to run.") from None
+        if gate_record.get("task_key") != task_identity_key:
+            raise AgentDeliveryError(
+                "The orchestrator spawn gate is bound to a different task; refusing to run."
+            )
     auth_key = authorization_key(plan_repo.slug, number, authorization.merge_sha, order.sha256)
     branch = f"agent/{order.task_id.lower()}-r{order.revision}-{run_id[:8]}"
     worktree = store.root / "worktrees" / run_id
