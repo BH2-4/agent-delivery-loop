@@ -34,6 +34,7 @@ from .git_ops import (
 )
 from .github import GitHubClient, Repo, parse_plan_pr_ref
 from .github_app import GitHubAppConfig, GitHubAppTokenProvider
+from .github_identity import GitHubPAT
 from .store import RunStateError, RunStore, authorization_key, default_state_dir, now_utc, task_key
 from .work_order import WorkOrder, parse_work_order
 
@@ -152,6 +153,7 @@ def execute_plan(
     work_order_path: str,
     worker_config: ClaudeConfig,
     publish: bool = False,
+    pat_identity: GitHubPAT | None = None,
 ) -> dict[str, Any]:
     root = repository_root(repo_path.expanduser().resolve())
     _validate_worker_config_root(root, worker_config)
@@ -175,7 +177,13 @@ def execute_plan(
     runtime_home = store.root / "runtime" / run_id
     version = preflight(config, runtime_home)
 
-    client = GitHubClient(plan_repo)
+    if pat_identity is not None:
+        # The trusted Python runner performs its authorization reads with the same explicit
+        # PAT snapshot the orchestrator validated; anonymous shared-exit quota is no longer
+        # part of the PAT-mode path. token_for re-checks the repository binding.
+        client = GitHubClient(plan_repo, token=pat_identity.token_for(plan_repo.slug))
+    else:
+        client = GitHubClient(plan_repo)
     authorization = client.authorized_plan(number, work_order_path, plan_url)
     order = parse_work_order(authorization.order_bytes, expected_path=authorization.order_path)
     ensure_plan_is_on_main(root, plan_repo, authorization.merge_sha)

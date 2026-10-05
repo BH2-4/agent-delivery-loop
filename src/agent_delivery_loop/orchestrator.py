@@ -181,6 +181,7 @@ def _spawn_agent_run(
     *, entry: str, repo_root: Path, plan_pr: str, work_order_path: str,
     model: str, base_url: str, effort: str, auth_config: Path,
     timeout_seconds: int, proxy: str | None, stdout_path: Path,
+    identity: GitHubPAT,
 ) -> dict[str, Any]:
     from .claude_worker import _stop_process_group
 
@@ -193,6 +194,14 @@ def _spawn_agent_run(
     env = {key: value for key, value in os.environ.items() if key not in CREDENTIAL_ENV_NAMES}
     if proxy:
         env.update({"HTTPS_PROXY": proxy, "HTTP_PROXY": proxy, "https_proxy": proxy, "http_proxy": proxy})
+    # One-shot credential channel for the trusted agent-run child only: the exact value of
+    # this orchestrator's in-memory PAT snapshot, so parent and child can never diverge onto
+    # different tokens. The variable never enters argv or a file, the names are on every
+    # credential scrub list, the child pops it before any model subprocess exists, and the
+    # channel disappears with the child process on success, failure, timeout or cancel.
+    repo_slug = parse_plan_pr_ref(plan_pr)[0].slug
+    env["AGENT_DELIVERY_PAT"] = identity.token_for(repo_slug)
+    env["AGENT_DELIVERY_PAT_LOGIN"] = identity.expected_login
     try:
         with open(stdout_path, "wb") as captured:
             process = subprocess.Popen(
@@ -416,6 +425,7 @@ def _continue_inner(orchestration: Orchestration, params: _Params, *, fresh: boo
             effort=params.effort, auth_config=params.auth_config,
             timeout_seconds=order.timeout_seconds + 300, proxy=params.proxy,
             stdout_path=orchestration.output_dir / "agent-run-stdout.json",
+            identity=identity,
         )
         run_id = agent_run_output.get("run_id")
         delivery_branch = agent_run_output.get("delivery_branch")

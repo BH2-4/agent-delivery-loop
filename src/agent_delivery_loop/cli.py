@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -11,6 +12,7 @@ from typing import Sequence
 from .claude_worker import ClaudeConfig, SUPPORTED_EFFORTS
 from .errors import AgentDeliveryError
 from .git_ops import repository_remote, repository_root
+from .github import parse_plan_pr_ref
 from .github_identity import GitHubPAT
 from .runner import execute_plan, watch_once
 from .review_cli import (
@@ -79,6 +81,23 @@ def _report_error(exc: Exception) -> int:
     return 2
 
 
+def _take_orchestrator_pat(plan_pr: str) -> GitHubPAT | None:
+    """Consume the orchestrator's one-shot PAT channel for the trusted runner.
+
+    The channel is read once and closed immediately: the variables leave os.environ before
+    any model subprocess can exist, and an invalid value fails closed rather than falling
+    back to anonymous reads. Without the channel the legacy anonymous entry is preserved.
+    """
+    token = os.environ.pop("AGENT_DELIVERY_PAT", None)
+    login = os.environ.pop("AGENT_DELIVERY_PAT_LOGIN", None)
+    if token is None and login is None:
+        return None
+    if token is None or login is None:
+        raise AgentDeliveryError("The orchestrator PAT channel was half-present; refusing anonymous fallback.")
+    repository = parse_plan_pr_ref(plan_pr)[0].slug
+    return GitHubPAT.from_value(repository=repository, expected_login=login, token=token)
+
+
 def agent_run_main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agent-run", description="Run one Work Order authorized by a merged Plan PR.")
     parser.add_argument("--plan-pr", required=True, help="Merged Plan PR URL or OWNER/REPO#NUMBER")
@@ -89,6 +108,7 @@ def agent_run_main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         repo_root, worker_config = _worker_config(args)
+        pat_identity = _take_orchestrator_pat(args.plan_pr)
         _print_result(
             execute_plan(
                 repo_path=repo_root,
@@ -96,6 +116,7 @@ def agent_run_main(argv: Sequence[str] | None = None) -> int:
                 work_order_path=args.work_order_path,
                 worker_config=worker_config,
                 publish=args.publish,
+                pat_identity=pat_identity,
             )
         )
         return 0
