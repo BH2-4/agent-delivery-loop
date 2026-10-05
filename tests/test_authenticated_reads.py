@@ -422,35 +422,104 @@ class TwoLayerStopTests(unittest.TestCase):
     stays alive — exactly why outer-stop can never prove the inner Worker stopped."""
 
     def test_popen_oserror_keeps_the_gate_as_uncertain(self) -> None:
-        """Once creation is entered, a failure without a handle is UNCERTAIN: the gate
-        stays blocking and the error is not the not-started class."""
+        """Once creation is entered, a failure without a handle is UNCERTAIN: a REAL
+        blocking gate stays on disk and actually blocks the next availability check."""
+        from agent_delivery_loop.store import RunStore, RunStateError
+
         identity = _identity()
         with tempfile.TemporaryDirectory() as temporary:
-            stdout = Path(temporary) / "out.json"
-            gate_path = Path(temporary) / "spawn-abcd1234.json"
-            gate_path.write_text("{}", encoding="utf-8")  # pre-written blocking gate on disk
-
-            class FakeStore:
-                def write(self, *_args, **_kwargs) -> None:
-                    return None
+            base = Path(temporary)
+            stdout = base / "out.json"
+            store = RunStore(base / "state")
+            gate_path = store.record_path("k", "spawn-abcd1234")
+            store.write("k", "spawn-abcd1234", orchestrator._spawn_gate_record("abcd1234-full", "k", "o/r"))
 
             with patch(
                 "agent_delivery_loop.orchestrator.subprocess.Popen", side_effect=OSError("boom"),
             ) as popen:
                 with self.assertRaises(AgentDeliveryError) as caught:
                     orchestrator._spawn_agent_run(
-                        entry="agent-run", repo_root=Path(temporary),
+                        entry="agent-run", repo_root=base,
                         plan_pr="https://github.com/o/r/pull/26",
                         work_order_path=".agents/work-orders/WO-X-001-r1.json",
                         model="m", base_url="https://api.example", effort="max",
                         auth_config=Path("/nowhere"), timeout_seconds=30, proxy=None,
                         stdout_path=stdout, identity=identity,
-                        store=FakeStore(), task_key_value="k", gate_path=gate_path,
+                        store=store, task_key_value="k", gate_path=gate_path,
                     )
             popen.assert_called_once()
             self.assertNotIsInstance(caught.exception, orchestrator.AgentRunNotStartedError)
             self.assertIn("uncertain", str(caught.exception))
             self.assertTrue(gate_path.exists())  # the gate keeps blocking
+            with self.assertRaises(RunStateError):
+                store.assert_worker_available()  # every entry stays blocked
+
+    def test_late_task_binding_gates_the_claim(self) -> None:
+        from types import SimpleNamespace
+        from agent_delivery_loop.store import RunStore, task_key as store_task_key
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repo = base / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+            (repo / "f").write_text("x", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "c"], check=True,
+                           env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+            subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "https://github.com/o/r.git"], check=True)
+            merge_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                                       capture_output=True, text=True).stdout.strip()
+            config = ClaudeConfig(
+                executable="claude", model="m", base_url="https://api.example",
+                provider_host="api.example", auth_name="ANTHROPIC_AUTH_TOKEN",
+                auth_value="x", effort="max", target_repo_root=repo.resolve(),
+            )
+            right_key = store_task_key("o/r", "WO-X-001", 1)
+
+            class FakeClient:
+                def __init__(self, repo_arg, token=None):  # noqa: ANN001
+                    pass
+
+                def authorized_plan(self, _number, _path, _url):  # noqa: ANN001
+                    return SimpleNamespace(order_path=".agents/work-orders/WO-X-001-r1.json",
+                                           order_bytes=b"{}", merge_sha=merge_sha)
+
+                def content(self, _ref, _sha):  # noqa: ANN001
+                    return b"skill body\n"
+
+            order = SimpleNamespace(task_id="WO-X-001", revision=1, allows_path=lambda _p: True,
+                                    identity="t", skill_ref="skill.md", worker_profile="p",
+                                    sha256="0" * 64)
+
+            class StopBeforeWorktree(AgentDeliveryError):
+                pass
+
+            with patch("agent_delivery_loop.runner.default_state_dir", return_value=base / "state"), \
+                 patch("agent_delivery_loop.runner.GitHubClient", FakeClient), \
+                 patch("agent_delivery_loop.runner.preflight", return_value=(0, 1, 0)), \
+                 patch("agent_delivery_loop.runner.parse_work_order", return_value=order), \
+                 patch("agent_delivery_loop.runner.ensure_plan_is_on_main"), \
+                 patch("agent_delivery_loop.runner.create_worktree", side_effect=StopBeforeWorktree("stop")):
+                store = RunStore(base / "state")
+                run_kwargs = dict(
+                    repo_path=repo, plan_pr="o/r#26",
+                    work_order_path=".agents/work-orders/WO-X-001-r1.json",
+                    worker_config=config, pat_identity=_identity(),
+                )
+                # A gate bound to a DIFFERENT task fails closed before the claim.
+                gate = store.record_path(right_key, "spawn-abcd1234")
+                store.write(right_key, "spawn-abcd1234",
+                            orchestrator._spawn_gate_record("abcd1234-full", "wrong-task", "o/r"))
+                with self.assertRaises(AgentDeliveryError) as caught:
+                    runner.execute_plan(**run_kwargs, spawn_gate_name=f"{right_key}/{gate.name}")
+                self.assertIn("different task", str(caught.exception))
+                # The correctly bound gate passes the late check AND the exempted claim.
+                store.write(right_key, "spawn-abcd1234",
+                            orchestrator._spawn_gate_record("abcd1234-full", right_key, "o/r"))
+                with self.assertRaises(StopBeforeWorktree):
+                    runner.execute_plan(**run_kwargs, spawn_gate_name=f"{right_key}/{gate.name}")
 
     def test_stdout_open_failure_is_not_started_and_removes_no_child_assumptions(self) -> None:
         identity = _identity()

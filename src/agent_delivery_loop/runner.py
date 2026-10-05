@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import uuid
 from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
@@ -186,15 +187,39 @@ def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def _read_spawn_gate(gate_path: Path) -> dict[str, Any]:
-    """Read one spawn gate, rejecting symlinks, non-regular files, and duplicate keys."""
+    """Read and fully validate one spawn gate record.
+
+    The file is opened with O_NOFOLLOW and validated through the descriptor (fstat),
+    so a symlink swap or a concurrent replacement cannot smuggle content past the
+    checks. The COMPLETE blocking-gate schema is enforced — schema_version, run_id
+    matching the filename, the blocking status pair, the gate kind, and the string
+    bindings — never just the kind field.
+    """
     import stat as stat_module
 
-    info = gate_path.lstat()
-    if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISREG(info.st_mode):
-        raise ValueError("not a regular file")
-    record = json.loads(gate_path.read_text(encoding="utf-8"), object_pairs_hook=_unique_keys)
-    if not isinstance(record, dict) or record.get("kind") != "orchestrator_spawn_gate":
-        raise ValueError("not a spawn gate")
+    descriptor = os.open(gate_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
+        if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISREG(info.st_mode):
+            raise ValueError("not a regular file")
+        raw = os.read(descriptor, 64 * 1024 + 1)
+    finally:
+        os.close(descriptor)
+    record = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_keys)
+    if not isinstance(record, dict):
+        raise ValueError("not an object")
+    required = {
+        "schema_version": 1,
+        "run_id": gate_path.stem,
+        "status": "starting",
+        "worker_status": "start_unconfirmed",
+        "kind": "orchestrator_spawn_gate",
+    }
+    if any(record.get(key) != value for key, value in required.items()):
+        raise ValueError("not a blocking spawn gate record")
+    for key in ("orchestration_id", "task_key", "repository"):
+        if not isinstance(record.get(key), str) or not record[key]:
+            raise ValueError("missing gate binding")
     return record
 
 

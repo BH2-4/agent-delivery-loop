@@ -179,7 +179,7 @@ def verify_installation(*, receipt_path: Path, expected_source_sha: str, expecte
 
 
 class AgentRunNotStartedError(AgentDeliveryError):
-    """Popen itself failed; no child process was ever created."""
+    """The output capture could not be opened before creation; no child was created."""
 
 
 AGENT_RUN_INTERRUPT_GRACE_SECONDS = 20.0

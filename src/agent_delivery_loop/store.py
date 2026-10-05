@@ -117,6 +117,17 @@ class RunStore:
                     if path.suffix == ".tmp":
                         continue
                     if exempt_record is not None and path == exempt_record:
+                        # Only a still-valid BLOCKING gate may be exempted, revalidated
+                        # here: a swapped, corrupted, or malformed file blocks instead.
+                        exempt = self._read_record(path)
+                        if (
+                            exempt.get("kind") != "orchestrator_spawn_gate"
+                            or exempt.get("status") != "starting"
+                            or exempt.get("worker_status") != "start_unconfirmed"
+                        ):
+                            raise RunStateError(
+                                "The exempted spawn gate is not a valid blocking gate. Worker start is blocked; stop trials."
+                            )
                         continue
                     record = self._read_record(path)
                     worker_status = record["worker_status"]
