@@ -16,16 +16,21 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlencode
 
 from .errors import AgentDeliveryError
 from .git_ops import git
+from .github_identity import GitHubPAT
 
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 GH_TIMEOUT_SECONDS = 60
 CI_POLL_SECONDS = 20
 REQUIRED_CHECK_NAME = "validate"
+REQUIRED_WORKFLOW = "ci.yml"
+CI_PAGE_LIMIT = 100
 CREDENTIAL_ENV_NAMES = (
     "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GIT_ASKPASS",
+    "GITHUB_ENTERPRISE_TOKEN", "AGENT_GIT_PASSWORD", "SSH_ASKPASS",
     "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY",
 )
 
@@ -46,22 +51,37 @@ def _proxy_env(proxy: str | None) -> dict[str, str]:
     }
 
 
-def run_gh(args: list[str], *, proxy: str | None = None, timeout: int = GH_TIMEOUT_SECONDS) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
+def run_gh(
+    args: list[str], *, identity: GitHubPAT,
+    proxy: str | None = None, timeout: int = GH_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    env = {key: value for key, value in os.environ.items() if key not in CREDENTIAL_ENV_NAMES}
+    for key in ("GH_DEBUG", "DEBUG", "GH_HOST", "GH_REPO", "GH_CONFIG_DIR"):
+        env.pop(key, None)
     env.pop("ALL_PROXY", None)
     env.pop("all_proxy", None)
     env.update(_proxy_env(proxy))
     try:
-        return subprocess.run(
-            ["gh", *args], text=True, capture_output=True, timeout=timeout, check=False,
-            env=env, stdin=subprocess.DEVNULL,
-        )
+        # Isolate gh's configuration without overwriting the user's daily login.
+        with tempfile.TemporaryDirectory(prefix="adl-gh-config-") as config:
+            env.update({
+                "GH_TOKEN": identity.token_for(identity.repository),
+                "GH_HOST": "github.com", "GH_CONFIG_DIR": config,
+                "GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "GH_PAGER": "cat",
+            })
+            return subprocess.run(
+                ["gh", *args], text=True, capture_output=True, timeout=timeout, check=False,
+                env=env, stdin=subprocess.DEVNULL,
+            )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise AgentDeliveryError(f"A gh command could not run or timed out: gh {args[0]}.") from exc
 
 
-def gh_json(args: list[str], *, proxy: str | None = None) -> Any:
-    result = run_gh(args, proxy=proxy)
+def gh_json(
+    args: list[str], *, identity: GitHubPAT, proxy: str | None = None,
+    timeout: int = GH_TIMEOUT_SECONDS,
+) -> Any:
+    result = run_gh(args, identity=identity, proxy=proxy, timeout=timeout)
     if result.returncode != 0:
         raise AgentDeliveryError(f"gh {' '.join(args[:2])} failed with exit code {result.returncode}; no state was assumed.")
     try:
@@ -70,9 +90,128 @@ def gh_json(args: list[str], *, proxy: str | None = None) -> Any:
         raise AgentDeliveryError("gh returned output that is not JSON.") from exc
 
 
-def remote_branch_sha(repo_slug: str, branch: str, *, proxy: str | None = None) -> str | None:
+def verify_github_identity(identity: GitHubPAT, *, proxy: str | None = None) -> dict[str, Any]:
+    """Read-only account and repository checks, not proof of token write scope."""
+    account = gh_json(["api", "user"], identity=identity, proxy=proxy)
+    if not isinstance(account, dict) or str(account.get("login", "")).casefold() != identity.expected_login.casefold():
+        raise AgentDeliveryError("PAT account does not match the explicitly expected GitHub login.")
+    repo = gh_json(["api", f"repos/{identity.repository}"], identity=identity, proxy=proxy)
+    if (
+        not isinstance(repo, dict) or str(repo.get("full_name", "")).casefold() != identity.repository.casefold()
+        or repo.get("default_branch") != "main"
+    ):
+        raise AgentDeliveryError("PAT repository lookup did not confirm the target repository and main branch.")
+    return {
+        **identity.metadata(), "account_read_verified": True, "repository_read_verified": True,
+        "write_permissions_verified": False, "protection_verified": False,
+    }
+
+
+def probe_github_access(identity: GitHubPAT, *, pr_number: int, proxy: str | None = None) -> dict[str, Any]:
+    """Probe actual PR and Actions REST reads once; never publish, wait, or merge."""
+    result = verify_github_identity(identity, proxy=proxy)
+    pull = gh_json(
+        ["pr", "view", str(pr_number), "--repo", identity.repository, "--json", "headRefOid,baseRefName"],
+        identity=identity, proxy=proxy,
+    )
+    if not isinstance(pull, dict) or not SHA_RE.fullmatch(str(pull.get("headRefOid", ""))) or pull.get("baseRefName") != "main":
+        raise AgentDeliveryError("PAT PR probe did not return a full head SHA targeting main.")
+    snapshot = _ci_snapshot(identity, pr_number=pr_number, head_sha=pull["headRefOid"], proxy=proxy)
+    if snapshot["workflow_run_id"] is None or not snapshot["checks"]:
+        raise AgentDeliveryError("PAT CI probe needs an existing PR with a matching workflow run and readable jobs.")
+    return {
+        **result, "status": "read_access_verified", "pr_number": pr_number,
+        "head_sha": pull["headRefOid"], "pr_read_verified": True, "ci_read_verified": True,
+        "ci_check_count": len(snapshot["checks"]), "ci_source": "github_actions_rest",
+        "workflow_run_id": snapshot["workflow_run_id"],
+        "delivery_verified": False,
+    }
+
+
+def _bounded_items(payload: Any, key: str) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict) or not isinstance(payload.get(key), list):
+        raise AgentDeliveryError("Actions REST returned an invalid list; no CI state was assumed.")
+    items = payload[key]
+    count = payload.get("total_count")
+    if type(count) is not int or count < 0 or count > CI_PAGE_LIMIT or len(items) != count:
+        raise AgentDeliveryError("Actions REST list is incomplete or exceeds the bounded scan; no CI state was assumed.")
+    if any(not isinstance(item, dict) for item in items):
+        raise AgentDeliveryError("Actions REST returned an invalid item; no CI state was assumed.")
+    return items
+
+
+def _ci_snapshot(
+    identity: GitHubPAT, *, pr_number: int, head_sha: str, proxy: str | None,
+    request_timeout=None,
+) -> dict[str, Any]:
+    def per_call() -> int:
+        return request_timeout() if callable(request_timeout) else GH_TIMEOUT_SECONDS
+    """Read the fixed workflow's newest run for this exact PR/head, then its latest jobs."""
+    query = urlencode({"event": "pull_request", "head_sha": head_sha, "per_page": CI_PAGE_LIMIT})
+    runs = _bounded_items(gh_json(
+        ["api", f"repos/{identity.repository}/actions/workflows/{REQUIRED_WORKFLOW}/runs?{query}"],
+        identity=identity, proxy=proxy, timeout=per_call(),
+    ), "workflow_runs")
+    matches = []
+    for run in runs:
+        pulls = run.get("pull_requests")
+        if not isinstance(pulls, list) or any(not isinstance(pull, dict) for pull in pulls):
+            raise AgentDeliveryError("Actions run lacks explicit PR association; no CI state was assumed.")
+        # Real-world contract: merged pull_request runs may carry an EMPTY association
+        # list (observed on this repository). head_sha already binds the run to this
+        # PR's exact candidate commit, so an empty list is accepted; a run explicitly
+        # associated with a different PR is excluded from matching.
+        numbers = {pull.get("number") for pull in pulls}
+        if numbers and pr_number not in numbers:
+            continue
+        if (
+            run.get("head_sha") != head_sha or run.get("event") != "pull_request"
+            or str(run.get("path", "")).split("@", 1)[0] != f".github/workflows/{REQUIRED_WORKFLOW}"
+            or type(run.get("id")) is not int or run["id"] < 1
+            or type(run.get("run_attempt")) is not int or run["run_attempt"] < 1
+        ):
+            raise AgentDeliveryError("Actions run does not match the fixed PR/head/workflow identity.")
+        matches.append(run)
+    if not matches:
+        return {"workflow_run_id": None, "checks": [], "links": [], "status": "missing", "conclusion": None}
+    run = max(matches, key=lambda item: (item["id"], item["run_attempt"]))
+    jobs = _bounded_items(gh_json(
+        ["api", f"repos/{identity.repository}/actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page={CI_PAGE_LIMIT}"],
+        identity=identity, proxy=proxy, timeout=per_call(),
+    ), "jobs")
+    checks = []
+    for job in jobs:
+        if (
+            not isinstance(job.get("name"), str) or not job["name"]
+            or job.get("head_sha") != head_sha or job.get("run_id") != run["id"]
+            or job.get("status") not in {"queued", "in_progress", "completed", "waiting", "pending", "requested"}
+        ):
+            raise AgentDeliveryError("Actions job identity or status does not match the selected run.")
+        state = str(job.get("conclusion", "")).upper() if job["status"] == "completed" else "PENDING"
+        if state in {"NONE", ""}:
+            raise AgentDeliveryError("A completed Actions job has no definite conclusion.")
+        checks.append((job["name"], state))
+    confirmed = gh_json(
+        ["api", f"repos/{identity.repository}/actions/runs/{run['id']}"],
+        identity=identity, proxy=proxy, timeout=per_call(),
+    )
+    if not isinstance(confirmed, dict) or any(
+        confirmed.get(key) != run.get(key) for key in ("id", "head_sha", "run_attempt", "status", "conclusion")
+    ):
+        raise AgentDeliveryError("Actions run changed during job verification; no CI state was assumed.")
+    return {
+        "workflow_run_id": run["id"], "run_attempt": run["run_attempt"],
+        "checks": sorted(checks), "links": [run.get("html_url")],
+        "status": run.get("status"), "conclusion": run.get("conclusion"),
+    }
+
+
+def remote_branch_sha(repo_slug: str, branch: str, *, identity: GitHubPAT, proxy: str | None = None) -> str | None:
     """Read the real remote branch head; None only on a definitive 404."""
-    result = run_gh(["api", f"repos/{repo_slug}/git/ref/heads/{branch}", "--jq", ".object.sha"], proxy=proxy)
+    identity.token_for(repo_slug)
+    result = run_gh(
+        ["api", f"repos/{repo_slug}/git/ref/heads/{branch}", "--jq", ".object.sha"], identity=identity, proxy=proxy,
+    )
     if result.returncode != 0:
         stderr = result.stderr or ""
         if "Not Found" in stderr or "404" in stderr:
@@ -102,21 +241,24 @@ def _push_once(worktree: Path, repo_url: str, branch: str, token: str, proxy: st
 
 def push_delivery_branch(
     *, worktree: Path, repo_slug: str, repo_url: str, branch: str, candidate_sha: str,
-    intent_sink: IntentSink, token_provider: Callable[[], str], proxy: str | None = None,
+    intent_sink: IntentSink, identity: GitHubPAT, proxy: str | None = None,
 ) -> dict[str, Any]:
-    identity = {
+    token = identity.token_for(repo_slug)
+    if repo_url != f"https://github.com/{repo_slug}.git" or not branch.startswith("agent/"):
+        raise AgentDeliveryError("PAT push must target a Delivery branch in the bound repository.")
+    target = {
         "operation": "push", "repository": repo_slug, "branch": branch,
         "base_branch": "main", "candidate_sha": candidate_sha,
     }
-    intent_sink({**identity, "state": "intent"})
+    intent_sink({**target, "state": "intent"})
     for attempt in range(2):
         try:
-            result = _push_once(worktree, repo_url, branch, token_provider(), proxy)
+            result = _push_once(worktree, repo_url, branch, token, proxy)
         except AgentDeliveryError:
             result = None
-        remote = remote_branch_sha(repo_slug, branch, proxy=proxy)
+        remote = remote_branch_sha(repo_slug, branch, identity=identity, proxy=proxy)
         if remote == candidate_sha:
-            intent_sink({**identity, "state": "confirmed", "attempts": attempt + 1})
+            intent_sink({**target, "state": "confirmed", "attempts": attempt + 1})
             return {"operation": "push", "branch": branch, "head": remote, "confirmed": True}
         if remote is None:
             if result is not None and result.returncode == 0:
@@ -134,9 +276,10 @@ def push_delivery_branch(
 
 def ensure_delivery_pr(
     *, repo_slug: str, branch: str, candidate_sha: str, title: str, body_file: Path,
-    intent_sink: IntentSink, proxy: str | None = None,
+    intent_sink: IntentSink, identity: GitHubPAT, proxy: str | None = None,
 ) -> dict[str, Any]:
-    identity = {
+    identity.token_for(repo_slug)
+    target = {
         "operation": "create_pr", "repository": repo_slug, "branch": branch,
         "base_branch": "main", "candidate_sha": candidate_sha,
     }
@@ -144,7 +287,7 @@ def ensure_delivery_pr(
     def existing() -> dict[str, Any] | None:
         pulls = gh_json(
             ["pr", "list", "--repo", repo_slug, "--head", branch, "--base", "main", "--state", "open",
-             "--json", "number,url,headRefOid"], proxy=proxy,
+             "--json", "number,url,headRefOid"], identity=identity, proxy=proxy,
         )
         if not isinstance(pulls, list):
             raise AgentDeliveryError("Delivery PR lookup did not return a list.")
@@ -161,14 +304,14 @@ def ensure_delivery_pr(
 
     found = existing()
     if found is not None:
-        intent_sink({**identity, "state": "confirmed", "reused": True})
+        intent_sink({**target, "state": "confirmed", "reused": True})
         return found
-    intent_sink({**identity, "state": "intent"})
+    intent_sink({**target, "state": "intent"})
     created_error: AgentDeliveryError | None = None
     try:
         created = run_gh(
             ["pr", "create", "--repo", repo_slug, "--head", branch, "--base", "main",
-             "--title", title, "--body-file", str(body_file)], proxy=proxy,
+             "--title", title, "--body-file", str(body_file)], identity=identity, proxy=proxy,
         )
     except AgentDeliveryError as exc:
         created = None  # A timeout may still have created the PR; reconcile below.
@@ -178,12 +321,12 @@ def ensure_delivery_pr(
         if match:
             found = existing()
             if found is not None:
-                intent_sink({**identity, "state": "confirmed", "reused": False})
+                intent_sink({**target, "state": "confirmed", "reused": False})
                 return found
     # Ambiguous, failed, or timed-out creation: reconcile read-only; never create a second time blind.
     found = existing()
     if found is not None:
-        intent_sink({**identity, "state": "confirmed_after_reconcile", "reused": True})
+        intent_sink({**target, "state": "confirmed_after_reconcile", "reused": True})
         return found
     raise WriteReconciliationError(
         "Delivery PR creation result could not be confirmed by a read-only lookup; inspect GitHub before retrying."
@@ -192,16 +335,19 @@ def ensure_delivery_pr(
 
 
 def merge_delivery_pr(
-    *, repo_slug: str, pr_number: int, candidate_sha: str, intent_sink: IntentSink, proxy: str | None = None,
+    *, repo_slug: str, pr_number: int, candidate_sha: str, intent_sink: IntentSink,
+    identity: GitHubPAT, proxy: str | None = None,
 ) -> dict[str, Any]:
-    identity = {
+    identity.token_for(repo_slug)
+    target = {
         "operation": "merge_pr", "repository": repo_slug, "pr_number": pr_number,
         "branch_target": "main", "candidate_sha": candidate_sha,
     }
-    intent_sink({**identity, "state": "intent"})
+    intent_sink({**target, "state": "intent"})
     for attempt in range(2):
         detail = gh_json(
-            ["pr", "view", str(pr_number), "--repo", repo_slug, "--json", "state,mergeCommit,headRefOid"], proxy=proxy
+            ["pr", "view", str(pr_number), "--repo", repo_slug, "--json", "state,mergeCommit,headRefOid"],
+            identity=identity, proxy=proxy,
         )
         if not isinstance(detail, dict):
             raise WriteReconciliationError("Delivery PR state could not be read before merging.")
@@ -212,7 +358,7 @@ def merge_delivery_pr(
                     f"The merged Delivery PR head is {detail.get('headRefOid')}, not the reviewed {candidate_sha}; "
                     "the real result does not match the approved merge."
                 )
-            intent_sink({**identity, "state": "confirmed", "already_merged": attempt > 0 or None})
+            intent_sink({**target, "state": "confirmed", "already_merged": attempt > 0 or None})
             return {
                 "merged": True, "merge_sha": merge_commit.get("oid") if isinstance(merge_commit, dict) else None,
             }
@@ -226,13 +372,14 @@ def merge_delivery_pr(
             run_gh(
                 ["pr", "merge", str(pr_number), "--repo", repo_slug, "--merge",
                  "--match-head-commit", candidate_sha],
-                proxy=proxy, timeout=120,
+                identity=identity, proxy=proxy, timeout=120,
             )
         except AgentDeliveryError:
             pass  # A lost merge response may still have merged the PR; the loop re-reads state.
     # Final read-only confirmation after the last bounded merge attempt.
     detail = gh_json(
-        ["pr", "view", str(pr_number), "--repo", repo_slug, "--json", "state,mergeCommit,headRefOid"], proxy=proxy
+        ["pr", "view", str(pr_number), "--repo", repo_slug, "--json", "state,mergeCommit,headRefOid"],
+        identity=identity, proxy=proxy,
     )
     if isinstance(detail, dict) and detail.get("state") == "MERGED":
         if detail.get("headRefOid") != candidate_sha:
@@ -240,50 +387,83 @@ def merge_delivery_pr(
                 f"The merged Delivery PR head is {detail.get('headRefOid')}, not the reviewed {candidate_sha}."
             )
         merge_commit = detail.get("mergeCommit")
-        intent_sink({**identity, "state": "confirmed_after_reconcile"})
+        intent_sink({**target, "state": "confirmed_after_reconcile"})
         return {
             "merged": True, "merge_sha": merge_commit.get("oid") if isinstance(merge_commit, dict) else None,
         }
     raise WriteReconciliationError("Merge could not be confirmed after bounded attempts; inspect GitHub.")
 
 
-def wait_for_ci(
-    *, repo_slug: str, pr_number: int, head_sha: str, timeout_seconds: int, proxy: str | None = None,
+def verify_ci_current(
+    identity: GitHubPAT, *, repo_slug: str, pr_number: int, head_sha: str, proxy: str | None = None,
 ) -> dict[str, Any]:
-    """Poll real gh check data; missing, pending-forever, cancelled, or failing checks never pass."""
-    deadline = time.monotonic() + timeout_seconds
-    last: list[dict[str, Any]] = []
-    while time.monotonic() < deadline:
-        # gh pr checks exits 0 (all pass), 1 (any failed), or 8 (pending) while still
-        # printing the JSON list; pending must poll, not abort.
-        checks_result = run_gh(
-            ["pr", "checks", str(pr_number), "--repo", repo_slug, "--json", "name,state,link"], proxy=proxy
+    """One fresh CI verification for the exact head right before a merge decision."""
+    identity.token_for(repo_slug)
+    snapshot = _ci_snapshot(identity, pr_number=pr_number, head_sha=head_sha, proxy=proxy)
+    checks = snapshot["checks"]
+    if (
+        snapshot["status"] != "completed" or snapshot["conclusion"] != "success"
+        or not checks or any(state != "SUCCESS" for _, state in checks)
+        or sum(name == REQUIRED_CHECK_NAME for name, _ in checks) != 1
+    ):
+        raise AgentDeliveryError(
+            "The fixed CI workflow is not currently successful for the reviewed head; merge is not allowed."
         )
-        if checks_result.returncode not in (0, 1, 8):
-            raise AgentDeliveryError(
-                f"gh pr checks exited with {checks_result.returncode}; no CI state was assumed."
+    return {
+        "workflow_run_id": snapshot["workflow_run_id"], "run_attempt": snapshot.get("run_attempt"),
+        "checks": checks,
+    }
+
+
+def wait_for_ci(
+    *, repo_slug: str, pr_number: int, head_sha: str, timeout_seconds: int,
+    identity: GitHubPAT, proxy: str | None = None,
+) -> dict[str, Any]:
+    """Poll fixed Actions workflow via PAT-compatible REST; missing/failed checks never pass."""
+    identity.token_for(repo_slug)
+    deadline = time.monotonic() + timeout_seconds
+
+    def remaining_timeout() -> int:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise AgentDeliveryError("CI wait exceeded its total time budget before completion.")
+        return max(1, min(GH_TIMEOUT_SECONDS, int(left)))
+
+    while True:
+        current = gh_json(
+            ["pr", "view", str(pr_number), "--repo", repo_slug, "--json", "headRefOid,baseRefName"],
+            identity=identity, proxy=proxy, timeout=remaining_timeout(),
+        )
+        if not isinstance(current, dict) or current.get("headRefOid") != head_sha or current.get("baseRefName") != "main":
+            raise AgentDeliveryError("PR head/target changed while waiting for CI; nothing was merged.")
+        snapshot = _ci_snapshot(
+            identity, pr_number=pr_number, head_sha=head_sha, proxy=proxy,
+            request_timeout=remaining_timeout,
+        )
+        if time.monotonic() >= deadline:
+            raise AgentDeliveryError("CI wait exceeded its total time budget before completion.")
+        if snapshot["status"] == "completed":
+            checks = snapshot["checks"]
+            if (
+                snapshot["conclusion"] != "success" or not checks
+                or any(state != "SUCCESS" for _, state in checks)
+                or sum(name == REQUIRED_CHECK_NAME for name, _ in checks) != 1
+            ):
+                raise AgentDeliveryError("The fixed CI workflow or its required validate job did not definitely succeed.")
+            # Re-read after the snapshot to bind success to the still-current head.
+            after = gh_json(
+                ["pr", "view", str(pr_number), "--repo", repo_slug, "--json", "headRefOid,baseRefName"],
+                identity=identity, proxy=proxy, timeout=remaining_timeout(),
             )
-        try:
-            checks = json.loads(checks_result.stdout)
-        except ValueError as exc:
-            raise AgentDeliveryError("gh pr checks did not return a parsable check list.") from exc
-        if not isinstance(checks, list):
-            raise AgentDeliveryError("gh pr checks did not return a check list.")
-        last = [item for item in checks if isinstance(item, dict)]
-        states = {str(item.get("state", "")).upper() for item in last}
-        if last and states == {"SUCCESS"}:
-            required = [item for item in last if item.get("name") == REQUIRED_CHECK_NAME]
-            if len(required) != 1:
-                raise AgentDeliveryError(f"The required '{REQUIRED_CHECK_NAME}' check is missing from the PR checks.")
-            current = gh_json(["pr", "view", str(pr_number), "--repo", repo_slug, "--json", "headRefOid"], proxy=proxy)
-            if not isinstance(current, dict) or current.get("headRefOid") != head_sha:
-                raise AgentDeliveryError("PR head changed while waiting for CI; the checked version is no longer current.")
-            return {
-                "checks": sorted((item.get("name"), str(item.get("state")).upper()) for item in last),
-                "links": [item.get("link") for item in last],
-            }
-        if last and states & {"FAILURE", "CANCELLED", "TIMED_OUT", "SKIPPED"}:
-            failed = [(item.get("name"), str(item.get("state")).upper()) for item in last]
-            raise AgentDeliveryError(f"CI reported a non-success terminal state: {failed}.")
-        time.sleep(CI_POLL_SECONDS)
+            if time.monotonic() >= deadline:
+                raise AgentDeliveryError("CI wait exceeded its total time budget before completion.")
+            if after != current:
+                raise AgentDeliveryError("PR identity changed during CI verification; nothing was merged.")
+            return {**snapshot, "source": "github_actions_rest", "head_sha": head_sha, "workflow": REQUIRED_WORKFLOW}
+        if snapshot["status"] not in {"missing", "queued", "in_progress", "waiting", "pending", "requested"}:
+            raise AgentDeliveryError("Actions workflow status is unknown; nothing was merged.")
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise AgentDeliveryError("CI wait exceeded its total time budget before completion.")
+        time.sleep(min(CI_POLL_SECONDS, left))
     raise AgentDeliveryError(f"CI did not reach a terminal state within {timeout_seconds} seconds; nothing was merged.")

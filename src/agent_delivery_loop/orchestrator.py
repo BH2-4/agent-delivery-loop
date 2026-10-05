@@ -22,11 +22,13 @@ from .claude_worker import ClaudeConfig
 from .errors import AgentDeliveryError
 from .git_ops import git, repository_remote, repository_root
 from .github import GitHubClient, parse_plan_pr_ref
+from .github_identity import GitHubPAT
 from .publish import (
     ensure_delivery_pr,
     merge_delivery_pr,
+    probe_github_access,
     push_delivery_branch,
-    run_gh,
+    verify_ci_current,
     wait_for_ci,
 )
 from .review_cli import (
@@ -249,6 +251,14 @@ class _Params:
         self.__dict__.update(kwargs)
 
 
+def _load_pat(repo_path: Path, plan_pr: str, pat_file: Path, login: str) -> GitHubPAT:
+    root = repository_root(repo_path.expanduser().resolve())
+    repo, _, _ = parse_plan_pr_ref(plan_pr)
+    if repository_remote(root).slug.casefold() != repo.slug.casefold():
+        raise AgentDeliveryError("The Plan PR and local origin must identify the same repository before loading PAT.")
+    return GitHubPAT.from_file(path=pat_file, repo_root=root, repository=repo.slug, expected_login=login)
+
+
 def deliver(
     *,
     repo_path: Path, plan_pr: str, work_order_path: str,
@@ -257,9 +267,11 @@ def deliver(
     review_model: str, review_effort: str, review_timeout_seconds: int,
     review_bundle_dir: Path, proxy: str | None = None,
     ci_timeout_seconds: int = 900, auto_merge: bool = False,
+    github_pat_file: Path, github_login: str,
 ) -> dict[str, Any]:
     if not MIN_REVIEW_TIMEOUT_SECONDS <= review_timeout_seconds <= MAX_REVIEW_TIMEOUT_SECONDS:
         raise AgentDeliveryError("Review timeout is out of the allowed range.")
+    identity = _load_pat(repo_path, plan_pr, github_pat_file, github_login)
     orchestration = Orchestration(str(uuid.uuid4()))
     params = _Params(
         repo_path=repo_path, plan_pr=plan_pr, work_order_path=work_order_path,
@@ -269,6 +281,7 @@ def deliver(
         review_effort=review_effort, review_timeout_seconds=review_timeout_seconds,
         review_bundle_dir=review_bundle_dir, proxy=proxy,
         ci_timeout_seconds=ci_timeout_seconds, auto_merge=auto_merge,
+        github_identity=identity,
     )
     orchestration.save(
         parameters={
@@ -281,6 +294,7 @@ def deliver(
             "model": model, "base_url": base_url, "effort": effort,
             "auth_config": str(auth_config), "repo_path": str(repo_path),
             "install_receipt": str(install_receipt),
+            "github_identity": identity.metadata(),
         }
     )
     return _continue(orchestration, params, fresh=True)
@@ -295,6 +309,7 @@ def resume(
     review_model: str, review_effort: str, review_timeout_seconds: int,
     review_bundle_dir: Path, proxy: str | None = None,
     ci_timeout_seconds: int = 900, auto_merge: bool = False,
+    github_pat_file: Path, github_login: str,
 ) -> dict[str, Any]:
     if not MIN_REVIEW_TIMEOUT_SECONDS <= review_timeout_seconds <= MAX_REVIEW_TIMEOUT_SECONDS:
         raise AgentDeliveryError("Review timeout is out of the allowed range.")
@@ -324,6 +339,13 @@ def resume(
     for key, expected in advisory_keys:
         if key in recorded and recorded[key] != expected:
             raise AgentDeliveryError(f"Resume parameter mismatch for '{key}'; the recorded orchestration binds different values.")
+    repo, _, _ = parse_plan_pr_ref(plan_pr)
+    expected_identity = {"kind": "fine_grained_pat", "repository": repo.slug, "expected_login": github_login}
+    if recorded.get("github_identity") != expected_identity:
+        raise AgentDeliveryError(
+            "Resume PAT identity is missing or mismatched; legacy personal-gh records cannot be silently migrated."
+        )
+    identity = _load_pat(repo_path, plan_pr, github_pat_file, github_login)
     params = _Params(
         repo_path=repo_path, plan_pr=plan_pr, work_order_path=work_order_path,
         model=model, base_url=base_url, effort=effort, auth_config=auth_config,
@@ -332,6 +354,7 @@ def resume(
         review_effort=review_effort, review_timeout_seconds=review_timeout_seconds,
         review_bundle_dir=review_bundle_dir, proxy=proxy,
         ci_timeout_seconds=ci_timeout_seconds, auto_merge=auto_merge,
+        github_identity=identity,
     )
     orchestration.save(stage=orchestration.record["stage"], resumed_at=_now(), failure=None)
     return _continue(orchestration, params, fresh=False)
@@ -362,7 +385,11 @@ def _continue_inner(orchestration: Orchestration, params: _Params, *, fresh: boo
     plan_repo, number, plan_url = parse_plan_pr_ref(params.plan_pr)
     if local_repo.slug.casefold() != plan_repo.slug.casefold():
         raise AgentDeliveryError("The Plan PR and the local repository origin must refer to the same repository.")
-    client = GitHubClient(plan_repo)
+    identity = params.github_identity
+    identity.token_for(plan_repo.slug)
+    verified_identity = probe_github_access(identity, pr_number=number, proxy=params.proxy)
+    orchestration.save(github_identity=verified_identity)
+    client = GitHubClient(plan_repo, token=identity.token_for(plan_repo.slug))
     authorization = client.authorized_plan(number, params.work_order_path, plan_url)
     order = parse_work_order(authorization.order_bytes, expected_path=authorization.order_path)
     git(root, "fetch", "--no-tags", plan_repo.https_url, "+refs/heads/main:refs/remotes/adl-main")
@@ -429,14 +456,11 @@ def _continue_inner(orchestration: Orchestration, params: _Params, *, fresh: boo
     candidate = review_state["candidate"]
 
     # Publish chain: intent-persisted writes, read-only reconciliation.
-    token_result = run_gh(["auth", "token"], proxy=params.proxy)
-    if token_result.returncode != 0 or not token_result.stdout.strip():
-        raise AgentDeliveryError("gh did not provide an authentication token for the one-shot push.")
     push_delivery_branch(
         worktree=worktree, repo_slug=plan_repo.slug, repo_url=plan_repo.https_url,
         branch=delivery_branch, candidate_sha=candidate,
         intent_sink=orchestration.write_intent_sink,
-        token_provider=lambda: token_result.stdout.strip(), proxy=params.proxy,
+        identity=identity, proxy=params.proxy,
     )
     orchestration.save(stage="pushed", pushed={"branch": delivery_branch, "head": candidate})
     body_path = orchestration.output_dir / "delivery-pr-body.md"
@@ -453,19 +477,26 @@ def _continue_inner(orchestration: Orchestration, params: _Params, *, fresh: boo
     pr = ensure_delivery_pr(
         repo_slug=plan_repo.slug, branch=delivery_branch, candidate_sha=candidate,
         title=f"Delivery: {order.task_id} r{order.revision}", body_file=body_path,
-        intent_sink=orchestration.write_intent_sink, proxy=params.proxy,
+        intent_sink=orchestration.write_intent_sink, identity=identity, proxy=params.proxy,
     )
     orchestration.save(stage="pr_open", delivery_pr={**pr, "head": candidate})
     ci = wait_for_ci(
         repo_slug=plan_repo.slug, pr_number=pr["number"], head_sha=candidate,
-        timeout_seconds=params.ci_timeout_seconds, proxy=params.proxy,
+        timeout_seconds=params.ci_timeout_seconds, identity=identity, proxy=params.proxy,
     )
     orchestration.save(stage="ci_passed", ci=ci)
     merge = {"merged": False, "merge_sha": None, "main_contains_head": False}
     if params.auto_merge:
+        # Re-verify the fixed CI for this exact head immediately before merging so a
+        # newer run/attempt cannot hide behind the earlier wait's success.
+        pre_merge_ci = verify_ci_current(
+            params.github_identity, repo_slug=plan_repo.slug, pr_number=pr["number"],
+            head_sha=candidate, proxy=params.proxy,
+        )
+        orchestration.save(stage="pre_merge_ci_verified", pre_merge_ci=pre_merge_ci)
         merge = merge_delivery_pr(
             repo_slug=plan_repo.slug, pr_number=pr["number"], candidate_sha=candidate,
-            intent_sink=orchestration.write_intent_sink, proxy=params.proxy,
+            intent_sink=orchestration.write_intent_sink, identity=identity, proxy=params.proxy,
         )
         git(root, "fetch", "--no-tags", plan_repo.https_url, "refs/heads/main:refs/remotes/adl-main")
         if git(root, "merge-base", "--is-ancestor", candidate, "refs/remotes/adl-main", check=False).returncode != 0:

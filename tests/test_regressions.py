@@ -35,6 +35,7 @@ from agent_delivery_loop.claude_worker import (
 from agent_delivery_loop.cli import _report_error, agent_run_main, agent_watch_main
 from agent_delivery_loop.errors import AgentDeliveryError
 from agent_delivery_loop.github import GitHubClient, Repo
+from agent_delivery_loop.github_identity import GitHubPAT
 from agent_delivery_loop.git_ops import DeliveryCommit, StagedSnapshot, commit_changes, git, stage_changes
 from agent_delivery_loop.runner import _record_cancelled_run, _safe_changed_paths, execute_plan
 from agent_delivery_loop.review_cli import ReviewGateError, assert_review_processes_settled, run_review_process
@@ -42,6 +43,10 @@ from agent_delivery_loop.orchestrator import verify_installation
 from agent_delivery_loop.publish import wait_for_ci as _wait_for_ci
 from agent_delivery_loop.store import RunStateError, RunStore, task_key
 from agent_delivery_loop.work_order import parse_work_order
+
+
+# Synthetic, non-working credential used only with isolated/mocked transports.
+TEST_PAT_IDENTITY = GitHubPAT(repository="o/r", expected_login="o", _token="github_pat_test_not_a_real_credential")
 
 
 FAKE_CODEX_SCRIPT = """#!{python}
@@ -409,8 +414,8 @@ class PublishReconciliationTests(unittest.TestCase):
             ):
                 result = publish.push_delivery_branch(
                     worktree=worktree, repo_slug="o/r", repo_url="https://github.com/o/r.git",
-                    branch="b", candidate_sha=candidate, intent_sink=intents.append,
-                    token_provider=lambda: "t",
+                    branch="agent/test", candidate_sha=candidate, intent_sink=intents.append,
+                    identity=TEST_PAT_IDENTITY,
                 )
             self.assertTrue(result["confirmed"])
             self.assertEqual(pushes["n"], 1, "a confirmed remote head must never be re-pushed")
@@ -423,7 +428,7 @@ class PublishReconciliationTests(unittest.TestCase):
         intents: list[dict] = []
         merges = {"n": 0}
 
-        def fake_run_gh(args, proxy=None, timeout=60):
+        def fake_run_gh(args, proxy=None, timeout=60, identity=None):
             if args[0] == "pr" and args[1] == "merge":
                 self.assertEqual(
                     args,
@@ -435,7 +440,7 @@ class PublishReconciliationTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 1, "", "connection lost")
             raise AssertionError("unexpected gh call")
 
-        def fake_json(args, proxy=None):
+        def fake_json(args, proxy=None, identity=None):
             if args[0] == "pr" and args[1] == "view":
                 if fake_json.views == 0:
                     fake_json.views += 1
@@ -447,7 +452,7 @@ class PublishReconciliationTests(unittest.TestCase):
         with patch.object(publish, "run_gh", fake_run_gh), patch.object(publish, "gh_json", fake_json):
             merged = publish.merge_delivery_pr(
                 repo_slug="o/r", pr_number=7, candidate_sha=candidate,
-                intent_sink=intents.append,
+                intent_sink=intents.append, identity=TEST_PAT_IDENTITY,
             )
         self.assertTrue(merged["merged"])
         self.assertEqual(merged["merge_sha"], "c" * 40)
@@ -460,7 +465,7 @@ class PublishReconciliationTests(unittest.TestCase):
             with self.assertRaises(publish.WriteReconciliationError):
                 publish.merge_delivery_pr(
                     repo_slug="o/r", pr_number=7, candidate_sha=candidate,
-                    intent_sink=lambda i: None,
+                    intent_sink=lambda i: None, identity=TEST_PAT_IDENTITY,
                 )
             merge_call.assert_not_called()
 
@@ -471,7 +476,7 @@ class PublishReconciliationTests(unittest.TestCase):
         with patch.object(publish, "gh_json", return_value=list(pulls)):
             found = publish.ensure_delivery_pr(
                 repo_slug="o/r", branch="b", candidate_sha="e" * 40, title="t",
-                body_file=Path("/tmp/x.md"), intent_sink=lambda i: None,
+                body_file=Path("/tmp/x.md"), intent_sink=lambda i: None, identity=TEST_PAT_IDENTITY,
             )
         self.assertEqual(found["number"], 9)
         self.assertTrue(found["reused"])
@@ -479,7 +484,7 @@ class PublishReconciliationTests(unittest.TestCase):
             with self.assertRaises(publish.WriteReconciliationError):
                 publish.ensure_delivery_pr(
                     repo_slug="o/r", branch="b", candidate_sha="e" * 40, title="t",
-                    body_file=Path("/tmp/x.md"), intent_sink=lambda i: None,
+                    body_file=Path("/tmp/x.md"), intent_sink=lambda i: None, identity=TEST_PAT_IDENTITY,
                 )
 
 
@@ -515,6 +520,7 @@ class ReworkAndResumeTests(unittest.TestCase):
                     expected_wheel_sha256=base["expected_wheel_sha256"], review_model="m",
                     review_effort="high", review_timeout_seconds=900,
                     review_bundle_dir=Path("/tmp/b"), proxy=None, ci_timeout_seconds=900, auto_merge=True,
+                    github_pat_file=Path("/tmp/not-read.pat"), github_login="o",
                 )
                 pre_worker = Orchestration("orch-pre")
                 pre_worker.save(**base)
@@ -674,46 +680,63 @@ class ReworkAndResumeTests(unittest.TestCase):
 
 
 class CiWaitTests(unittest.TestCase):
-    def test_only_full_uppercase_success_with_required_check_passes(self) -> None:
-        import subprocess as _sp
+    def api_fixture(self, *, states=("success",), job_name="validate", head="c" * 40, total=1, missing=False):
+        seen = {"n": 0, "run": None}
 
-        head = "c" * 40
-        view = {"headRefOid": head}
-        pending = _sp.CompletedProcess([], 8, json.dumps(
-            [{"name": "validate", "state": "PENDING", "link": "https://example.invalid/run/1"}]
-        ), "")
-        passed = _sp.CompletedProcess([], 0, json.dumps(
-            [{"name": "validate", "state": "SUCCESS", "link": "https://example.invalid/run/1"}]
-        ), "")
-        with patch("agent_delivery_loop.publish.run_gh", side_effect=[pending, passed]), patch(
-            "agent_delivery_loop.publish.gh_json", return_value=view
+        def read(args, *, identity, proxy=None, timeout=60):
+            if args[:2] == ["pr", "view"]:
+                return {"headRefOid": "c" * 40, "baseRefName": "main"}
+            path = args[1]
+            if "/workflows/ci.yml/runs?" in path:
+                state = states[min(seen["n"], len(states) - 1)]
+                seen["n"] += 1
+                run = {
+                    "id": 7, "head_sha": head, "event": "pull_request", "run_attempt": 1,
+                    "path": ".github/workflows/ci.yml", "pull_requests": [{"number": 1}],
+                    "status": "in_progress" if state == "pending" else "completed",
+                    "conclusion": None if state == "pending" else state,
+                    "html_url": "https://example.invalid/run/7",
+                }
+                seen["run"] = run
+                return {"total_count": 0 if missing else total, "workflow_runs": [] if missing else [run]}
+            if "/attempts/1/jobs?" in path:
+                run = seen["run"]
+                job = {
+                    "name": job_name, "head_sha": run["head_sha"], "run_id": 7,
+                    "status": run["status"], "conclusion": run["conclusion"],
+                }
+                return {"total_count": 1, "jobs": [job]}
+            if path.endswith("/actions/runs/7"):
+                return seen["run"]
+            raise AssertionError(f"Unexpected API fixture call: {args}")
+
+        return read
+
+    def test_pending_then_fixed_workflow_success_passes(self) -> None:
+        with patch(
+            "agent_delivery_loop.publish.gh_json", side_effect=self.api_fixture(states=("pending", "success"))
         ), patch("agent_delivery_loop.publish.CI_POLL_SECONDS", 0):
             outcome = _wait_for_ci(
-                repo_slug="o/r", pr_number=1, head_sha=head, timeout_seconds=5, proxy=None
+                repo_slug="o/r", pr_number=1, head_sha="c" * 40, timeout_seconds=5, proxy=None,
+                identity=TEST_PAT_IDENTITY,
             )
         self.assertEqual(outcome["checks"], [("validate", "SUCCESS")])
+        self.assertEqual(outcome["workflow_run_id"], 7)
+        self.assertEqual(outcome["source"], "github_actions_rest")
 
     def test_missing_required_check_or_failure_state_stops(self) -> None:
-        import subprocess as _sp
-
-        def gh(payload, code=0):
-            return _sp.CompletedProcess([], code, json.dumps(payload), "")
-
-        with patch("agent_delivery_loop.publish.run_gh", return_value=gh([{"name": "other", "state": "SUCCESS"}])):
-            with self.assertRaises(AgentDeliveryError):
-                _wait_for_ci(repo_slug="o/r", pr_number=1, head_sha="c" * 40, timeout_seconds=5, proxy=None)
-        with patch("agent_delivery_loop.publish.run_gh", return_value=gh([{"name": "validate", "state": "FAILURE"}], 1)):
-            with self.assertRaises(AgentDeliveryError):
-                _wait_for_ci(repo_slug="o/r", pr_number=1, head_sha="c" * 40, timeout_seconds=5, proxy=None)
-
-    def test_empty_check_list_never_passes_as_success(self) -> None:
-        import subprocess as _sp
-
-        empty = _sp.CompletedProcess([], 8, "[]", "")
-        with patch("agent_delivery_loop.publish.CI_POLL_SECONDS", 0):
-            with patch("agent_delivery_loop.publish.run_gh", return_value=empty):
+        for fixture in (self.api_fixture(job_name="other"), self.api_fixture(states=("failure",))):
+            with patch("agent_delivery_loop.publish.gh_json", side_effect=fixture):
                 with self.assertRaises(AgentDeliveryError):
-                    _wait_for_ci(repo_slug="o/r", pr_number=1, head_sha="c" * 40, timeout_seconds=1, proxy=None)
+                    _wait_for_ci(repo_slug="o/r", pr_number=1, head_sha="c" * 40, timeout_seconds=5, proxy=None, identity=TEST_PAT_IDENTITY)
+
+    def test_wrong_head_missing_or_incomplete_runs_never_pass(self) -> None:
+        for fixture in (self.api_fixture(head="d" * 40), self.api_fixture(total=101), self.api_fixture(missing=True)):
+            with patch("agent_delivery_loop.publish.CI_POLL_SECONDS", 0), patch(
+                "agent_delivery_loop.publish.gh_json", side_effect=fixture,
+            ):
+                with self.assertRaises(AgentDeliveryError):
+                    _wait_for_ci(repo_slug="o/r", pr_number=1, head_sha="c" * 40, timeout_seconds=1, proxy=None, identity=TEST_PAT_IDENTITY)
 
 
 class ExplicitClaudeConfigurationTests(unittest.TestCase):
