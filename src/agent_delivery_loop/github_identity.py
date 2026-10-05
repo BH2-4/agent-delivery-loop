@@ -59,6 +59,20 @@ class GitHubPAT:
                 os.close(descriptor)
         return cls(repository=repository, expected_login=expected_login, _token=token)
 
+    @classmethod
+    def from_value(cls, *, repository: str, expected_login: str, token: str) -> GitHubPAT:
+        """Bind an already-validated in-memory credential snapshot to one repository and login.
+
+        Only the trusted orchestrator path may call this, with the exact value of its own
+        GitHubPAT snapshot. A child must never re-read the PAT file: if the file changed
+        between the parent's validation and a fresh read, the two processes would silently
+        use different credentials. Format, size and binding checks still apply; the value
+        must already have passed from_file's filesystem checks in the parent process.
+        """
+        if not isinstance(token, str):
+            raise AgentDeliveryError("The in-process PAT snapshot is invalid; no anonymous fallback is allowed.")
+        return cls(repository=repository, expected_login=expected_login, _token=token.strip())
+
     def token_for(self, repository: str) -> str:
         if repository.casefold() != self.repository.casefold():
             raise AgentDeliveryError("PAT operation targets a different repository; refusing the operation.")

@@ -14,6 +14,7 @@ from typing import Any
 from .errors import AgentDeliveryError
 from .git_ops import git, repository_remote, repository_root
 from .github import GitHubClient, parse_plan_pr_ref
+from .github_identity import GitHubPAT
 from .store import authorization_key, default_state_dir, task_key
 from .work_order import EvidenceRef, WorkOrder, parse_work_order
 
@@ -205,7 +206,8 @@ def _paths(root: Path, base: str, head: str, order: WorkOrder) -> list[str]:
 
 
 def _snapshot(
-    *, repo_path: Path, plan_pr: str, work_order_path: str, run_record: Path, head_sha: str
+    *, repo_path: Path, plan_pr: str, work_order_path: str, run_record: Path, head_sha: str,
+    pat_identity: GitHubPAT | None = None,
 ) -> tuple[dict[str, Any], bytes]:
     root = repository_root(repo_path.expanduser().resolve())
     repo, number, plan_url = parse_plan_pr_ref(plan_pr)
@@ -231,7 +233,14 @@ def _snapshot(
     ):
         raise AgentDeliveryError("Run record is not a completed candidate with confirmed Worker stop.")
 
-    client = GitHubClient(repo)  # Public reads only; no personal or App token.
+    # Trusted Python read path: the orchestrator passes its explicit PAT snapshot so
+    # authorization reads do not depend on anonymous shared-exit quota. Without an
+    # identity (legacy direct entries) the public anonymous read behavior is preserved.
+    # The identity never reaches the review packet, prompt, or any model subprocess.
+    if pat_identity is not None:
+        client = GitHubClient(repo, token=pat_identity.token_for(repo.slug))
+    else:
+        client = GitHubClient(repo)
     authorization = client.authorized_plan(number, work_order_path, plan_url)
     order = parse_work_order(authorization.order_bytes, expected_path=authorization.order_path)
     skill = client.content(order.skill_ref, authorization.merge_sha)
@@ -352,10 +361,11 @@ def _packet_files(metadata: dict[str, Any], context: bytes) -> dict[str, bytes]:
 def prepare_review(
     *, output_dir: Path, repo_path: Path, plan_pr: str,
     work_order_path: str, run_record: Path, head_sha: str,
+    pat_identity: GitHubPAT | None = None,
 ) -> dict[str, Any]:
     metadata, context = _snapshot(
         repo_path=repo_path, plan_pr=plan_pr, work_order_path=work_order_path,
-        run_record=run_record, head_sha=head_sha,
+        run_record=run_record, head_sha=head_sha, pat_identity=pat_identity,
     )
     destination = output_dir.expanduser().absolute()
     root = repository_root(repo_path.expanduser().resolve())
@@ -390,13 +400,14 @@ def check_review(
     *, bundle_dir: Path, result_path: Path, review_exit_code: int,
     repo_path: Path, plan_pr: str, work_order_path: str, run_record: Path, head_sha: str,
     exit_code_source: str = "operator_attested_not_independently_proven",
+    pat_identity: GitHubPAT | None = None,
 ) -> dict[str, Any]:
     if not isinstance(review_exit_code, int) or isinstance(review_exit_code, bool) or review_exit_code != 0:
         raise AgentDeliveryError("Review CLI was reported unsuccessful; no review was accepted.")
     # Re-query authorization and detect main/branch changes.
     metadata, context = _snapshot(
         repo_path=repo_path, plan_pr=plan_pr, work_order_path=work_order_path,
-        run_record=run_record, head_sha=head_sha,
+        run_record=run_record, head_sha=head_sha, pat_identity=pat_identity,
     )
     expected_files = _packet_files(metadata, context)
     for filename, expected in expected_files.items():

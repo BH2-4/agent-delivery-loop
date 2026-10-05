@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import uuid
 from pathlib import Path
@@ -177,13 +178,94 @@ def verify_installation(*, receipt_path: Path, expected_source_sha: str, expecte
     }
 
 
+class AgentRunNotStartedError(AgentDeliveryError):
+    """The output capture could not be opened before creation; no child was created."""
+
+
+AGENT_RUN_INTERRUPT_GRACE_SECONDS = 20.0
+
+
+def _stop_agent_run_bounded(process: subprocess.Popen[str]) -> bool:
+    """Two-layer-aware stop of the trusted Python agent-run runner.
+
+    The runner and its inner Claude Worker live in independent process groups, so
+    stopping the outer group is never proof that Claude stopped. SIGINT goes to the
+    outer group first: a Python runner turns it into KeyboardInterrupt and runs its
+    own Worker cleanup — including stopping and confirming the inner Claude group and
+    persisting the safety record. The leader exiting is not enough: same-group
+    descendants that ignore SIGINT must be caught by checking the group and
+    escalating to the hard SIGTERM/SIGKILL stop. A True return confirms the OUTER
+    process group is gone; whether the inner run ended safely is proven only by its
+    persisted run record, which the spawn gate resolution checks separately.
+    """
+    from .claude_worker import _process_group_exists, _stop_process_group
+
+    if process.poll() is not None:
+        return not _process_group_exists(process.pid)
+    try:
+        os.killpg(process.pid, signal.SIGINT)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        process.wait(timeout=AGENT_RUN_INTERRUPT_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        return _stop_process_group(process)
+    if not _process_group_exists(process.pid):
+        return True
+    return _stop_process_group(process)
+
+
+def _spawn_gate_record(orchestration_id: str, task_key_value: str, repository: str) -> dict[str, Any]:
+    """Single-phase BLOCKING gate: written and read-back verified before Popen begins.
+
+    There is no non-blocking pending phase and no post-Popen flip: every RunStore
+    launch entry sees an unconfirmed start from the moment creation is attempted. The
+    task_key/repository fields bind the gate to one authorized task so the tracked
+    child can validate the exemption it receives.
+    """
+    return {
+        "schema_version": 1,
+        "run_id": f"spawn-{orchestration_id[:8]}",
+        "status": "starting",
+        "worker_status": "start_unconfirmed",
+        "kind": "orchestrator_spawn_gate",
+        "orchestration_id": orchestration_id,
+        "task_key": task_key_value,
+        "repository": repository,
+        "registered_at": _now(),
+    }
+
+
+def _preflight_spawn_gates(store: Any) -> None:
+    """Refuse to spawn while ANY unresolved spawn gate remains (any task)."""
+    for directory in store.runs.iterdir():
+        if not directory.is_dir():
+            continue
+        for path in directory.glob("spawn-*.json"):
+            raise AgentDeliveryError(
+                f"An unresolved agent-run spawn gate remains ({path.name}); manual safety review is required before any new run."
+            )
+
+
+def _resolve_spawn_gate(store: Any, task_key_value: str, gate_path: Path, registered_epoch: float) -> bool:
+    """Failure paths never auto-release a spawn gate — kept for explicitness.
+
+    Gate release is exact-evidence only: the trusted runner releases its own gate right
+    after persisting its verified-safe terminal record (runner._release_own_spawn_gate),
+    and the orchestrator removes the gate idempotently on the success path once
+    _verify_worker_result has verified THIS spawn's record. Any other outcome (timeout,
+    interruption, hard kill, unconfirmed stop, malformed output) keeps the gate
+    blocking every launch path until manual safety review.
+    """
+    return False
+
+
 def _spawn_agent_run(
     *, entry: str, repo_root: Path, plan_pr: str, work_order_path: str,
     model: str, base_url: str, effort: str, auth_config: Path,
     timeout_seconds: int, proxy: str | None, stdout_path: Path,
+    identity: GitHubPAT, store: Any, task_key_value: str, gate_path: Path,
 ) -> dict[str, Any]:
-    from .claude_worker import _stop_process_group
-
     argv = [
         entry, "--plan-pr", plan_pr, "--work-order-path", work_order_path,
         "--repo-path", str(repo_root),
@@ -193,22 +275,57 @@ def _spawn_agent_run(
     env = {key: value for key, value in os.environ.items() if key not in CREDENTIAL_ENV_NAMES}
     if proxy:
         env.update({"HTTPS_PROXY": proxy, "HTTP_PROXY": proxy, "https_proxy": proxy, "http_proxy": proxy})
+    # One-shot credential channel for the trusted agent-run child only: the exact value of
+    # this orchestrator's in-memory PAT snapshot, so parent and child can never diverge onto
+    # different tokens. The variable never enters argv or a file, the names are on every
+    # credential scrub list, the child pops it before any model subprocess exists, and the
+    # channel disappears with the child process on success, failure, timeout or cancel.
+    repo_slug = parse_plan_pr_ref(plan_pr)[0].slug
+    env["AGENT_DELIVERY_PAT"] = identity.token_for(repo_slug)
+    env["AGENT_DELIVERY_PAT_LOGIN"] = identity.expected_login
+    # The child is told which durable spawn gate tracks it so its own availability
+    # check can exempt exactly that one record (name only; not a credential).
+    env["AGENT_DELIVERY_SPAWN_GATE"] = f"{task_key_value}/{gate_path.name}"
+    # The blocking gate was written and read-back verified by the caller BEFORE this
+    # function was entered, so the creation phase already starts under a durable block.
+    # A stdout-capture open failure happens strictly before creation begins, so it
+    # provably leaves no child and may release the gate. Once creation itself is
+    # entered, an exception without a handle (including a Popen OSError) leaves the
+    # outcome UNCERTAIN: the gate stays and every launch entry keeps blocking until
+    # the runner's verified-safe terminal record releases it or a human intervenes.
+    # No timestamp, record age, or PID guess participates in this decision.
     try:
-        with open(stdout_path, "wb") as captured:
+        captured = open(stdout_path, "wb")
+    except OSError as exc:
+        raise AgentRunNotStartedError("The agent-run output capture could not be opened.") from exc
+    with captured:
+        try:
             process = subprocess.Popen(
                 argv, stdin=subprocess.DEVNULL, stdout=captured, stderr=subprocess.STDOUT,
                 env=env, start_new_session=True,
             )
-            try:
-                exit_code = process.wait(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired:
-                if not _stop_process_group(process):
-                    raise AgentDeliveryError(
-                        "The spawned agent-run exceeded its time limit and its process group could not be confirmed stopped; runs are blocked."
-                    )
-                raise AgentDeliveryError("The spawned agent-run exceeded its time limit and was stopped; no delivery continued.")
-    except OSError as exc:
-        raise AgentDeliveryError("The installed agent-run entry could not be started.") from exc
+        except OSError as exc:
+            raise AgentDeliveryError(
+                "The agent-run creation attempt failed without a handle; the spawn outcome is "
+                "uncertain and the spawn gate remains blocking."
+            ) from exc
+        try:
+            exit_code = process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            if not _stop_agent_run_bounded(process):
+                raise AgentDeliveryError(
+                    "The spawned agent-run exceeded its time limit and its process group could not be confirmed stopped; runs are blocked."
+                )
+            raise AgentDeliveryError("The spawned agent-run exceeded its time limit and was stopped; no delivery continued.")
+        except BaseException:
+            # Interruption or cancellation must not leave the trusted child (and its
+            # one-shot PAT channel) running unconfirmed. A confirmed outer stop
+            # re-raises the interruption; an unconfirmed stop blocks future runs.
+            if not _stop_agent_run_bounded(process):
+                raise AgentDeliveryError(
+                    "agent-run was interrupted and its process group could not be confirmed stopped; runs are blocked."
+                ) from None
+            raise
     output = stdout_path.read_bytes()[:MAX_AGENT_RUN_OUTPUT_BYTES]
     if exit_code != 0:
         raise AgentDeliveryError(f"The installed agent-run exited with code {exit_code}; its sanitized output was preserved.")
@@ -410,13 +527,36 @@ def _continue_inner(orchestration: Orchestration, params: _Params, *, fresh: boo
     store = RunStore(default_state_dir())
     worktree = None
     if fresh:
-        agent_run_output = _spawn_agent_run(
-            entry=install["agent_run_entry"], repo_root=root, plan_pr=params.plan_pr,
-            work_order_path=params.work_order_path, model=params.model, base_url=params.base_url,
-            effort=params.effort, auth_config=params.auth_config,
-            timeout_seconds=order.timeout_seconds + 300, proxy=params.proxy,
-            stdout_path=orchestration.output_dir / "agent-run-stdout.json",
+        task_key_value = task_key(plan_repo.slug, order.task_id, order.revision)
+        # Every RunStore launch entry must reject unconfirmed starts, so the blocking
+        # gate is written and read-back verified BEFORE the creation phase is entered;
+        # there is no non-blocking pending phase and no post-Popen flip. Later launches
+        # refuse until the runner's verified-safe terminal record releases it.
+        store.assert_worker_available()
+        _preflight_spawn_gates(store)
+        gate_path = store.record_path(task_key_value, f"spawn-{orchestration.id[:8]}")
+        store.write(
+            task_key_value, gate_path.stem,
+            _spawn_gate_record(orchestration.id, task_key_value, plan_repo.slug),
         )
+        try:
+            agent_run_output = _spawn_agent_run(
+                entry=install["agent_run_entry"], repo_root=root, plan_pr=params.plan_pr,
+                work_order_path=params.work_order_path, model=params.model, base_url=params.base_url,
+                effort=params.effort, auth_config=params.auth_config,
+                timeout_seconds=order.timeout_seconds + 300, proxy=params.proxy,
+                stdout_path=orchestration.output_dir / "agent-run-stdout.json",
+                identity=identity, store=store, task_key_value=task_key_value, gate_path=gate_path,
+            )
+        except AgentRunNotStartedError:
+            # Only a failure strictly before creation began (capture open) can land
+            # here; it provably created no child, so the gate may be removed.
+            gate_path.unlink(missing_ok=True)
+            raise
+        except BaseException:
+            # Unknown safe-end: the gate stays. Only the runner's own verified-safe
+            # terminal record (or the verified success path below) can release it.
+            raise
         run_id = agent_run_output.get("run_id")
         delivery_branch = agent_run_output.get("delivery_branch")
         delivery_commit = agent_run_output.get("delivery_commit")
@@ -424,6 +564,9 @@ def _continue_inner(orchestration: Orchestration, params: _Params, *, fresh: boo
             raise AgentDeliveryError("agent-run did not report a run ID, delivery branch, and full delivery commit.")
         record_path = _worker_record_path(plan_repo.slug, order.task_id, order.revision, run_id)
         worker_record = _verify_worker_result(record_path, run_id, str(delivery_commit), order)
+        # Exact-evidence release: THIS spawn's record is verified stopped-complete
+        # (the runner normally already released its own gate; this is idempotent).
+        gate_path.unlink(missing_ok=True)
         worktree = store.root / "worktrees" / run_id
         orchestration.save(
             stage="worker_completed",
@@ -451,7 +594,7 @@ def _continue_inner(orchestration: Orchestration, params: _Params, *, fresh: boo
     # Review / rework loop: candidate is always the current local branch head.
     review_state = _review_loop(
         orchestration, params, root, plan_repo, order, authorization, record_path, worktree, delivery_branch,
-        skill_sha256=worker_record.get("skill_sha256"),
+        skill_sha256=worker_record.get("skill_sha256"), identity=identity,
     )
     candidate = review_state["candidate"]
 
@@ -521,9 +664,14 @@ def _changed(record_path: Path, candidate: str, orchestration: Orchestration) ->
 def _review_loop(
     orchestration: Orchestration, params: _Params, root: Path, plan_repo, order,
     authorization, record_path: Path, worktree: Path, delivery_branch: str,
-    skill_sha256: str | None = None,
+    skill_sha256: str | None = None, *, identity: GitHubPAT | None = None,
 ) -> dict[str, Any]:
-    """Run reviews until pass, bounded rework in between; never re-runs the Worker."""
+    """Run reviews until pass, bounded rework in between; never re-runs the Worker.
+
+    The trusted Python packet preparation and receipt verification read GitHub with the
+    orchestrator's explicit identity when one is bound; the review model subprocess
+    never receives it (the packet carries only pinned public content).
+    """
     from .store import RunStore as _RunStore
 
     store = _RunStore(default_state_dir())
@@ -562,6 +710,7 @@ def _review_loop(
             prepare_review(
                 output_dir=bundle_dir, repo_path=root, plan_pr=params.plan_pr,
                 work_order_path=params.work_order_path, run_record=record_path, head_sha=candidate,
+                pat_identity=identity,
             )
             review_run = run_review_process(
                 bundle_dir=bundle_dir, timeout_seconds=params.review_timeout_seconds,
@@ -583,6 +732,7 @@ def _review_loop(
                 repo_path=root, plan_pr=params.plan_pr, work_order_path=params.work_order_path,
                 run_record=record_path, head_sha=candidate,
                 exit_code_source="captured_by_orchestrator",
+                pat_identity=identity,
             )
             orchestration.save(stage="review_passed", review={**linkage, "verdict": "pass"})
             return {"candidate": candidate}

@@ -31,8 +31,30 @@ CI_PAGE_LIMIT = 100
 CREDENTIAL_ENV_NAMES = (
     "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GIT_ASKPASS",
     "GITHUB_ENTERPRISE_TOKEN", "AGENT_GIT_PASSWORD", "SSH_ASKPASS",
+    "AGENT_DELIVERY_PAT", "AGENT_DELIVERY_PAT_LOGIN",
     "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY",
 )
+
+# Bounded transient-retry policy for identified read-only gh invocations. The budget is
+# monotonic-clock and shared by every attempt of one call; it never extends an outer
+# CI deadline, and non-read-only invocations (writes) always stay single-attempt.
+GH_READ_RETRY_DELAYS_SECONDS = (2.0, 8.0)
+GH_READ_BUDGET_SECONDS = 45.0
+# A request starts only while at least this much budget remains; a sub-second
+# remainder is never rounded up into a longer per-attempt timeout.
+GH_READ_MIN_ATTEMPT_SECONDS = 1.0
+# `gh api` GET semantics are proven ONLY by an allowlist: exactly one positional (the
+# endpoint) plus output/header flags. Unknown flags, extra positionals (gh api treats
+# them as key=value fields and switches to POST) and any method/field/input spelling
+# — separated, --flag=value, or short-flag-attached — all disable retry (fail closed).
+_GH_API_FLAGS_WITH_VALUE = {"-H", "--header", "--jq"}
+_GH_API_SELF_CONTAINED_FLAGS = {"--verbose", "--paginate", "--slurp"}
+_GH_TRANSIENT_PATTERNS = (
+    "tls handshake timeout", "connection reset", "connection refused", "connection closed",
+    "i/o timeout", "net/http", "dial tcp", "context deadline", "unexpected eof",
+    "proxy error", "server error", "http 500", "http 502", "http 503", "http 504", "http 5",
+)
+_GH_RATE_LIMIT_MARKERS = ("rate limit", "ratelimit", "http 429", "too many requests")
 
 IntentSink = Callable[[dict[str, Any]], None]
 
@@ -53,7 +75,7 @@ def _proxy_env(proxy: str | None) -> dict[str, str]:
 
 def run_gh(
     args: list[str], *, identity: GitHubPAT,
-    proxy: str | None = None, timeout: int = GH_TIMEOUT_SECONDS,
+    proxy: str | None = None, timeout: float = GH_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
     env = {key: value for key, value in os.environ.items() if key not in CREDENTIAL_ENV_NAMES}
     for key in ("GH_DEBUG", "DEBUG", "GH_HOST", "GH_REPO", "GH_CONFIG_DIR"):
@@ -74,20 +96,125 @@ def run_gh(
                 env=env, stdin=subprocess.DEVNULL,
             )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise AgentDeliveryError(f"A gh command could not run or timed out: gh {args[0]}.") from exc
+        raise AgentDeliveryError(
+            f"A gh command could not run or timed out: gh {args[0] if args else '(no arguments)'}."
+        ) from exc
 
 
 def gh_json(
     args: list[str], *, identity: GitHubPAT, proxy: str | None = None,
-    timeout: int = GH_TIMEOUT_SECONDS,
+    timeout: float = GH_TIMEOUT_SECONDS,
 ) -> Any:
-    result = run_gh(args, identity=identity, proxy=proxy, timeout=timeout)
+    result = run_gh_read(args, identity=identity, proxy=proxy, timeout=timeout)
     if result.returncode != 0:
         raise AgentDeliveryError(f"gh {' '.join(args[:2])} failed with exit code {result.returncode}; no state was assumed.")
     try:
         return json.loads(result.stdout)
     except ValueError as exc:
         raise AgentDeliveryError("gh returned output that is not JSON.") from exc
+
+
+def _is_read_only_gh_args(args: list[str]) -> bool:
+    """Only invocations whose actual HTTP semantics are provably GET may be retried.
+
+    `gh api` is read-only only with exactly one positional endpoint and nothing beyond
+    the allowlisted output/header flags; anything else — including every method/field
+    spelling that would flip the request to POST — fails closed to single-attempt.
+    """
+    if not args:
+        return False
+    if args[0] == "api":
+        positionals = 0
+        tokens = args[1:]
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if token == "--":
+                positionals += len(tokens) - index - 1
+                break
+            if token.startswith("-"):
+                name, _, _value = token.partition("=")
+                if name in _GH_API_FLAGS_WITH_VALUE:
+                    if "=" not in token:
+                        index += 1  # the flag consumes the next token as its value
+                elif name in _GH_API_SELF_CONTAINED_FLAGS:
+                    pass
+                else:
+                    return False
+            else:
+                positionals += 1
+            index += 1
+        return positionals == 1
+    return args[:2] == ["pr", "view"]
+
+
+def _classify_gh_failure(stderr: str) -> str:
+    lowered = (stderr or "").lower()
+    if any(marker in lowered for marker in _GH_RATE_LIMIT_MARKERS):
+        return "rate_limited"
+    if any(pattern in lowered for pattern in _GH_TRANSIENT_PATTERNS):
+        return "transient_network"
+    return "not_transient"
+
+
+def run_gh_read(
+    args: list[str], *, identity: GitHubPAT, proxy: str | None = None,
+    timeout: float = GH_TIMEOUT_SECONDS, return_hard_failures: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run a provably read-only gh invocation with bounded transient-network retries.
+
+    Writes and ambiguous shapes stay single-attempt by construction: callers that must not
+    be retried keep using run_gh directly. Rate limiting, authentication/permission denials
+    and unrecognised failures stop immediately; only transient transport failures retry,
+    inside one monotonic-clock budget shared by all attempts and bounded by `timeout`.
+    Budget semantics are strict: no request is started when the remaining budget is
+    exhausted or below one second, and a per-attempt timeout never exceeds the remaining
+    time (never rounded up). Backoff also reserves room for one further attempt. The
+    budget derives from this call's `timeout` only, so it can never extend an outer
+    CI deadline. `return_hard_failures` lets a caller that must inspect definitive
+    non-transient statuses itself (e.g. 404 handling) receive the raw result.
+    """
+    if not _is_read_only_gh_args(args):
+        return run_gh(args, identity=identity, proxy=proxy, timeout=timeout)
+    budget = min(float(timeout), GH_READ_BUDGET_SECONDS)
+    deadline = time.monotonic() + budget
+    attempts = 0
+    result: subprocess.CompletedProcess[str] | None = None
+    while attempts < len(GH_READ_RETRY_DELAYS_SECONDS) + 1:
+        remaining = deadline - time.monotonic()
+        if remaining < GH_READ_MIN_ATTEMPT_SECONDS:
+            break  # Exhausted (or sub-second) budget never starts a request.
+        attempts += 1
+        result = run_gh(args, identity=identity, proxy=proxy, timeout=min(float(timeout), remaining))
+        if result.returncode == 0:
+            return result
+        category = _classify_gh_failure(result.stderr or "")
+        if category != "transient_network" or attempts > len(GH_READ_RETRY_DELAYS_SECONDS):
+            break
+        delay = min(
+            GH_READ_RETRY_DELAYS_SECONDS[attempts - 1],
+            deadline - time.monotonic() - GH_READ_MIN_ATTEMPT_SECONDS,
+        )
+        if delay <= 0:
+            break
+        time.sleep(delay)
+    if result is None:
+        raise AgentDeliveryError(
+            f"gh {' '.join(args[:2])} was not started: the read budget was already exhausted; no state was assumed."
+        )
+    if result.returncode != 0:
+        category = _classify_gh_failure(result.stderr or "")
+        if return_hard_failures and category != "transient_network":
+            return result
+        detail = {
+            "rate_limited": " (rate limited; not retried — see reset info in gh output)",
+            "transient_network": f" (transient network failure persisted after {attempts} bounded attempt(s))",
+            "not_transient": "",
+        }[category]
+        raise AgentDeliveryError(
+            f"gh {' '.join(args[:2])} failed with exit code {result.returncode}{detail}; no state was assumed."
+        )
+    return result
 
 
 def verify_github_identity(identity: GitHubPAT, *, proxy: str | None = None) -> dict[str, Any]:
@@ -209,8 +336,9 @@ def _ci_snapshot(
 def remote_branch_sha(repo_slug: str, branch: str, *, identity: GitHubPAT, proxy: str | None = None) -> str | None:
     """Read the real remote branch head; None only on a definitive 404."""
     identity.token_for(repo_slug)
-    result = run_gh(
-        ["api", f"repos/{repo_slug}/git/ref/heads/{branch}", "--jq", ".object.sha"], identity=identity, proxy=proxy,
+    result = run_gh_read(
+        ["api", f"repos/{repo_slug}/git/ref/heads/{branch}", "--jq", ".object.sha"],
+        identity=identity, proxy=proxy, return_hard_failures=True,
     )
     if result.returncode != 0:
         stderr = result.stderr or ""
@@ -423,11 +551,13 @@ def wait_for_ci(
     identity.token_for(repo_slug)
     deadline = time.monotonic() + timeout_seconds
 
-    def remaining_timeout() -> int:
+    def remaining_timeout() -> float:
         left = deadline - time.monotonic()
         if left <= 0:
             raise AgentDeliveryError("CI wait exceeded its total time budget before completion.")
-        return max(1, min(GH_TIMEOUT_SECONDS, int(left)))
+        # Exact float, never floored or padded: a sub-second remainder must reach
+        # run_gh_read untouched so it can decline to start a request it cannot fit.
+        return min(float(GH_TIMEOUT_SECONDS), left)
 
     while True:
         current = gh_json(

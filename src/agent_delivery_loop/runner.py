@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
+import os
 import uuid
 from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
@@ -34,8 +36,38 @@ from .git_ops import (
 )
 from .github import GitHubClient, Repo, parse_plan_pr_ref
 from .github_app import GitHubAppConfig, GitHubAppTokenProvider
+from .github_identity import GitHubPAT
 from .store import RunStateError, RunStore, authorization_key, default_state_dir, now_utc, task_key
 from .work_order import WorkOrder, parse_work_order
+
+
+def _release_own_spawn_gate(gate_path: Path | None) -> None:
+    """Release exactly this launch's spawn gate after persisting a verified-safe end.
+
+    Only the trusted runner that owns the gate calls this, and only right after it has
+    durably written its own safe terminal record (Worker confirmed stopped, or never
+    started). The exact-file binding replaces every time-window heuristic: no record
+    content, mtime, or timestamp can release someone else's gate, and any failure path
+    that never reaches a safe terminal write keeps the gate blocking.
+    """
+
+    def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate gate field")
+            result[key] = value
+        return result
+
+    if gate_path is None:
+        return
+    try:
+        record = json.loads(gate_path.read_text(encoding="utf-8"), object_pairs_hook=_unique_keys)
+        if isinstance(record, dict) and record.get("kind") == "orchestrator_spawn_gate":
+            gate_path.unlink()
+    except (OSError, ValueError):
+        # An unreadable or malformed gate keeps blocking; that is the safe direction.
+        return
 
 
 def _validate_paths(worktree: Path, order: WorkOrder, paths: Sequence[str]) -> list[str]:
@@ -145,6 +177,52 @@ def _validate_worker_config_root(root: Path, config: ClaudeConfig) -> None:
         raise AgentDeliveryError("Explicit Claude configuration was not bound to this repository.")
 
 
+def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate field")
+        result[key] = value
+    return result
+
+
+def _read_spawn_gate(gate_path: Path) -> dict[str, Any]:
+    """Read and fully validate one spawn gate record.
+
+    The file is opened with O_NOFOLLOW and validated through the descriptor (fstat),
+    so a symlink swap or a concurrent replacement cannot smuggle content past the
+    checks. The COMPLETE blocking-gate schema is enforced — schema_version, run_id
+    matching the filename, the blocking status pair, the gate kind, and the string
+    bindings — never just the kind field.
+    """
+    import stat as stat_module
+
+    descriptor = os.open(gate_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
+        if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISREG(info.st_mode):
+            raise ValueError("not a regular file")
+        raw = os.read(descriptor, 64 * 1024 + 1)
+    finally:
+        os.close(descriptor)
+    record = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_keys)
+    if not isinstance(record, dict):
+        raise ValueError("not an object")
+    required = {
+        "schema_version": 1,
+        "run_id": gate_path.stem,
+        "status": "starting",
+        "worker_status": "start_unconfirmed",
+        "kind": "orchestrator_spawn_gate",
+    }
+    if any(record.get(key) != value for key, value in required.items()):
+        raise ValueError("not a blocking spawn gate record")
+    for key in ("orchestration_id", "task_key", "repository"):
+        if not isinstance(record.get(key), str) or not record[key]:
+            raise ValueError("missing gate binding")
+    return record
+
+
 def execute_plan(
     *,
     repo_path: Path,
@@ -152,6 +230,8 @@ def execute_plan(
     work_order_path: str,
     worker_config: ClaudeConfig,
     publish: bool = False,
+    pat_identity: GitHubPAT | None = None,
+    spawn_gate_name: str | None = None,
 ) -> dict[str, Any]:
     root = repository_root(repo_path.expanduser().resolve())
     _validate_worker_config_root(root, worker_config)
@@ -170,12 +250,44 @@ def execute_plan(
 
     config = worker_config
     store = RunStore(default_state_dir())
-    store.assert_worker_available()
+    # The orchestrator's durable BLOCKING gate was written and read-back verified before
+    # this child was created; the exemption applies to exactly that one validated record
+    # in EVERY availability check (including the preflight below). A gate that is
+    # missing, misnamed, a symlink, corrupt JSON, duplicate-keyed, or of the wrong kind
+    # is rejected — never silently exempted.
+    exempt_record: Path | None = None
+    if spawn_gate_name is not None:
+        parts = spawn_gate_name.split("/")
+        candidate_gate = store.runs / spawn_gate_name if len(parts) == 2 else None
+        if (
+            candidate_gate is None
+            or not parts[1].startswith("spawn-")
+            or not parts[1].endswith(".json")
+        ):
+            raise AgentDeliveryError("The orchestrator spawn gate is invalid or missing; refusing to run.")
+        try:
+            gate_record = _read_spawn_gate(candidate_gate)
+        except (OSError, ValueError):
+            raise AgentDeliveryError(
+                "The orchestrator spawn gate is invalid or missing; refusing to run."
+            ) from None
+        if str(gate_record.get("repository", "")).casefold() != plan_repo.slug.casefold():
+            raise AgentDeliveryError(
+                "The orchestrator spawn gate is bound to a different repository; refusing to run."
+            )
+        exempt_record = candidate_gate
+    store.assert_worker_available(exempt_record=exempt_record)
     run_id = str(uuid.uuid4())
     runtime_home = store.root / "runtime" / run_id
     version = preflight(config, runtime_home)
 
-    client = GitHubClient(plan_repo)
+    if pat_identity is not None:
+        # The trusted Python runner performs its authorization reads with the same explicit
+        # PAT snapshot the orchestrator validated; anonymous shared-exit quota is no longer
+        # part of the PAT-mode path. token_for re-checks the repository binding.
+        client = GitHubClient(plan_repo, token=pat_identity.token_for(plan_repo.slug))
+    else:
+        client = GitHubClient(plan_repo)
     authorization = client.authorized_plan(number, work_order_path, plan_url)
     order = parse_work_order(authorization.order_bytes, expected_path=authorization.order_path)
     ensure_plan_is_on_main(root, plan_repo, authorization.merge_sha)
@@ -226,7 +338,37 @@ def execute_plan(
     }
     worker_lifecycle = WorkerLifecycle()
 
-    with store.claim(task_identity_key):
+    # exempt_record was validated before the preflight above and covers the claim too.
+    gate_release_allowed = exempt_record is None  # no gate -> release calls are no-ops anyway
+    with store.claim(task_identity_key, exempt_record=exempt_record):
+        # FINAL exemption validation, inside the claim's host+task flock: with the
+        # locks held no other writer can touch the gate, so this re-read closes every
+        # swap window (deletion, replacement, hard-link content change, or re-binding
+        # to a different task/repository) that could have slipped between the earlier
+        # checks and the claim. Any drift fails closed before anything is created.
+        if exempt_record is not None:
+            # The exempted gate must live under THIS authorized task's run directory:
+            # a valid gate parked in another directory with matching embedded bindings
+            # is still someone else's and must fail closed.
+            if exempt_record.parent != store.runs / task_identity_key:
+                raise AgentDeliveryError(
+                    "The orchestrator spawn gate is not in this task's run directory; refusing to run."
+                )
+            try:
+                gate_record = _read_spawn_gate(exempt_record)
+            except (OSError, ValueError):
+                raise AgentDeliveryError(
+                    "The orchestrator spawn gate is invalid or missing; refusing to run."
+                ) from None
+            if gate_record.get("task_key") != task_identity_key:
+                raise AgentDeliveryError(
+                    "The orchestrator spawn gate is bound to a different task; refusing to run."
+                )
+            if str(gate_record.get("repository", "")).casefold() != plan_repo.slug.casefold():
+                raise AgentDeliveryError(
+                    "The orchestrator spawn gate is bound to a different repository; refusing to run."
+                )
+            gate_release_allowed = True
         # This durable, read-back-verified record is the gate BEFORE any Worker
         # creation. A later failed/interrupted update cannot release it.
         store.write(task_identity_key, run_id, record)
@@ -285,6 +427,7 @@ def execute_plan(
                 record["status"] = "delivery_pr_open"
             record["finished_at"] = now_utc()
             store.write(task_identity_key, run_id, record)
+            _release_own_spawn_gate(exempt_record if gate_release_allowed else None)  # own verified-safe end persisted
             return {
                 **record,
                 "worktree_id": run_id,
@@ -298,6 +441,7 @@ def execute_plan(
                 record,
                 reason=str(exc),
             )
+            _release_own_spawn_gate(exempt_record if gate_release_allowed else None)  # Worker never started
             raise AgentDeliveryError(f"Work Order was cancelled before the Worker started. Run ID: {run_id}.") from None
         except WorkerCancelled as exc:
             worker_lifecycle.status = "stopped"
@@ -310,6 +454,7 @@ def execute_plan(
                 session_id=exc.session_id,
                 reason="Cancellation completed after the Worker process group stopped.",
             )
+            _release_own_spawn_gate(exempt_record if gate_release_allowed else None)  # own verified-safe end persisted
             raise AgentDeliveryError(f"Work Order was cancelled after Worker cleanup. Run ID: {run_id}.") from None
         except WorkerCleanupError as exc:
             worker_lifecycle.status = "stop_unconfirmed"
@@ -334,6 +479,7 @@ def execute_plan(
                     record,
                     reason="Cancellation occurred before the Worker started.",
                 )
+                _release_own_spawn_gate(exempt_record if gate_release_allowed else None)  # Worker never started
                 raise AgentDeliveryError(f"Work Order was cancelled before the Worker started. Run ID: {run_id}.") from None
             if worker_lifecycle.status == "stopped":
                 _record_cancelled_run(
@@ -344,6 +490,7 @@ def execute_plan(
                     session_id=worker_lifecycle.session_id,
                     reason="Run cancelled after the Worker process group was confirmed stopped.",
                 )
+                _release_own_spawn_gate(exempt_record if gate_release_allowed else None)  # own verified-safe end persisted
                 raise AgentDeliveryError(f"Work Order was cancelled after Worker cleanup. Run ID: {run_id}.") from None
             _record_cleanup_failed_run(
                 store,
@@ -378,6 +525,8 @@ def execute_plan(
                     record["session_id"] = exc.session_id
             record["failure"] = str(exc) if isinstance(exc, AgentDeliveryError) else "Unexpected worker failure; raw output was suppressed."
             store.write(task_identity_key, run_id, record)
+            if worker_lifecycle.status in {"not_started", "stopped"}:
+                _release_own_spawn_gate(exempt_record if gate_release_allowed else None)  # own verified-safe end persisted
             if isinstance(exc, AgentDeliveryError):
                 raise AgentDeliveryError(f"{exc} Run ID: {run_id}.") from None
             raise AgentDeliveryError(record["failure"]) from None

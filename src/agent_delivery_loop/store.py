@@ -74,7 +74,7 @@ class RunStore:
         _fsync_directory(self.root.parent)
 
     @contextmanager
-    def claim(self, key: str) -> Iterator[None]:
+    def claim(self, key: str, *, exempt_record: Path | None = None) -> Iterator[None]:
         host_descriptor = os.open(self.locks / "worker.lock", os.O_CREAT | os.O_RDWR, 0o600)
         task_descriptor: int | None = None
         try:
@@ -82,7 +82,7 @@ class RunStore:
                 fcntl.flock(host_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise AgentDeliveryError("Another Work Order is already running on this host.") from exc
-            self.assert_worker_available()
+            self.assert_worker_available(exempt_record=exempt_record)
             task_descriptor = os.open(self.locks / f"{key}.lock", os.O_CREAT | os.O_RDWR, 0o600)
             try:
                 fcntl.flock(task_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -94,7 +94,13 @@ class RunStore:
                 os.close(task_descriptor)
             os.close(host_descriptor)
 
-    def assert_worker_available(self) -> None:
+    def assert_worker_available(self, *, exempt_record: Path | None = None) -> None:
+        """All safety records must show a confirmed safe end before any Worker starts.
+
+        `exempt_record` may name exactly one orchestrator spawn-gate record that tracks
+        THIS child's own launch; it is skipped so the tracked runner can start while
+        every other launch path stays blocked by the gate.
+        """
         try:
             # Honor older failure markers, but never create another state source.
             try:
@@ -109,6 +115,19 @@ class RunStore:
                     raise ValueError("Unexpected run directory")
                 for path in directory.iterdir():
                     if path.suffix == ".tmp":
+                        continue
+                    if exempt_record is not None and path == exempt_record:
+                        # Only a still-valid BLOCKING gate may be exempted, revalidated
+                        # here: a swapped, corrupted, or malformed file blocks instead.
+                        exempt = self._read_record(path)
+                        if (
+                            exempt.get("kind") != "orchestrator_spawn_gate"
+                            or exempt.get("status") != "starting"
+                            or exempt.get("worker_status") != "start_unconfirmed"
+                        ):
+                            raise RunStateError(
+                                "The exempted spawn gate is not a valid blocking gate. Worker start is blocked; stop trials."
+                            )
                         continue
                     record = self._read_record(path)
                     worker_status = record["worker_status"]
