@@ -1,10 +1,10 @@
 # 写结果核对、有界返修与安全续接说明
 
-本文面向仓库使用者，概述本轮新增的三项能力：GitHub 写操作结果核对、有界返修与安全续接。事实依据为资料包内附带的 `src/agent_delivery_loop/publish.py`、`src/agent_delivery_loop/rework.py`、`src/agent_delivery_loop/github.py` 与 ADR-0006。
+本文面向仓库使用者，概述本轮新增的三项能力：GitHub 写操作结果核对、有界返修与安全续接。事实依据为资料包内附带的 `src/agent_delivery_loop/publish.py`、`src/agent_delivery_loop/rework.py` 与 ADR-0006。
 
 ## 写操作核对
 
-- 两条链路分开：读/写分离与 `GitHubWritePendingError` 是 ADR 记录的 GitHub API 客户端策略（`GitHubClient.request()`：只有 GET 享受分类重试，POST 等写请求单次执行，响应丢失——网络断开、5xx——归为该异常，绝不自动重放）；发布链的 `gh` 子进程不使用该异常——`run_gh` 超时或启动失败抛 `AgentDeliveryError`，写请求的真实结果一律交由只读核对判定。
+- 两条链路分开：读/写分离与 `GitHubWritePendingError` 是 ADR-0006 记录的 GitHub API 客户端策略（`GitHubClient.request()`：只有 GET 享受分类重试，POST 等写请求单次执行，响应丢失——网络断开、5xx——归为该异常，绝不自动重放）；发布链的 `gh` 子进程不使用该异常——`run_gh` 超时或启动失败抛 `AgentDeliveryError`，写请求的真实结果一律交由只读核对判定。
 - 写前持久化意图：每个外部写（推送分支 / 创建 Delivery PR / 合并 PR）先持久化操作意图与完整身份（仓库、任务与修订、分支、目标分支、候选 SHA、操作类型）；检查点保存失败即不执行写。
 - 丢失响应用只读核对：写后用只读 `gh` 查询（`gh api`、`gh pr list`、`gh pr view`）核对远端真实状态——已成功则接纳真实结果且不重复执行；重试条件按操作区分，核对不清即停止，不统一到单一异常：
   - 推送：远端分支明确不存在（404）且推送未报告成功时，允许一次有界重推（分支确不存在，重复安全）；
