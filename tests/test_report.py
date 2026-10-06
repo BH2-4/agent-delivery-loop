@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent_delivery_loop.cli import main
-from agent_delivery_loop.report import REPORT_FIELDS, ReportError, build_report
+from agent_delivery_loop.report import KNOWN_STAGES, REPORT_FIELDS, ReportError, build_report
 
 COMPLETED_ORCHESTRATION_ID = "46d814b8-b778-41dd-8477-b412b7ed2387"
 BLOCKED_ORCHESTRATION_ID = "2eb4742a-448e-41ae-a342-f9473c7516ad"
@@ -230,6 +230,34 @@ class ReportTests(unittest.TestCase):
             with self.assertRaises(ReportError, msg=json.dumps(mutation)):
                 build_report(STRUCTURE_ORCHESTRATION_ID, state_dir=self.state)
             (self.state / "orchestrations" / f"{STRUCTURE_ORCHESTRATION_ID}.json").unlink()
+
+    def test_stage_must_be_a_known_enum_value(self) -> None:
+        path = self.state / "orchestrations" / f"{MINIMAL_ORCHESTRATION_ID}.json"
+        for stage in KNOWN_STAGES:
+            self._write({"schema_version": 1, "orchestration_id": MINIMAL_ORCHESTRATION_ID, "stage": stage})
+            self.assertEqual(build_report(MINIMAL_ORCHESTRATION_ID, state_dir=self.state)["stage"], stage)
+            path.unlink()
+        for stage in (
+            "",
+            "everything is fine now",
+            "Completed",  # enum literals are lowercase; case variants are unknown
+            "review_blocked ",  # trailing whitespace is not the literal either
+            "rework_r3_started",  # beyond the bounded rework budget
+        ):
+            self._write({"schema_version": 1, "orchestration_id": MINIMAL_ORCHESTRATION_ID, "stage": stage})
+            with self.assertRaises(ReportError, msg=repr(stage)):
+                build_report(MINIMAL_ORCHESTRATION_ID, state_dir=self.state)
+            path.unlink()
+
+    def test_stage_vocabulary_tracks_the_sole_record_writer(self) -> None:
+        from agent_delivery_loop.orchestrator import PRE_WORKER_STAGES
+        from agent_delivery_loop.rework import MAX_REWORK_ROUNDS
+
+        self.assertTrue(PRE_WORKER_STAGES <= KNOWN_STAGES)
+        for index in range(1, MAX_REWORK_ROUNDS + 1):
+            for suffix in ("started", "completed"):
+                self.assertIn(f"rework_r{index}_{suffix}", KNOWN_STAGES)
+        self.assertNotIn(f"rework_r{MAX_REWORK_ROUNDS + 1}_started", KNOWN_STAGES)
 
     def test_oversized_record_is_rejected(self) -> None:
         record = _completed_record()

@@ -34,6 +34,30 @@ REPORT_FIELDS = (
     "delivery_commit",
     "delivery_pr",
 )
+# The complete stage vocabulary of the sole record writer (orchestrator.py): its
+# fixed checkpoint literals in pipeline order, plus the bounded rework loop's
+# rework_r{1..MAX_REWORK_ROUNDS}_{started,completed} stages (rework.py caps the
+# budget at 2, so the set is finite). Any other stage value is a structural
+# error: free text must never be echoed into a summary.
+KNOWN_STAGES = frozenset({
+    "created",
+    "install_verified",
+    "evidence_ready",
+    "worker_completed",
+    "pushed",
+    "pr_open",
+    "ci_passed",
+    "pre_merge_ci_verified",
+    "review_completed_pending_check",
+    "review_passed",
+    "review_blocked",
+    "rework_r1_started",
+    "rework_r1_completed",
+    "rework_r2_started",
+    "rework_r2_completed",
+    "awaiting_user_merge",
+    "completed",
+})
 
 
 class ReportError(AgentDeliveryError):
@@ -114,7 +138,7 @@ def build_report(orchestration_id: str, *, state_dir: Path | None = None) -> dic
     if record.get("orchestration_id") != identifier:
         raise ReportError("The orchestration record does not match the requested orchestration ID.")
     stage = record.get("stage")
-    if not isinstance(stage, str) or not stage:
+    if not isinstance(stage, str) or stage not in KNOWN_STAGES:
         raise _unexpected()
     task: str | None = None
     revision: int | None = None
