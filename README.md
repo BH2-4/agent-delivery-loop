@@ -5,11 +5,11 @@
 **English summary:** A GitHub-native, human-authorized delivery loop for CLI coding agents.
 
 > [!IMPORTANT]
-> 两张真实文档 Work Order 已执行并由人接纳进 `main`：第一张执行命令失败，候选成果后来通过 PR #5 人工接纳；第二张 `agent-run` 正常以退出码 0 完成，再经人工修正文案、独立审查、CI 和 PR #7 人工合并。单机、单 Worker、人工监督的正常交付路径已观察到一次成功，**不代表零人工返修、长期稳定或生产可用**。GitHub App、`main` 保护和无人值守发布仍未验证。
+> 引导阶段两张真实文档 Work Order 已执行并由人接纳进 `main`：第一张执行命令失败，候选成果后来通过 PR #5 人工接纳；第二张 `agent-run` 正常以退出码 0 完成，再经人工修正文案、独立审查、CI 和 PR #7 人工合并。单机、单 Worker、人工监督的正常交付路径已观察到一次成功，**不代表零人工返修、长期稳定或生产可用**。其后 PAT 试运行工单 `WO-PAT-TRIAL-001-r2` 的编排 R10 终态为 `review_blocked`，候选经人工修正后经 PR #30 人工接纳；PR #31 合并审查交接容量修复并重建普通 wheel 安装（静态核验通过）。安装版真实端到端交付与无人值守能力未验证；GitHub App、`main` 保护和无人值守发布仍未验证。当前交付流程说明见 [PAT 交付 Runbook](docs/pat-delivery-runbook.md)。
 
 ## 当前实现状态
 
-**PAT 阶段补充（2026-10-05，本地源码待交付）**：用户已选择细粒度 PAT，其他身份路线保留。`deliver/resume` 现在要求显式 `--github-pat-file` / `--github-login`，不再使用日常 `gh auth` 凭据；新增 `check-github-auth` 只读预检。CI 改用 `Actions:read` 的 run／jobs REST 接口，固定 `ci.yml`／`validate`，不依赖 Checks API。已安装 wheel 尚未更新，真实 PAT 权限／CI 兼容性／交付未验证。App 的 `agent-run --publish` 仍独立且不可冒充启用。见 [接入说明](docs/pat-setup.md)、[身份备选](docs/identity-options-and-pat-transition.md)与 [ADR 草案](docs/adr-0007-pat-draft.md)。下一轮模板见 [PAT Goal](docs/goal-pat-trial.md)，保存模板不启动 Goal 或授予运行权限。
+**PAT 阶段补充（2026-10-05 提出；相关源码已在后续 PR 中进入 `main`）**：用户已选择细粒度 PAT（正式决策见 [ADR-0007](docs/adr/0007-fine-grained-pat-stage.md)，前身[草案](docs/adr-0007-pat-draft.md)已获批准），其他身份路线保留。`deliver/resume` 要求显式 `--github-pat-file` / `--github-login`，不再使用日常 `gh auth` 凭据；`check-github-auth` 为只读预检。CI 核对改用 `Actions:read` 的 run／jobs REST 接口，固定 `ci.yml`／`validate`，不依赖 Checks API。PAT 试运行工单 `WO-PAT-TRIAL-001-r2` 的编排 R10 已真实运行一次，终态 `review_blocked`（见下方检查点）；PR #31 后从其合并提交重建普通 wheel 安装到 `.venv`，静态安装核验通过，安装版真实端到端交付与真实 PAT 写权限／CI 兼容性仍未验证。App 的 `agent-run --publish` 仍独立且不可冒充启用。见 [接入说明](docs/pat-setup.md)、[交付 Runbook](docs/pat-delivery-runbook.md)与[身份备选](docs/identity-options-and-pat-transition.md)。下一轮模板见 [PAT Goal](docs/goal-pat-trial.md)，保存模板不启动 Goal 或授予运行权限。
 
 **已实现（源码范围）**
 
@@ -30,6 +30,7 @@
 - `WO-PILOT-001-r1`：执行命令退出码 2，原候选提交和运行记录保留；登记问题由 [PR #4](https://github.com/BH2-4/agent-delivery-loop/pull/4) 修复后，没有重跑该工单。人工修正文案、独立审查及 CI 后，通过 [Delivery PR #5](https://github.com/BH2-4/agent-delivery-loop/pull/5) 接纳成果。这不改变原调用失败的事实。
 - `WO-PILOT-002-r1`：使用修复版普通 wheel，`agent-run` 退出码 0，记录为 `local_ready` / `stopped`，临时 HOME 已清理。人工修正文案、独立审查及 CI 后，通过 [Delivery PR #7](https://github.com/BH2-4/agent-delivery-loop/pull/7) 合并进 `main`。原运行记录仍指向 Worker 原始提交，不改写成返修后的 head。
 - 两次记录的 Claude Code CLI 均为 2.1.289，请求配置固定为 `glm-5.3`、BigModel Anthropic 兼容端点和 `max` effort；CC Switch 配置未改动。上述结果仅限这两次调用与低风险文档任务，详见下方[真实 Work Order 检查点](#当前真实-work-order-检查点2026-10-04)。
+- `WO-PAT-TRIAL-001-r2`（PAT 试运行）：安装版编排 R10 真实运行，第一轮独立审查结论 `blocked`，编排按机制停止，终态 `review_blocked`，该历史不改写。R10 候选（仅新增 `docs/pat-delivery-runbook.md`）随后由人工修正文案、独立审查 `pass`，经 [Delivery PR #30](https://github.com/BH2-4/agent-delivery-loop/pull/30) 在人工授权下普通合并。这属于人工接纳既有候选，不代表原 R10 执行成功，也不代表无人值守能力已验证；固定版本证据见下方 [PAT 编排试运行与容量修复检查点](#pat-编排试运行与容量修复检查点2026-10-06)。
 
 **尚未验证**
 
@@ -39,7 +40,7 @@
 - Claude Code 管理员托管策略可能仍适用，当前执行环境的托管策略尚未审计。
 - Work Order 的 `max_budget_usd` 会传入 Claude CLI，但经当前自定义模型端点的实际费用上限语义尚未验证；应按软限制看待。
 - `agent-watch` 的真实发现路径尚未验证；两次工单均直接调用 `agent-run`。只实现手动 `--once`，无跨主机抢单、自动重试或定时器。
-- Codex CLI 安装问题已修复；已有自动启动只读审查、捕获退出码并连接 PR / CI 的单次编排源码，不是长期后台服务。PAT 版本尚未安装或真实验证；交接入口通过不代表语义审查、CI 或交付已经成功。
+- Codex CLI 安装问题已修复；已有自动启动只读审查、捕获退出码并连接 PR / CI 的单次编排源码，不是长期后台服务。PAT 版本已随 PR #31 后重建的普通 wheel 安装，静态安装核验（导入来源、模块一致性、容量常量 192 KiB／64 KiB、CLI 入口）通过；安装版真实端到端交付、真实 PAT 写权限与 CI 兼容性未验证。R10 编排首轮独立审查结论为 `blocked`，交接入口通过不代表语义审查、CI 或交付已经成功。
 - 不调用模型的临时子进程与故障注入回归覆盖启动登记取消、创建阶段未返回句柄的异常、停止未确认后的写入失败/再次取消、门禁读写故障，以及 HOME 清理时取消不得继续交付。真实调用已观察到正常返回及清理，但真实 Claude 的 Ctrl+C、超时、启动故障和脱离进程组的后代行为仍未验证；替身回归不能证明这些真实异常路径。Session ID 会记录，但 transcript 不保存；Session 恢复流程尚未设计。
 
 **后续阶段**：基于这两次文档试运行另行讨论可重复性和代码任务验证、GitHub App/仓库规则验证、Issue 进度讨论、Hermes 手机通知、Steward 自动审查，以及跨主机或自动恢复；当前不自动进入这些阶段。
@@ -274,7 +275,7 @@ Hermes 通知尚未实现。若未来接入，应先只开放输出方向，避�
 | 仓库与主机 | 一个仓库、一台受信任的本地主机 |
 | Worker | 一个固定配置的 Claude Code |
 | 本机执行器语言 | Python |
-| GitHub 写身份 | App 接口保留且未验证；单次编排源码改用显式 PAT，尚待审查、安装与真实权限／交付验证 |
+| GitHub 写身份 | App 接口保留且未验证；编排源码改用显式 PAT 并已进入 `main`、重建 wheel 安装（静态核验通过），真实写权限／端到端交付未验证 |
 | 并发 | 同一时间最多一个任务 |
 | 运行隔离 | 每次使用新会话和独立 worktree |
 | 当前入口 | 手动调用 `agent-run` 或 `agent-watch --once` |
@@ -312,7 +313,7 @@ Hermes 通知尚未实现。若未来接入，应先只开放输出方向，避�
 
 第一遍手动串联流程的操作顺序、问题处理、关键提交和两张工单的证据，单独归档在[第一次人工交付纪实（2026-10-04）](docs/history/2026-10-04-first-manual-delivery.md)。这是历史记录，不随当前实现状态改写，也不构成重跑授权。
 
-下一阶段先减少命令与结果的人工搬运，方案见[人工授权、单次自动串联（proposed）](docs/automation-v1-plan.md)。当前仅试跑会话内的审查与 GitHub 机械步骤；Python 完整编排入口尚未实现，不启用后台服务、自动返修或无人值守发布。
+下一阶段先减少命令与结果的人工搬运，方案见[人工授权、单次自动串联（proposed）](docs/automation-v1-plan.md)。Python 编排入口 `agent-delivery deliver` 已实现并真实运行过一次（R10，终态 `review_blocked`，见下方检查点），其审查、返修与发布链仍以人工授权为前提；不启用后台服务、定时器或无人值守发布，安装版真实端到端交付未验证。
 
 尚未决定的扩展建议单独记录在[后续讨论提案](docs/discussion-backlog.md)，目前包括 GitHub Issue 进度对齐与 CLI Session 归属管理。
 
@@ -442,6 +443,17 @@ Worker 已确认退出但没有完成任务时，保留交付成果与脱敏运�
 
 两份原始运行记录保持不变，仍关联各自 Worker 原始提交；人工推送、PR 创建、返修、审查和合并在 GitHub 另行留痕，不能回填为原执行器自动完成。第二次证明一次正常的人工监督文档闭环，不证明真实异常停止、代码任务、无人值守发布、自动合并或部署。
 
+### PAT 编排试运行与容量修复检查点（2026-10-06）
+
+| 事件 | 固定版本证据 |
+| --- | --- |
+| 编排 R10（`WO-PAT-TRIAL-001-r2`） | 终态 `review_blocked`：第一轮独立审查结论 `blocked`，编排按机制停止；该历史不改写 |
+| R10 候选人工接纳 | 人工修正文案形成提交 `bd61689a0b191e1cb74f410e5337db72efc16162`（仅改 `docs/pat-delivery-runbook.md`，基于 `97f33d98a3b10f329f4c78ca350506c265473b1b`）；独立审查回执 `a68f4252-fa66-4f7d-a0cc-30b4ab71231f` 结论 `pass`（绑定上述 head 与基线）；经 [Delivery PR #30](https://github.com/BH2-4/agent-delivery-loop/pull/30) 在人工授权下普通合并，merge 提交 `4d0ca318f448f92d41a24c6a2b525d50759766a7` |
+| 审查交接容量修复 | 修复提交 `a22db0d62e4c9577f0921ed8b39489dd1e728a4f`，独立只读审查 `pass`、CI 唯一 `validate` 成功，经 [PR #31](https://github.com/BH2-4/agent-delivery-loop/pull/31) 合并，merge 提交 `45c813e5203ba32623695282e4b9511a33458746`；两端 touched 文件内容总量上限由 64 KiB 提高到 192 KiB，Skill 内容维持独立 64 KiB 上限，diff、context、evidence、单文件与文件数限额不变 |
+| 普通 wheel 重建安装 | 从 `45c813e5203ba32623695282e4b9511a33458746` 构建普通 wheel（SHA-256 `a1445558973b8f24f2dc32a33315de16e7452e34a5ed0fbb237ebf92b2818af7`）安装到仓库 `.venv`；静态安装核验（导入来源、模块一致性、容量常量 192 KiB／64 KiB、CLI 入口）通过 |
+
+以上是人工接纳既有候选与源码修复发布，**不是**原 R10 编排执行成功，也**不构成**无人值守能力、真实 PAT 写权限或安装版端到端交付已验证。`docs/pat-delivery-runbook.md` 已随 PR #30 进入 `main`，是当前交付流程说明的权威入口之一；其各节流程属操作要求，已实测能力仅限本检查点与该文开篇列出的固定证据。
+
 ## 安全边界
 
 由于本仓库公开，任何提交到仓库的内容都应被视为公开信息。不得提交：
@@ -487,14 +499,14 @@ GitHub App 的 `Contents:write` 权限也满足合并 PR 接口的权限要求�
 ## 当前状态
 
 ```text
-阶段：两张文档工单已人工接纳；第二张正常执行后的人工交付闭环已完成一次
-可运行代码：Python CLI、Work Order 解析器、单次 watcher 与最小 CI 已有
-生产可用性：不可用；可重复性、代码任务与无人值守安全边界仍待验证
+阶段：两张引导文档工单已人工接纳；PAT 编排 R10 终态 review_blocked，其候选经 PR #30 人工接纳；PR #31 容量修复已合并并重建安装 wheel
+可运行代码：Python CLI、Work Order 解析器、单次 watcher、审查交接与单次编排源码已有
+生产可用性：不可用；可重复性、代码任务、安装版端到端交付与无人值守安全边界仍待验证
 默认执行器：Claude Code CLI，限制为文件工具
 许可证：待确定；源码公开但暂未授权复用
 ```
 
-第一次执行的失败记录保留；第二次执行正常结束。两张文档成果均经人工修正、独立审查、CI 和人工合并进入 `main`，未部署。GitHub App 发布、`main` 保护和无人值守流程仍需另行配置与验证。
+第一次执行的失败记录保留；第二次执行正常结束。两张引导文档成果均经人工修正、独立审查、CI 和人工合并进入 `main`；其后的 Runbook 候选（PR #30）与容量修复（PR #31）同样经独立审查后由人工授权合并。以上均未部署，也不代表无人值守能力已验证。GitHub App 发布、`main` 保护和无人值守流程仍需另行配置与验证。
 
 ## 路线图
 
@@ -562,4 +574,4 @@ The initial version focuses on one problem: turning an already-approved requirem
 
 GitHub is the source of truth. Merging a Plan PR authorizes execution; merging a separate Delivery PR accepts the implementation. Agents cannot approve their own work, merge changes, or deploy automatically.
 
-Two real documentation Work Orders have run and their deliverables were manually accepted into main. The first invocation exited with code 2 after a tuple/list run-record read-back mismatch; its candidate was later manually revised and accepted through Delivery PR #5, without rerunning the task or rewriting its record. After PR #4 fixed the mismatch, the second invocation exited with code 0 and recorded local_ready / stopped. Its document was manually revised, independently reviewed, checked by CI, and accepted through Delivery PR #7. The original run records still reference the Worker commits, not the revised PR heads. This demonstrates one successful, human-supervised normal documentation delivery path, not zero-touch operation, repeatability, or production readiness. GitHub App publishing, main branch protection, real abnormal shutdown, and unattended delivery remain unverified.
+Two real documentation Work Orders have run and their deliverables were manually accepted into main. The first invocation exited with code 2 after a tuple/list run-record read-back mismatch; its candidate was later manually revised and accepted through Delivery PR #5, without rerunning the task or rewriting its record. After PR #4 fixed the mismatch, the second invocation exited with code 0 and recorded local_ready / stopped. Its document was manually revised, independently reviewed, checked by CI, and accepted through Delivery PR #7. The original run records still reference the Worker commits, not the revised PR heads. This demonstrates one successful, human-supervised normal documentation delivery path, not zero-touch operation, repeatability, or production readiness. After that, the PAT trial orchestration R10 (WO-PAT-TRIAL-001-r2) ended review_blocked: its first independent review returned blocked and the orchestration stopped by mechanism. The candidate was manually revised into commit bd61689 (docs/pat-delivery-runbook.md only), received an independent pass review receipt bound to that head, and was merged under human authorization through PR #30; PR #31 then merged a review-handoff capacity fix (touched-content cap raised from 64 KiB to 192 KiB, Skill cap unchanged at 64 KiB), after which a normal wheel was rebuilt from the merge commit and installed with static verification passing. These were human acceptances and fixes, not an original-run success and not a verification of unattended capability. GitHub App publishing, main branch protection, real abnormal shutdown, and unattended delivery remain unverified.
