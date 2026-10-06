@@ -340,6 +340,54 @@ class ReviewIdentityWiringTests(unittest.TestCase):
         path.write_text(json.dumps(record), encoding="utf-8")
         return path
 
+    def test_touched_content_budget_covers_both_commit_sides_and_stays_bounded(self) -> None:
+        import agent_delivery_loop.review_handoff as handoff
+
+        class DocsOrder:
+            def allows_path(self, path: str) -> bool:
+                return path.startswith("docs/")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(Path(temporary))
+
+            def git(*args: str) -> str:
+                return subprocess.run(
+                    ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True,
+                    env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                         "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+                ).stdout.strip()
+
+            sizes = {
+                "docs/README-sized.md": 39_718,
+                "docs/bootstrap-sized.md": 16_221,
+                "docs/pat-setup-sized.md": 10_280,
+            }
+            for path, size in sizes.items():
+                target = repo / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"a" * size)
+            git("add", "docs")
+            git("commit", "-m", "add review-sized baseline files")
+            base = git("rev-parse", "HEAD")
+
+            for path, size in sizes.items():
+                (repo / path).write_bytes(b"b" * size)
+            git("add", "docs")
+            git("commit", "-m", "change review-sized files")
+            head = git("rev-parse", "HEAD")
+
+            self.assertEqual(handoff.MAX_TOUCHED_BYTES, 192 * 1024)
+            self.assertEqual(handoff.MAX_SKILL_BYTES, 64 * 1024)
+            self.assertEqual(handoff._paths(repo, base, head, DocsOrder()), sorted(sizes))
+
+            for path in sizes:
+                (repo / path).write_bytes(b"c" * 50_000)
+            git("add", "docs")
+            git("commit", "-m", "exceed touched content budget")
+            oversized_head = git("rev-parse", "HEAD")
+            with self.assertRaisesRegex(AgentDeliveryError, "Touched file content exceeds"):
+                handoff._paths(repo, base, oversized_head, DocsOrder())
+
     def test_snapshot_builds_the_authenticated_client_from_the_identity(self) -> None:
         import agent_delivery_loop.review_handoff as handoff
 
