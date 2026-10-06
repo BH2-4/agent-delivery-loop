@@ -21,7 +21,8 @@ from .work_order import EvidenceRef, WorkOrder, parse_work_order
 MAX_JSON_BYTES = 64 * 1024
 MAX_DIFF_BYTES = 32 * 1024
 MAX_CONTEXT_BYTES = 96 * 1024
-MAX_TOUCHED_BYTES = 64 * 1024
+MAX_TOUCHED_BYTES = 192 * 1024
+MAX_SKILL_BYTES = 64 * 1024
 MAX_CHANGED_FILES = 100
 MAX_EVIDENCE_BYTES = 48 * 1024
 MAX_EVIDENCE_FILE_BYTES = 32 * 1024
@@ -244,7 +245,7 @@ def _snapshot(
     authorization = client.authorized_plan(number, work_order_path, plan_url)
     order = parse_work_order(authorization.order_bytes, expected_path=authorization.order_path)
     skill = client.content(order.skill_ref, authorization.merge_sha)
-    if not skill or len(skill) > MAX_TOUCHED_BYTES:
+    if not skill or len(skill) > MAX_SKILL_BYTES:
         raise AgentDeliveryError("Authorized Skill is empty or exceeds the review limit.")
     original = _sha(record.get("delivery_commit"))
     expected = {
