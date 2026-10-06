@@ -34,11 +34,8 @@ REPORT_FIELDS = (
     "delivery_commit",
     "delivery_pr",
 )
-# The complete stage vocabulary of the sole record writer (orchestrator.py): its
-# fixed checkpoint literals in pipeline order, plus the bounded rework loop's
-# rework_r{1..MAX_REWORK_ROUNDS}_{started,completed} stages (rework.py caps the
-# budget at 2, so the set is finite). Any other stage value is a structural
-# error: free text must never be echoed into a summary.
+# Stages currently supported by this report command. Any other stage value is a
+# structural error: free text must never be echoed into a summary.
 KNOWN_STAGES = frozenset({
     "created",
     "install_verified",
