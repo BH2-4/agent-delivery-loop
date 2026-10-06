@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "task_id": "WO-B2-REPORT-001",
+  "revision": 1,
+  "objective": "背景：仓库已有单次交付编排记录（JSON，含 orchestration_id、stage、failure、worker、review、candidate 等字段，由现有编排器写入现有状态目录；字段写入逻辑以工作树内 src/agent_delivery_loop/orchestrator.py 为准）。本任务新增 agent-delivery report --orchestration-id <UUID> 子命令：仅离线读取本地编排记录并输出脱敏摘要。功能契约（全部满足）：(1) 沿用现有状态目录定位规则（与 src/agent_delivery_loop/store.py 现有实现一致），仅按经过 UUID 严格校验的编排 ID 定位记录文件；拒绝路径穿越与任意文件路径。(2) 只读目标编排 JSON 本体；不遍历全部运行历史、不追踪记录中出现的任意文件路径、不扫描凭据。(3) 不实例化会产生 mkdir/chmod/写记录等副作用的 RunStore、Orchestration 或其他有副作用的初始化路径；report 分支不得要求 GitHub 或模型认证。(4) 读取设合理大小上限（对齐仓库现有读取上限风格）；拒绝非法 ID、符号链接、非普通文件、损坏 JSON、记录内 ID 与请求 ID 不一致；错误信息仅使用固定安全分类措辞，不透传底层异常文本；失败非零退出。(5) 成功读取一个失败/受阻任务的记录也算报告成功，退出码 0；退出码表示报告读取是否成功，不表示该任务执行成功。(6) 输出为固定少量字段（脱敏白名单），形如（值均为脱敏示例）：orchestration_id=<uuid>；task=<task_id r<revision>>；stage=<已知枚举值>；worker_run_session=<run-id/session-id 或 未记录>；delivery_commit=<完整 SHA 或 未记录>；delivery_pr=<PR 号 或 未记录>；failure_class=<固定安全分类 或 未记录>。字段按记录实际内容取值并校验类型与安全格式（UUID、SHA-256、整数 PR 号、已知枚举）；缺失输出 未记录，不推测事实。(7) 不透传完整 JSON、自由文本错误、命令行、认证来源、本机绝对路径、原始子进程输出或完整会话内容。(8) 语义红线：不因 delivery_pr 字段缺失断言远端无 PR；不把 local_ready 当作合并或部署成功；不把历史编排的后续人工接纳改写为该编排 completed（如原 R10 编排保持 review_blocked 的记录事实）。(9) 命令不联网、不启动模型、不修改任何状态记录或其权限、不改变工单 schema；仅用 Python 标准库，不新增依赖、缓存、数据库、监听器或报告框架。README.md 仅新增一小节简短用法：占位符示例与退出码含义，不出现真实个人路径、凭据位置或真实记录内容。验证分工：Worker 负责实现 src/agent_delivery_loop/report.py（新建）、cli.py 接线、tests/test_report.py（少量高价值聚焦用例）与 README 用法；Worker 运行环境可能无法执行任意命令，不得声称已运行测试或编译，结构化结果如实说明已编写、未运行；实际编译、聚焦测试运行与 CI 由外层可信执行程序负责。若接线确需修改 allowed_paths 之外文件（如打包配置），停止并说明原因，不越界。",
+  "out_of_scope": [
+    "不修改 allowed_paths 之外任何文件；接线需要越界时停止说明，不实施",
+    "不新增依赖或非标准库模块；不建缓存/数据库/监听器/报告框架",
+    "不改动工单 schema、编排器逻辑、审查/发布路径、凭据或权限配置",
+    "不执行任何 GitHub 写操作（发布由外部链路负责）",
+    "不在输出或 README 中暴露真实个人路径、凭据位置、完整记录内容或会话",
+    "不声称已运行测试或编译（如环境受限）；不声称任何远端当前状态（命令为纯离线）"
+  ],
+  "acceptance_criteria": [
+    "仅 src/agent_delivery_loop/cli.py、src/agent_delivery_loop/report.py（新建）、tests/test_report.py、README.md 四个路径被修改",
+    "CLI 接线可用：agent-delivery report --orchestration-id <UUID> 子命令注册成功且 --help 正常",
+    "UUID 严格校验：非法 ID 与路径穿越被拒绝，非零退出，错误为固定分类措辞",
+    "只读定位：沿用 store.py 状态目录规则；不实例化副作用初始化路径；不联网、不读凭据、不要求认证",
+    "读取防御：符号链接、非普通文件、损坏 JSON、记录内 ID 与请求不一致均拒绝且非零退出",
+    "输出恰为白名单字段；缺失字段输出 未记录；输出不含绝对路径、自由文本错误、完整 JSON 或会话内容",
+    "语义红线落实：local_ready 不表述为合并或部署成功；delivery_pr 缺失不断言远端无 PR；人工接纳不改写为原编排 completed",
+    "临时目录中合成记录可同时报告 completed 与 blocked 两类且退出码均为 0",
+    "tests/test_report.py 为少量高价值聚焦用例（合成记录读取、无状态写入、非法/缺失/损坏输入、敏感字段不输出），不做覆盖率工程",
+    "README 新增简短用法小节：占位符示例与退出码含义；无真实路径或凭据",
+    "实现仅用标准库；Worker 如实报告未运行的部分，不假称已验证"
+  ],
+  "allowed_paths": [
+    "src/agent_delivery_loop/cli.py",
+    "src/agent_delivery_loop/report.py",
+    "tests/test_report.py",
+    "README.md"
+  ],
+  "worker_profile": "claude-code-v1",
+  "skill_ref": ".agents/policies/delivery-skill/SKILL.md",
+  "stop_conditions": [
+    "验收所需信息在仓库文件中不存在时停止并报告 blocked，不猜测",
+    "需要修改 allowed_paths 之外任何文件才能完成接线时停止并说明",
+    "对记录字段语义不确定时以 orchestrator.py 写入逻辑为准，仍不确定则停止"
+  ],
+  "limits": {
+    "max_turns": 24,
+    "timeout_seconds": 900,
+    "max_budget_usd": 5
+  },
+  "review_evidence": [
+    {
+      "path": "src/agent_delivery_loop/cli.py",
+      "ref": "13703053ce35523ec187e4ce30e16982b8bd4400",
+      "purpose": "子命令注册与参数接线现状（argparse 结构）"
+    },
+    {
+      "path": "src/agent_delivery_loop/store.py",
+      "ref": "13703053ce35523ec187e4ce30e16982b8bd4400",
+      "purpose": "状态目录定位规则与副作用边界（避免实例化写入路径）"
+    },
+    {
+      "path": "src/agent_delivery_loop/review_cli.py",
+      "ref": "13703053ce35523ec187e4ce30e16982b8bd4400",
+      "purpose": "只读子命令、脱敏输出与固定错误分类的风格参照"
+    }
+  ]
+}
