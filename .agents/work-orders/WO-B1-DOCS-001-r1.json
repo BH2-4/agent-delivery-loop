@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "task_id": "WO-B1-DOCS-001",
+  "revision": 1,
+  "objective": "背景：仓库已完成两次真实合并与一次容量修复发布，但 README.md、docs/bootstrap.md、docs/pat-setup.md 中仍有与之冲突或滞后的状态表述。本任务做一次小范围文档状态更新：只修正过时状态与入口、补齐必要相对链接，保留有价值历史记载，不整篇重写、不重组章节结构。任务要求：(1) 小范围修正过时状态与入口，保留有价值历史；(2) 准确区分已实现、已验证、未验证与后续阶段，不把规范要求写成已实测；(3) 为相关说明补齐指向 docs/pat-delivery-runbook.md 的有效相对链接；(4) 操作示例一律使用占位符，不出现真实个人路径、凭据或令牌文件位置、完整会话内容或本机私有记录。固定事实（以此为准，不得改写为其他结论）：原编排 R10（工单 WO-PAT-TRIAL-001-r2）终态为 review_blocked：其第一轮独立审查结论 blocked，编排按机制停止；该历史不得改写。R10 候选经人工修正文案后形成提交 bd61689a0b191e1cb74f410e5337db72efc16162（改动仅 docs/pat-delivery-runbook.md，基于 97f33d98a3b10f329f4c78ca350506c265473b1b）；独立审查回执 a68f4252-fa66-4f7d-a0cc-30b4ab71231f 结论 pass（绑定上述 head 与基线）；随后经 Delivery PR #30 在人工授权下普通合并，merge 提交 4d0ca318f448f92d41a24c6a2b525d50759766a7。这属于人工接纳既有候选，不代表原 R10 执行成功，也不代表无人值守能力已验证。PR #31 合并了审查交接容量修复（merge 45c813e5203ba32623695282e4b9511a33458746，修复提交 a22db0d62e4c9577f0921ed8b39489dd1e728a4f，独立只读审查 pass，CI 唯一 validate 成功）：两端 touched 文件内容总量上限由 64 KiB 提高到 192 KiB，Skill 内容维持独立 64 KiB 上限，diff、context、evidence、单文件与文件数限额不变。此后从 45c813e5203ba32623695282e4b9511a33458746 构建普通 wheel（SHA-256 a1445558973b8f24f2dc32a33315de16e7452e34a5ed0fbb237ebf92b2818af7）并安装到仓库 .venv，静态安装核验（导入来源、模块一致性、容量常量 192 KiB/64 KiB、CLI 入口）通过；安装版真实端到端交付在本任务开始前未验证。docs/pat-delivery-runbook.md 已随 PR #30 进入 main，是当前交付流程说明的权威入口之一。表述边界：不得声称原 R10 执行成功或长期无人值守能力已验证；不得预先声称本次 B1、后续 B2、GitHub App 发布、OS 级凭据隔离或任何部署已经完成；历史试运行与检查点记载按其当时事实保留，必要时以明确的时间标注区分新旧状态。",
+  "out_of_scope": [
+    "不修改 README.md、docs/bootstrap.md、docs/pat-setup.md 之外的任何文件（包括链接目标文档与其他 docs 文件）",
+    "不重写整篇文档、不重新组织全部章节、不删除有价值历史记载",
+    "不修改执行器源码、测试、CI、工单 schema、协议文件、权限或凭据配置",
+    "不执行任何 GitHub 写操作（推送、PR、合并由外部链路负责）",
+    "不写入任何真实个人路径、凭据或令牌文件位置、完整会话内容或本机私有记录",
+    "不声称未验证的能力（包括本次 B1 自身、B2、App 发布、OS 级凭据隔离、部署）"
+  ],
+  "acceptance_criteria": [
+    "仅 README.md、docs/bootstrap.md、docs/pat-setup.md 三个文件被修改",
+    "与固定事实冲突的过时表述已被修正或明确标注为历史状态；有价值历史记载保留",
+    "已实现、已验证、未验证、后续阶段四类状态区分明确；规范/操作要求不被写成已实测通过",
+    "相关说明包含指向 docs/pat-delivery-runbook.md 的有效相对链接（目标文件在 main 中存在）",
+    "R10 review_blocked、PR #30 人工接纳合并、PR #31 容量修复与普通 wheel 安装均如实记载，且未表述为原执行成功或无人值守能力已验证",
+    "未预先声称 B1、B2、App 发布、OS 级凭据隔离或部署已完成",
+    "操作示例仅使用占位符，全文无真实个人路径、凭据位置、令牌、完整会话或私有记录内容",
+    "文档其余部分（未涉及过时状态的段落）保持不动"
+  ],
+  "allowed_paths": [
+    "README.md",
+    "docs/bootstrap.md",
+    "docs/pat-setup.md"
+  ],
+  "worker_profile": "claude-code-v1",
+  "skill_ref": ".agents/policies/delivery-skill/SKILL.md",
+  "stop_conditions": [
+    "验收所需信息在仓库文件中不存在时停止并报告 blocked，不编造状态",
+    "需要修改 allowed_paths 之外任何文件时停止",
+    "对固定事实与文档内容的取舍不确定时停止并说明，不猜测"
+  ],
+  "limits": {
+    "max_turns": 24,
+    "timeout_seconds": 900,
+    "max_budget_usd": 5
+  },
+  "review_evidence": [
+    {
+      "path": "docs/bootstrap.md",
+      "ref": "45c813e5203ba32623695282e4b9511a33458746",
+      "purpose": "当前检查点、当前边界与试运行记载现状（README 的编辑目标与固定事实已在 objective/验收标准中给定，Worker 在工作树内自行读取）"
+    },
+    {
+      "path": "docs/pat-setup.md",
+      "ref": "45c813e5203ba32623695282e4b9511a33458746",
+      "purpose": "细粒度 PAT 接入、推荐权限与预检说明现状"
+    },
+    {
+      "path": "docs/pat-delivery-runbook.md",
+      "ref": "45c813e5203ba32623695282e4b9511a33458746",
+      "purpose": "需要被相对链接引用的交付 runbook（六主题内容）"
+    }
+  ]
+}
