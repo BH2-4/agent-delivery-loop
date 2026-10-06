@@ -430,6 +430,14 @@ Worker 已确认退出但没有完成任务时，保留交付成果与脱敏运�
 
 失败时命令返回非零并写入脱敏状态；不要手动改写运行记录或直接重用失败 worktree。先检查状态 JSON 和 worktree，再由人决定是否创建新修订。所有变更仍需独立 Codex 审查和 CI；本仓库不自动批准、合并或部署。
 
+### 离线编排报告（agent-delivery report）
+
+```sh
+agent-delivery report --orchestration-id <orchestration-uuid>
+```
+
+读取一条本机编排记录，输出仅含固定白名单字段的单个简短 JSON 摘要（orchestration_id、task、revision、stage、run_id、session_id、delivery_commit、delivery_pr）。命令纯离线：不联网、不启动模型、不读凭据，也不创建目录、修改记录或权限；记录按与执行器一致的状态目录规则定位（默认 `~/.agent-delivery-loop/orchestrations/`，可用 `AGENT_STATE_DIR` 覆盖）。退出码 0 仅表示报告读取成功，不代表任务成功：`completed`、`review_blocked` 等受阻或失败编排同样返回 0；ID 非法、记录缺失或损坏时非零退出，错误为固定脱敏分类。字段缺失输出 null：PR 字段为 null 不代表远端没有 PR，未到合并阶段也不代表已合并或部署。
+
 ### 当前真实 Work Order 检查点（2026-10-04）
 
 | 工单 | 开工授权 | 原始执行结果 | 人工接纳 |
