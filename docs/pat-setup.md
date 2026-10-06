@@ -1,8 +1,8 @@
 # 当前单机阶段：细粒度 PAT 接入
 
-日期：2026-10-05。状态：**本地源码已修改；真实 PAT 接入、安装与交付尚未验证。**
+日期：2026-10-05（状态于 2026-10-06 更新）。状态：**PAT 相关源码已进入 `main`，且当前 `.venv` 安装的是 PR #31 合并提交重建的普通 wheel（静态核验通过）；安装版真实端到端交付、真实 PAT 写权限与 Actions 兼容性尚未验证。**
 
-方案比较保存在[身份备选](identity-options-and-pat-transition.md)，正式决策草案见 [ADR-0007 草案](adr-0007-pat-draft.md)。用户已选择 PAT，但选择路线不等于提供令牌或授权新一轮 GitHub 写操作。本文不启动实验，不延长 ADR-0004/0005/0006 的期限。
+方案比较保存在[身份备选](identity-options-and-pat-transition.md)，正式决策见 [ADR-0007](adr/0007-fine-grained-pat-stage.md)（由[草案](adr-0007-pat-draft.md)批准而来）。用户已选择 PAT，但选择路线不等于提供令牌或授权新一轮 GitHub 写操作。本文不启动实验，不延长 ADR-0004/0005/0006 的期限。PAT 试运行工单 `WO-PAT-TRIAL-001-r2` 的编排 R10 终态为 `review_blocked`，其候选经人工修正后经 PR #30 人工接纳，不代表原执行成功；当前交付流程的操作顺序与门禁见 [PAT 交付 Runbook](pat-delivery-runbook.md)。
 
 ## 1. 本次实际修改
 
@@ -40,7 +40,7 @@
 
 ## 3. 本地保存与首次预检
 
-先经独立审查、提交、合并并按准确源码 SHA 重建普通 wheel。**当前已安装的 wheel 不会随着源码改动自动更新**；不要用 `PYTHONPATH` 冒充安装验证或重新改 editable `.pth`。
+先经独立审查、提交、合并并按准确源码 SHA 重建普通 wheel。**当前已安装的 wheel 不会随着源码改动自动更新**；不要用 `PYTHONPATH` 冒充安装验证或重新改 editable `.pth`。当前 `.venv` 安装的是从 PR #31 合并提交 `45c813e5203ba32623695282e4b9511a33458746` 构建的普通 wheel（SHA-256 `a1445558973b8f24f2dc32a33315de16e7452e34a5ed0fbb237ebf92b2818af7`），静态安装核验（导入来源、模块一致性、容量常量 192 KiB／64 KiB、CLI 入口）通过；安装版真实端到端交付尚未验证。
 
 由用户把令牌保存为仓库外私有文件，推荐 `~/.config/agent-delivery-loop/github.pat`，只存一行 Token。父目录 `0700`，文件 `0600`；使用本地可信编辑／密码管理方式，不在命令历史、聊天或剪贴板日志中保留密钥。程序只读取，不代建密钥或修改权限。不要将它放入项目 `.env`、全局 shell 配置或 Worker 状态目录。
 
@@ -48,12 +48,12 @@
 
 ```sh
 env -u PYTHONPATH .venv/bin/agent-delivery check-github-auth \
-  --github-pat-file "$HOME/.config/agent-delivery-loop/github.pat" \
-  --github-login BH2-4 --pr 24 \
-  --proxy http://127.0.0.1:12451
+  --github-pat-file /path/outside/repository/github.pat \
+  --github-login <expected-login> --pr <existing-pr-number> \
+  --proxy <proxy-url>
 ```
 
-`--pr 24` 只是查询一张已有 PR，不重跑其任务。预期退出码 `0`、状态 `read_access_verified`，账号／仓库／PR／CI 读取字段为真；`write_permissions_verified`、`protection_verified`、`delivery_verified` 仍为假。空检查列表不能证明 CI 通过；预检成功也不能证明推送、建 PR、合并、Token 实际权限边界或到期日已验证。
+`--pr <existing-pr-number>` 只是查询一张已有 PR，不重跑其任务。预期退出码 `0`、状态 `read_access_verified`，账号／仓库／PR／CI 读取字段为真；`write_permissions_verified`、`protection_verified`、`delivery_verified` 仍为假。空检查列表不能证明 CI 通过；预检成功也不能证明推送、建 PR、合并、Token 实际权限边界或到期日已验证。
 
 `GH_TOKEN` 优先于已存登录，本实现仅在必要子进程中设置，并使用临时 `GH_CONFIG_DIR`；不会要求 `gh auth login/logout`。[gh 环境变量](https://cli.github.com/manual/gh_help_environment)
 
@@ -64,7 +64,7 @@ env -u PYTHONPATH .venv/bin/agent-delivery check-github-auth \
 `deliver/resume` 除原有参数外需添加：
 
 ```text
---github-pat-file <outside-repository-private-file> --github-login BH2-4
+--github-pat-file <outside-repository-private-file> --github-login <expected-login>
 ```
 
 路径不是令牌本身，但也不应写进公开简报。真实写操作成功后才能逐项记录“推送／创建 PR／合并已验证”，不能用只读结果或替身回归代替。网络失败、认证失败、格式异常、身份错配或状态不明时停止，保留检查点，不打印原始 `gh` 输出、不换身份、不盲目重放。
