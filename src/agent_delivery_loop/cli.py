@@ -237,6 +237,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     verify_parser.add_argument("--repo-path", type=Path, default=Path.cwd())
     verify_parser.add_argument("--bundle-dir", required=True, type=Path)
     verify_parser.add_argument("--review-record", required=True, type=Path, help="Harness review process record with the captured exit code")
+    report_parser = subparsers.add_parser(
+        "report",
+        help="Print one short sanitized offline JSON summary of a stored orchestration record"
+    )
+    report_parser.add_argument("--orchestration-id", required=True, help="Orchestration UUID of the record to summarize")
     args = parser.parse_args(argv)
     if args.command == "check-github-auth":
         from .publish import probe_github_access
@@ -343,5 +348,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         except Exception as exc:
             return _report_error(exc)
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.command == "report":
+        from .report import build_report
+
+        try:
+            summary = build_report(args.orchestration_id)
+        except Exception as exc:
+            return _report_error(exc)
+        print(json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
         return 0
     return 2
