@@ -4,6 +4,8 @@
 
 **English summary:** A GitHub-native, human-authorized delivery loop for CLI coding agents.
 
+**待办入口：**[项目后续提案](docs/discussion-backlog.md) · [薄启动封装跟踪 #37](https://github.com/BH2-4/agent-delivery-loop/issues/37)。记录与讨论不构成执行授权。
+
 > [!IMPORTANT]
 > 引导阶段两张真实文档 Work Order 已执行并由人接纳进 `main`：第一张执行命令失败，候选成果后来通过 PR #5 人工接纳；第二张 `agent-run` 正常以退出码 0 完成，再经人工修正文案、独立审查、CI 和 PR #7 人工合并。单机、单 Worker、人工监督的正常交付路径已观察到一次成功，**不代表零人工返修、长期稳定或生产可用**。其后 PAT 试运行工单 `WO-PAT-TRIAL-001-r2` 的编排 R10 终态为 `review_blocked`，候选经人工修正后经 PR #30 人工接纳；PR #31 合并审查交接容量修复并重建普通 wheel 安装（静态核验通过）。安装版真实端到端交付与无人值守能力未验证；GitHub App、`main` 保护和无人值守发布仍未验证。当前交付流程说明见 [PAT 交付 Runbook](docs/pat-delivery-runbook.md)。
 
@@ -315,7 +317,7 @@ Hermes 通知尚未实现。若未来接入，应先只开放输出方向，避�
 
 下一阶段先减少命令与结果的人工搬运，方案见[人工授权、单次自动串联（proposed）](docs/automation-v1-plan.md)。Python 编排入口 `agent-delivery deliver` 已实现并真实运行过一次（R10，终态 `review_blocked`，见下方检查点），其审查、返修与发布链仍以人工授权为前提；不启用后台服务、定时器或无人值守发布，安装版真实端到端交付未验证。
 
-尚未决定的扩展建议单独记录在[后续讨论提案](docs/discussion-backlog.md)，目前包括 GitHub Issue 进度对齐与 CLI Session 归属管理。
+尚未实施或仍需讨论的扩展建议单独记录在[后续讨论提案](docs/discussion-backlog.md)，目前包括 GitHub Issue 进度对齐、CLI Session 归属管理与薄启动封装。
 
 ## CCSwitch 的位置
 
