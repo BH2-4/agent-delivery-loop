@@ -23,6 +23,9 @@ from .claude_worker import (
     run_claude,
 )
 from .errors import AgentDeliveryError
+from .execution import ExecutionStore, execution_key
+from .github import GitHubClient, Repo
+from .github_identity import GitHubPAT
 from .git_ops import commit_changes, ensure_diff_clean, stage_changes
 from .runner import _safe_changed_paths, _validate_paths
 from .store import RunStore, now_utc, task_key
@@ -68,6 +71,7 @@ def run_bounded_rework(
     directive: str,
     rework_count_so_far: int,
     expected_skill_sha256: str | None = None,
+    pat_identity: GitHubPAT | None = None,
 ) -> dict[str, Any]:
     """Run one bounded rework round; returns the new candidate head and linkage."""
     if rework_count_so_far >= MAX_REWORK_ROUNDS or not 1 <= rework_index <= MAX_REWORK_ROUNDS:
@@ -75,6 +79,11 @@ def run_bounded_rework(
             f"Bounded rework budget ({MAX_REWORK_ROUNDS}) is exhausted; the candidate cannot be reworked further."
         )
     store.assert_worker_available()
+    if pat_identity is None:
+        raise AgentDeliveryError("Explicit GitHub identity is required for a shared rework launch grant.")
+    owner, repository = repo_slug.split("/")
+    executions = ExecutionStore(GitHubClient(Repo(owner, repository), token=pat_identity.token_for(repo_slug)))
+    shared_key = execution_key(repo_slug, order.task_id, f"r{order.revision}/rework-{rework_index}")
     key = task_key(repo_slug, order.task_id, order.revision)
     rework_id = str(uuid.uuid4())
     runtime_home = store.root / "runtime" / rework_id
@@ -101,6 +110,12 @@ def run_bounded_rework(
     }
     lifecycle = WorkerLifecycle()
     with store.claim(key):
+        grant = executions.acquire(shared_key, claimant_id=store.claimant_id(), request_id=rework_id,
+            binding={"work_order_sha256": order.sha256, "parent_sha": parent_sha,
+                     "directive_sha256": record["directive_sha256"], "skill_sha256": expected_skill_sha256})
+        if grant["new_start"] is not True:
+            raise AgentDeliveryError(f"Rework launch withheld ({grant['result']}); inspect execution key {shared_key}.")
+        record.update(execution_key=shared_key, start_sha=grant["record_sha"], claimant_id=grant["claimant_id"])
         # Same pre-creation gate as the original Worker: persisted and read back.
         store.write(key, rework_id, record)
         try:
@@ -121,6 +136,7 @@ def run_bounded_rework(
             record["status"] = "validating"
             record["worker_status"] = "stopped"
             store.write(key, rework_id, record)
+            executions.complete(grant, session_id=outcome.session_id)
             _safe_changed_paths(worktree, order)
             ensure_diff_clean(worktree)
             staged = stage_changes(worktree)

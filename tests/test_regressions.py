@@ -1390,6 +1390,7 @@ class RunRecordRoundTripTests(unittest.TestCase):
             with (
                 patch("agent_delivery_loop.runner.default_state_dir", return_value=state_dir),
                 patch("agent_delivery_loop.runner.GitHubClient", return_value=github),
+                patch("agent_delivery_loop.runner.ExecutionStore", return_value=Mock(acquire=Mock(return_value={"new_start": True, "result": "new", "record_sha": "a"*40, "claimant_id": "test", "grant_id": "test"}))),
                 patch("agent_delivery_loop.runner.ensure_plan_is_on_main"),
                 patch("agent_delivery_loop.runner.preflight", return_value=(2, 1, 288)),
                 patch("agent_delivery_loop.runner.run_claude", side_effect=fake_worker),
@@ -1400,6 +1401,7 @@ class RunRecordRoundTripTests(unittest.TestCase):
                     plan_pr="https://github.com/BH2-4/agent-delivery-loop/pull/2",
                     work_order_path=order_path,
                     worker_config=worker_config,
+                    pat_identity=GitHubPAT(repository="BH2-4/agent-delivery-loop", expected_login="BH2-4", _token="github_pat_test_only"),
                 )
 
             self.assertEqual(len(commits), 1)
@@ -1684,6 +1686,7 @@ class WorkerSafetyGateTests(unittest.TestCase):
                 ("repository_root", Mock(return_value=root)),
                 ("repository_remote", Mock(return_value=repo)),
                 ("GitHubClient", Mock(return_value=client)),
+                ("ExecutionStore", Mock(return_value=Mock(acquire=Mock(return_value={"new_start": True, "result": "new", "record_sha": "a"*40, "claimant_id": "test", "grant_id": "test"})))),
                 ("preflight", Mock(return_value=(2, 1, 284))),
                 ("ensure_plan_is_on_main", Mock()),
                 ("create_worktree", make_worktree),
@@ -1695,6 +1698,7 @@ class WorkerSafetyGateTests(unittest.TestCase):
                 "plan_pr": "owner/repo#123",
                 "work_order_path": order_path,
                 "worker_config": config,
+                "pat_identity": GitHubPAT(repository="owner/repo", expected_login="owner", _token="github_pat_test_only"),
             }
 
     def _stored_run(self, store):

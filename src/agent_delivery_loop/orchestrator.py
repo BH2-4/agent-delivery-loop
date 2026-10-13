@@ -557,6 +557,14 @@ def _continue_inner(orchestration: Orchestration, params: _Params, *, fresh: boo
             # Unknown safe-end: the gate stays. Only the runner's own verified-safe
             # terminal record (or the verified success path below) can release it.
             raise
+        if agent_run_output.get("new_start") is False:
+            launch = {key: agent_run_output.get(key) for key in (
+                "execution_key", "result", "status", "claimant_id", "claim_sha", "start_sha", "reason",
+            )}
+            orchestration.save(launch=launch)
+            raise AgentDeliveryError(
+                f"Shared Worker launch withheld ({launch['result']}); inspect execution key {launch['execution_key']}."
+            )
         run_id = agent_run_output.get("run_id")
         delivery_branch = agent_run_output.get("delivery_branch")
         delivery_commit = agent_run_output.get("delivery_commit")
@@ -760,6 +768,7 @@ def _review_loop(
                 delivery_branch=delivery_branch, parent_sha=candidate,
                 rework_index=rework_index, directive=directive,
                 rework_count_so_far=rework_state["count"],
+                pat_identity=identity,
             )
             entries = orchestration.record["rework"]["entries"]
             entries.append({

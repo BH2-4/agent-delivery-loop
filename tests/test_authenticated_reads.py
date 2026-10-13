@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from agent_delivery_loop import orchestrator, publish, review_cli, runner
 from agent_delivery_loop.claude_worker import ClaudeConfig
@@ -555,6 +555,7 @@ class TwoLayerStopTests(unittest.TestCase):
                  patch("agent_delivery_loop.runner.preflight", return_value=(0, 1, 0)), \
                  patch("agent_delivery_loop.runner.parse_work_order", return_value=order), \
                  patch("agent_delivery_loop.runner.ensure_plan_is_on_main"), \
+                 patch("agent_delivery_loop.runner.ExecutionStore", return_value=Mock(acquire=Mock(return_value={"new_start": True, "result": "new", "record_sha": "a"*40, "claimant_id": "test", "grant_id": "test"}))), \
                  patch("agent_delivery_loop.runner.create_worktree", side_effect=fake_create_worktree):
                 store = RunStore(base / "state")
                 run_kwargs = dict(

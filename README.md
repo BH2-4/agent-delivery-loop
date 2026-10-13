@@ -9,6 +9,12 @@
 
 ## 当前实现状态
 
+共享防重复启动已迁入源码：普通程序先取得 GitHub 原子启动资格，才进入
+Claude CLI；完成记录保留，启动未知时进入待确认，禁止自动重启。
+直接运行和扫描入口需要显式 GitHub 身份。协议、查询和恢复代价见
+[共享启动资格说明](docs/start-dedupe.md)。真实验证与发布状态以本轮
+[验证报告](docs/start-dedupe-verification.md) 为准；源码合入不代表安装或上线。
+
 **PAT 阶段补充（2026-10-05 提出；相关源码已在后续 PR 中进入 `main`）**：用户已选择细粒度 PAT（正式决策见 [ADR-0007](docs/adr/0007-fine-grained-pat-stage.md)，前身[草案](docs/adr-0007-pat-draft.md)已获批准），其他身份路线保留。`deliver/resume` 要求显式 `--github-pat-file` / `--github-login`，不再使用日常 `gh auth` 凭据；`check-github-auth` 为只读预检。CI 核对改用 `Actions:read` 的 run／jobs REST 接口，固定 `ci.yml`／`validate`，不依赖 Checks API。PAT 试运行工单 `WO-PAT-TRIAL-001-r2` 的编排 R10 已真实运行一次，终态 `review_blocked`（见下方检查点）；PR #31 后从其合并提交重建普通 wheel 安装到 `.venv`，静态安装核验通过，安装版真实端到端交付与真实 PAT 写权限／CI 兼容性仍未验证。App 的 `agent-run --publish` 仍独立且不可冒充启用。见 [接入说明](docs/pat-setup.md)、[交付 Runbook](docs/pat-delivery-runbook.md)与[身份备选](docs/identity-options-and-pat-transition.md)。下一轮模板见 [PAT Goal](docs/goal-pat-trial.md)，保存模板不启动 Goal 或授予运行权限。
 
 **已实现（源码范围）**

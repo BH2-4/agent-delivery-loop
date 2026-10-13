@@ -22,6 +22,7 @@ from .claude_worker import (
     run_claude,
 )
 from .errors import AgentDeliveryError
+from .execution import ExecutionStore, execution_key
 from .git_ops import (
     changed_paths,
     commit_changes,
@@ -279,7 +280,6 @@ def execute_plan(
     store.assert_worker_available(exempt_record=exempt_record)
     run_id = str(uuid.uuid4())
     runtime_home = store.root / "runtime" / run_id
-    version = preflight(config, runtime_home)
 
     if pat_identity is not None:
         # The trusted Python runner performs its authorization reads with the same explicit
@@ -287,7 +287,10 @@ def execute_plan(
         # part of the PAT-mode path. token_for re-checks the repository binding.
         client = GitHubClient(plan_repo, token=pat_identity.token_for(plan_repo.slug))
     else:
-        client = GitHubClient(plan_repo)
+        if app_config is None:
+            raise AgentDeliveryError("An explicit GitHub PAT is required for shared launch records; anonymous execution is disabled.")
+        token = GitHubAppTokenProvider(plan_repo, app_config).installation_token()
+        client = GitHubClient(plan_repo, token=token)
     authorization = client.authorized_plan(number, work_order_path, plan_url)
     order = parse_work_order(authorization.order_bytes, expected_path=authorization.order_path)
     ensure_plan_is_on_main(root, plan_repo, authorization.merge_sha)
@@ -301,6 +304,7 @@ def execute_plan(
 
     task_identity_key = task_key(plan_repo.slug, order.task_id, order.revision)
     auth_key = authorization_key(plan_repo.slug, number, authorization.merge_sha, order.sha256)
+    shared_key = execution_key(plan_repo.slug, order.task_id, f"r{order.revision}")
     branch = f"agent/{order.task_id.lower()}-r{order.revision}-{run_id[:8]}"
     worktree = store.root / "worktrees" / run_id
     record: dict[str, Any] = {
@@ -320,7 +324,8 @@ def execute_plan(
         "skill_sha256": hashlib.sha256(skill_bytes).hexdigest(),
         "authorization_key": auth_key,
         "worker_profile": order.worker_profile,
-        "claude_code_version": ".".join(map(str, version)),
+        "claude_code_version": None,
+        "execution_key": shared_key,
         "requested_model": config.model,
         "requested_effort": config.effort,
         "auth_source": config.auth_source,
@@ -369,10 +374,31 @@ def execute_plan(
                     "The orchestrator spawn gate is bound to a different repository; refusing to run."
                 )
             gate_release_allowed = True
+        executions = ExecutionStore(client)
+        # Retain protection for pre-migration local history too. Such history
+        # cannot silently become a fresh shared execution on this host.
+        if store.has_record(task_identity_key, exempt_record=exempt_record) and executions.inspect(shared_key)["start_sha"] is None:
+            _release_own_spawn_gate(exempt_record if gate_release_allowed else None)
+            return {"execution_key": shared_key, "result": "existing", "new_start": False,
+                    "status": "pending_confirmation", "reason": "retained_local_execution_requires_inspection",
+                    "task_id": order.task_id, "revision": order.revision, "run_id": None}
+        grant = executions.acquire(
+            shared_key, claimant_id=store.claimant_id(), request_id=run_id,
+            binding={"plan_merge_sha": authorization.merge_sha, "work_order_sha256": order.sha256,
+                     "skill_sha256": record["skill_sha256"]},
+        )
+        if grant["new_start"] is not True:
+            _release_own_spawn_gate(exempt_record if gate_release_allowed else None)
+            return {**grant, "task_id": order.task_id, "revision": order.revision, "run_id": None}
+        record["claimant_id"] = grant["claimant_id"]
+        record["start_sha"] = grant["record_sha"]
+        record["grant_id"] = grant["grant_id"]
         # This durable, read-back-verified record is the gate BEFORE any Worker
         # creation. A later failed/interrupted update cannot release it.
         store.write(task_identity_key, run_id, record)
         try:
+            version = preflight(config, runtime_home)
+            record["claude_code_version"] = ".".join(map(str, version))
             create_worktree(root, worktree, branch, authorization.merge_sha)
             skill_path = worktree / PurePosixPath(order.skill_ref)
             try:
@@ -395,6 +421,7 @@ def execute_plan(
             record["status"] = "validating"
             record["worker_status"] = "stopped"
             store.write(task_identity_key, run_id, record)
+            executions.complete(grant, session_id=outcome.session_id)
             _safe_changed_paths(worktree, order)
             ensure_diff_clean(worktree)
             staged = stage_changes(worktree)
@@ -537,18 +564,22 @@ def watch_once(
     repo_path: Path,
     worker_config: ClaudeConfig,
     publish: bool = False,
+    pat_identity: GitHubPAT | None = None,
 ) -> dict[str, Any] | None:
     root = repository_root(repo_path.expanduser().resolve())
     _validate_worker_config_root(root, worker_config)
     repo = repository_remote(root)
     store = RunStore(default_state_dir())
     store.assert_worker_available()
-    client = GitHubClient(repo)
+    if pat_identity is None:
+        raise AgentDeliveryError("An explicit GitHub PAT is required for shared discovery and launch records.")
+    client = GitHubClient(repo, token=pat_identity.token_for(repo.slug))
+    executions = ExecutionStore(client)
     for number, path, url in client.merged_plan_candidates():
         authorization = client.authorized_plan(number, path, url)
         order = parse_work_order(authorization.order_bytes, expected_path=authorization.order_path)
         key = task_key(repo.slug, order.task_id, order.revision)
-        if store.has_record(key):
+        if store.has_record(key) or executions.inspect(execution_key(repo.slug, order.task_id, f"r{order.revision}"))["start_sha"] is not None:
             continue
         return execute_plan(
             repo_path=root,
@@ -556,5 +587,6 @@ def watch_once(
             work_order_path=path,
             worker_config=worker_config,
             publish=publish,
+            pat_identity=pat_identity,
         )
     return None

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import http.client
 import json
 import re
 import time
@@ -37,6 +38,14 @@ class GitHubReadError(AgentDeliveryError):
 
 class GitHubWritePendingError(AgentDeliveryError):
     """A write request's outcome is unknown; it must never be blindly replayed."""
+
+
+class GitHubAPIError(GitHubReadError):
+    """A definite HTTP rejection, distinct from an unknown write outcome."""
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        super().__init__(f"GitHub API request failed with HTTP {status_code}.")
 
 
 def _rate_reset_remaining(headers: Any) -> int | None:
@@ -95,7 +104,7 @@ class GitHubClient:
         self.repo = repo
         self._token = token
 
-    def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+    def request(self, method: str, path: str, payload: dict[str, Any] | None = None, *, expected_status: int | None = None) -> Any:
         if not path.startswith("/") or ".." in path.split("/"):
             raise AgentDeliveryError("Invalid GitHub API path.")
         data = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -129,6 +138,8 @@ class GitHubClient:
             try:
                 with urllib.request.urlopen(request, timeout=attempt_timeout) as response:
                     body = response.read()
+                    if expected_status is not None and response.status != expected_status:
+                        raise GitHubWritePendingError("GitHub returned an unexpected status; no new launch was confirmed.")
                 break
             except urllib.error.HTTPError as exc:
                 try:
@@ -161,8 +172,8 @@ class GitHubClient:
                         f"GitHub write (HTTP {exc.code}) returned a server error; the remote result must be verified read-only."
                     ) from None
                 # 404, 401/403 without rate-limit markers, 4xx: real errors, never retried.
-                raise GitHubReadError(f"GitHub API request failed with HTTP {exc.code}.") from None
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                raise GitHubAPIError(exc.code) from None
+            except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
                 last_failure = f"network ({type(exc).__name__})"
                 if attempt < retries_left and time.monotonic() < deadline:
                     time.sleep(READ_RETRY_DELAYS_SECONDS[attempt])
@@ -180,7 +191,9 @@ class GitHubClient:
             return None
         try:
             return json.loads(body)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            if not is_read:
+                raise GitHubWritePendingError("GitHub write returned unreadable JSON; its outcome is unknown.") from exc
             raise AgentDeliveryError("GitHub returned an unreadable API response.") from exc
 
     def get_pull(self, number: int) -> dict[str, Any]:
