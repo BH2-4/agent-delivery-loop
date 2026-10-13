@@ -76,3 +76,13 @@ Git 对象由服务端自身管理，客户端无法逐一删除。
 全局 CLI 安装保留。`main` 没有 branch protection/ruleset，既有必需 CI 契约为
 `ci.yml` 的精确 head、固定 attempt、唯一成功 `validate`；不使用管理员绕过。
 此次维护 PR 不经过 Worker 交付编排；源代码合入、wheel 验证和正式部署分别记录。
+
+固定实现提交：`614e51ea953551f1dc97c29195aa1ccafa93192a`。该版本真实 ref
+复查（新建、重复、完成后其他领取者重放）通过，未调用模型，合成两条 ref
+删除后再次读取确认不存在。此前基础 API 场景共 8 项通过；保留首轮失败。
+最终版本的 `claude_worker.py` SHA-256 与唯一真实模型冒烟的启动器完全一致。
+
+从该提交构建普通 wheel `agent_delivery_loop-0.1.0-py3-none-any.whl`，SHA-256
+`b99a85856ce55ccce87464a8131d9c1f04850e8696fd547dfa865d03bded8af0`。
+隔离普通安装的 19 个 Python 模块与 wheel 及源码逐字节一致，既有
+`verify_installation`、实际导入来源和新 CLI 帮助入口检查通过；没有更新正式运行环境。
