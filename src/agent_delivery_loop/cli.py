@@ -47,6 +47,14 @@ def _print_result(result: dict[str, object]) -> None:
         "delivery_pr",
         "changed_paths",
         "worktree_id",
+        "execution_key",
+        "result",
+        "new_start",
+        "claimant_id",
+        "claim_sha",
+        "start_sha",
+        "grant_id",
+        "reason",
     )
     print(json.dumps({key: result.get(key) for key in fields}, ensure_ascii=False, indent=2, sort_keys=True))
 
@@ -112,11 +120,18 @@ def agent_run_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--work-order-path", required=True, help="Work Order path changed by that Plan PR")
     parser.add_argument("--repo-path", type=Path, default=Path.cwd(), help="Local clone of the target repository")
     parser.add_argument("--publish", action="store_true", help="Use a verified GitHub App to push and open a Delivery PR")
+    parser.add_argument("--github-pat-file", type=Path)
+    parser.add_argument("--github-login")
     _add_worker_arguments(parser)
     args = parser.parse_args(argv)
     try:
         repo_root, worker_config = _worker_config(args)
         pat_identity = _take_orchestrator_pat(args.plan_pr)
+        if args.github_pat_file is not None or args.github_login is not None:
+            if pat_identity is not None or args.github_pat_file is None or args.github_login is None:
+                raise AgentDeliveryError("Provide exactly one explicit GitHub identity source.")
+            pat_identity = GitHubPAT.from_file(path=args.github_pat_file, repo_root=repo_root,
+                repository=repository_remote(repo_root).slug, expected_login=args.github_login)
         spawn_gate_name = _take_spawn_gate_name(pat_present=pat_identity is not None)
         _print_result(
             execute_plan(
@@ -146,10 +161,13 @@ def agent_watch_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--repo-path", type=Path, default=Path.cwd(), help="Local clone of the target repository")
     parser.add_argument("--publish", action="store_true", help="Require a verified GitHub App and open a Delivery PR")
     _add_worker_arguments(parser)
+    _add_github_identity_arguments(parser)
     args = parser.parse_args(argv)
     try:
         repo_root, worker_config = _worker_config(args)
-        result = watch_once(repo_path=repo_root, worker_config=worker_config, publish=args.publish)
+        identity = GitHubPAT.from_file(path=args.github_pat_file, repo_root=repo_root,
+            repository=repository_remote(repo_root).slug, expected_login=args.github_login)
+        result = watch_once(repo_path=repo_root, worker_config=worker_config, publish=args.publish, pat_identity=identity)
         if result is None:
             print("No eligible merged Work Order was found.")
         else:
@@ -242,7 +260,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Print one short sanitized offline JSON summary of a stored orchestration record"
     )
     report_parser.add_argument("--orchestration-id", required=True, help="Orchestration UUID of the record to summarize")
+    execution_parser = subparsers.add_parser("execution-status", help="Read shared execution claim, start and completion; never relaunch")
+    execution_parser.add_argument("--execution-key", required=True)
+    execution_parser.add_argument("--repo-path", type=Path, default=Path.cwd())
+    _add_github_identity_arguments(execution_parser)
     args = parser.parse_args(argv)
+    if args.command == "execution-status":
+        from .execution import ExecutionStore
+        from .github import GitHubClient
+        try:
+            root = repository_root(args.repo_path.expanduser().resolve())
+            repo = repository_remote(root)
+            identity = GitHubPAT.from_file(path=args.github_pat_file, repo_root=root, repository=repo.slug, expected_login=args.github_login)
+            result = ExecutionStore(GitHubClient(repo, token=identity.token_for(repo.slug))).inspect(args.execution_key)
+        except Exception as exc:
+            return _report_error(exc)
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
     if args.command == "check-github-auth":
         from .publish import probe_github_access
 

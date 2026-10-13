@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -72,6 +73,26 @@ class RunStore:
             self.locks.chmod(0o700)
         _fsync_directory(self.root)
         _fsync_directory(self.root.parent)
+
+    def claimant_id(self) -> str:
+        """Stable local claimant identity; never an execution key or request ID."""
+        path = self.root / "claimant-id"
+        try:
+            try:
+                descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                pass
+            else:
+                with os.fdopen(descriptor, "w") as stream:
+                    stream.write(str(uuid.uuid4()))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                _fsync_directory(self.root)
+            if path.is_symlink():
+                raise ValueError("Unexpected claimant link")
+            return str(uuid.UUID(path.read_text(encoding="ascii")))
+        except (OSError, ValueError) as exc:
+            raise RunStateError("Claimant identity is unreadable; launch is blocked.") from exc
 
     @contextmanager
     def claim(self, key: str, *, exempt_record: Path | None = None) -> Iterator[None]:
@@ -158,10 +179,10 @@ class RunStore:
     def record_path(self, key: str, run_id: str) -> Path:
         return self.runs / key / f"{run_id}.json"
 
-    def has_record(self, key: str) -> bool:
+    def has_record(self, key: str, *, exempt_record: Path | None = None) -> bool:
         directory = self.runs / key
         try:
-            return any(path.suffix == ".json" for path in directory.iterdir())
+            return any(path.suffix == ".json" and path != exempt_record for path in directory.iterdir())
         except FileNotFoundError:
             return False
         except OSError as exc:
