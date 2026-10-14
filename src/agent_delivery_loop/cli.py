@@ -182,6 +182,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     validate_parser = subparsers.add_parser("validate", help="Parse and validate a version 1 Work Order JSON file")
     validate_parser.add_argument("path", type=Path)
+    launch_parser = subparsers.add_parser("launch", help="Start deliver using a private local configuration and an explicit authorized task")
+    launch_parser.add_argument("--config", required=True, type=Path)
+    launch_parser.add_argument("--plan-pr", required=True)
+    launch_parser.add_argument("--work-order-path", required=True)
     for command in ("prepare-review", "check-review", "run-review"):
         review_parser = subparsers.add_parser(command, help="Prepare, check, or run a bounded review-only candidate handoff")
         review_parser.add_argument("--plan-pr", required=True)
@@ -265,6 +269,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     execution_parser.add_argument("--repo-path", type=Path, default=Path.cwd())
     _add_github_identity_arguments(execution_parser)
     args = parser.parse_args(argv)
+    if args.command == "launch":
+        from .launch import launch_arguments
+
+        try:
+            arguments = launch_arguments(args.config, plan_pr=args.plan_pr, work_order_path=args.work_order_path)
+        except Exception as exc:
+            return _report_error(exc)
+        return main(arguments)
     if args.command == "execution-status":
         from .execution import ExecutionStore
         from .github import GitHubClient
