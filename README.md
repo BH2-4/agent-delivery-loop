@@ -15,6 +15,10 @@ Claude CLI；完成记录保留，启动未知时进入待确认，禁止自动�
 [共享启动资格说明](docs/start-dedupe.md)。真实验证与发布状态以本轮
 [验证报告](docs/start-dedupe-verification.md) 为准；源码合入不代表安装或上线。
 
+本地启动可使用 [`agent-delivery launch`](docs/launch.md)：配置一次模型、身份
+和安装版本，之后只指定 Plan PR 与 Work Order，复用既有交付流程。
+两段历史讨论的进度与剩余事项见[合并进度](docs/consolidated-progress.md)。
+
 **PAT 阶段补充（2026-10-05 提出；相关源码已在后续 PR 中进入 `main`）**：用户已选择细粒度 PAT（正式决策见 [ADR-0007](docs/adr/0007-fine-grained-pat-stage.md)，前身[草案](docs/adr-0007-pat-draft.md)已获批准），其他身份路线保留。`deliver/resume` 要求显式 `--github-pat-file` / `--github-login`，不再使用日常 `gh auth` 凭据；`check-github-auth` 为只读预检。CI 核对改用 `Actions:read` 的 run／jobs REST 接口，固定 `ci.yml`／`validate`，不依赖 Checks API。PAT 试运行工单 `WO-PAT-TRIAL-001-r2` 的编排 R10 已真实运行一次，终态 `review_blocked`（见下方检查点）；PR #31 后从其合并提交重建普通 wheel 安装到 `.venv`，静态安装核验通过，安装版真实端到端交付与真实 PAT 写权限／CI 兼容性仍未验证。App 的 `agent-run --publish` 仍独立且不可冒充启用。见 [接入说明](docs/pat-setup.md)、[交付 Runbook](docs/pat-delivery-runbook.md)与[身份备选](docs/identity-options-and-pat-transition.md)。下一轮模板见 [PAT Goal](docs/goal-pat-trial.md)，保存模板不启动 Goal 或授予运行权限。
 
 **已实现（源码范围）**
@@ -28,7 +32,7 @@ Claude CLI；完成记录保留，启动未知时进入待确认，禁止自动�
 - Worker 创建前，先在现有运行记录中持久化并回读验证 `worker_status: start_unconfirmed`，作为“尚未确认安全结束”的门禁；领取任务时检查全部运行记录。Ctrl+C、超时和异常会尝试有界停止 Worker 进程组，但不保证每次都能确认停止。进入创建阶段后，未取得进程句柄也按停止未确认处理，保留 HOME 和门禁；后续状态写入失败或再次取消，启动前记录仍会阻止新任务。只有明确未启动或已确认停止，才可清理 HOME 并写入安全状态。启动登记和停止/HOME 清理关键区短暂延迟 Ctrl+C，取消不会被吞掉后继续交付。记录不可读、格式损坏或缺少安全字段时失败关闭；不自动恢复或清除阻断。
 - 本机任务互斥锁、提交前允许路径检查、提交内容和父提交快照、最终提交路径复核、`git diff --check`、本地 Delivery 分支与私有运行记录。执行器使用单次 Git 命令配置屏蔽钩子，不改用户全局配置，也不删除用户钩子。
 - `agent-watch --once`：单次扫描已合并 Plan PR；不安装定时任务，不运行守护进程。
-- GitHub App 窄权限发布接口；CI 编译源码、运行聚焦回归用例、解析 Work Order schema，并验证示例 Work Order。CI 不会自动检查每张新 Work Order。
+- GitHub App 窄权限发布接口；CI 编译源码、运行聚焦回归用例，并使用 JSON Schema 与 Python 解析器验证正式及示例 Work Order。
 - 审查交接源码入口 `agent-delivery prepare-review` / `check-review`：核对固定授权与候选，准备有限上下文资料包，检查结构化回执；不启动模型、执行任务或发布。`agent-delivery run-review` 进一步亲自启动一次全新只读审查进程并捕获实际退出码、结构化结果与停止确认；`agent-delivery check-evidence` 在 Worker 开工前核对工单 `review_evidence` 固定版本证据就绪；`agent-delivery verify-review` 在网络恢复后复核已捕获的同一回执而不重调模型；写操作（推送/建 PR/合并）经意图持久化与只读结果核对，绝不盲目重放（`publish`）；`changes_required` 触发最多两轮有界返修（全新 Worker 会话、独立返修记录、复用既有安全机制）；`agent-delivery resume` 从已确认阶段安全续接（ADR-0006）；`agent-delivery deliver` 按 [automation-v1 方案](docs/automation-v1-plan.md) 单次串联安装核验、授权核对、Worker、审查、发布、CI 与条件式合并。过去个人 `gh` 实验例外见 ADR-0004/0005/0006，不自动续期；当前源码改用显式 PAT，真实验证仍以新一轮记录为准。
 
 **已观察的真实试运行**

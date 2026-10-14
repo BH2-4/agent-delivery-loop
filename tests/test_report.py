@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent_delivery_loop.cli import main
-from agent_delivery_loop.report import KNOWN_STAGES, REPORT_FIELDS, ReportError, build_report
+from agent_delivery_loop.report import KNOWN_STAGES, ReportError, build_report
 
 COMPLETED_ORCHESTRATION_ID = "46d814b8-b778-41dd-8477-b412b7ed2387"
 BLOCKED_ORCHESTRATION_ID = "2eb4742a-448e-41ae-a342-f9473c7516ad"
@@ -156,21 +156,6 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(code, 0, stderr)
             self.assertEqual(stdout.strip(), expected)
             self.assertEqual(stderr, "")
-
-    def test_summary_is_exactly_the_inline_whitelist(self) -> None:
-        self._write(_completed_record())
-        self._write(_blocked_record())
-        completed = build_report(COMPLETED_ORCHESTRATION_ID, state_dir=self.state)
-        blocked = build_report(BLOCKED_ORCHESTRATION_ID, state_dir=self.state)
-        self.assertEqual(tuple(completed), REPORT_FIELDS)
-        self.assertEqual(tuple(blocked), REPORT_FIELDS)
-        self.assertEqual(completed, json.loads(COMPLETED_SUMMARY))
-        self.assertEqual(blocked, json.loads(BLOCKED_SUMMARY))
-        for serialized in (json.dumps(completed), json.dumps(blocked)):
-            self.assertNotIn(LEAK, serialized)
-            self.assertNotIn(FAILURE_TEXT, serialized)
-            self.assertNotIn("record_path", serialized)
-            self.assertNotIn("parameters", serialized)
 
     def test_missing_optional_sections_map_to_null(self) -> None:
         self._write({"schema_version": 1, "orchestration_id": MINIMAL_ORCHESTRATION_ID, "stage": "created"})

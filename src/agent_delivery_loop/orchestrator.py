@@ -16,6 +16,7 @@ import re
 import signal
 import subprocess
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -170,6 +171,18 @@ def verify_installation(*, receipt_path: Path, expected_source_sha: str, expecte
     # The orchestrator itself must run from that same installed tree, not a source checkout.
     if site_packages not in Path(__file__).resolve().parents:
         raise AgentDeliveryError("The orchestrator is not running from the recorded installed environment.")
+    with zipfile.ZipFile(wheel) as archive:
+        expected_modules = {
+            name.removeprefix("agent_delivery_loop/"): archive.read(name)
+            for name in archive.namelist()
+            if name.startswith("agent_delivery_loop/") and name.endswith(".py")
+        }
+    installed_modules = {
+        path.relative_to(origin.parent).as_posix(): path.read_bytes()
+        for path in origin.parent.rglob("*.py")
+    }
+    if installed_modules != expected_modules:
+        raise AgentDeliveryError("Installed Python modules do not match the approved wheel.")
     return {
         "source_sha": receipt["source_sha"],
         "wheel_sha256": receipt["wheel_sha256"],

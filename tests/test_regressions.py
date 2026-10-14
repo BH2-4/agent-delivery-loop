@@ -12,9 +12,11 @@ import fcntl
 import subprocess
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from contextlib import ExitStack, contextmanager, redirect_stderr
 from io import StringIO
+from itertools import count
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
@@ -122,10 +124,10 @@ class ReviewCliProcessTests(unittest.TestCase):
             encoding="utf-8",
         )
         sleeping.chmod(0o700)
-        with patch("agent_delivery_loop.review_cli.MIN_REVIEW_TIMEOUT_SECONDS", 1):
+        with patch("agent_delivery_loop.review_cli.MIN_REVIEW_TIMEOUT_SECONDS", 0.1):
             with self.assertRaises(AgentDeliveryError) as raised:
                 run_review_process(
-                    bundle_dir=self.bundle, timeout_seconds=1, review_model="m",
+                    bundle_dir=self.bundle, timeout_seconds=0.1, review_model="m",
                     review_effort="high", codex_binary=str(sleeping),
                 )
         self.assertIn("time limit", str(raised.exception))
@@ -179,17 +181,24 @@ class InstallVerificationTests(unittest.TestCase):
             encoding="utf-8",
         )
         fake_python.chmod(0o700)
+        package = base / "venv" / "lib" / "python3" / "site-packages" / "agent_delivery_loop"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_bytes(b"# installed fixture\n")
+        (package / "report.py").write_bytes(b"REPORT_VERSION = 1\n")
         wheel = base / "approved.whl"
-        wheel.write_bytes(b"wheel-bytes")
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("agent_delivery_loop/__init__.py", b"# installed fixture\n")
+            archive.writestr("agent_delivery_loop/report.py", b"REPORT_VERSION = 1\n")
+        wheel_sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
         receipt = base / "receipt.json"
         receipt.write_text(json.dumps({
             "schema_version": 1,
             "source_sha": "a" * 40,
-            "wheel_sha256": hashlib.sha256(b"wheel-bytes").hexdigest(),
+            "wheel_sha256": wheel_sha,
             "venv_bin": str(venv_bin),
             "wheel_path": str(wheel),
         }), encoding="utf-8")
-        return receipt, venv_bin, "a" * 40, hashlib.sha256(b"wheel-bytes").hexdigest()
+        return receipt, venv_bin, "a" * 40, wheel_sha
 
     def test_matching_receipt_with_site_packages_origin_passes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -200,6 +209,24 @@ class InstallVerificationTests(unittest.TestCase):
                     receipt_path=receipt, expected_source_sha=source_sha, expected_wheel_sha256=wheel_sha
                 )
             self.assertTrue(verified["agent_run_entry"].endswith("agent-run"))
+
+    def test_installed_modules_must_match_approved_wheel(self) -> None:
+        for change in ("modified", "missing", "extra"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                receipt, _, source_sha, wheel_sha = self._environment(base)
+                package = base / "venv" / "lib" / "python3" / "site-packages" / "agent_delivery_loop"
+                if change == "modified":
+                    (package / "report.py").write_bytes(b"REPORT_VERSION = 2\n")
+                elif change == "missing":
+                    (package / "report.py").unlink()
+                else:
+                    (package / "extra.py").write_bytes(b"# stale module\n")
+                with patch("agent_delivery_loop.orchestrator.__file__", str(package / "orchestrator.py")):
+                    with self.assertRaisesRegex(AgentDeliveryError, "Installed Python modules"):
+                        verify_installation(
+                            receipt_path=receipt, expected_source_sha=source_sha, expected_wheel_sha256=wheel_sha
+                        )
 
     def test_mismatched_provenance_and_editable_origin_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -734,6 +761,8 @@ class CiWaitTests(unittest.TestCase):
         for fixture in (self.api_fixture(head="d" * 40), self.api_fixture(total=101), self.api_fixture(missing=True)):
             with patch("agent_delivery_loop.publish.CI_POLL_SECONDS", 0), patch(
                 "agent_delivery_loop.publish.gh_json", side_effect=fixture,
+            ), patch(
+                "agent_delivery_loop.publish.time.monotonic", side_effect=count(step=0.1),
             ):
                 with self.assertRaises(AgentDeliveryError):
                     _wait_for_ci(repo_slug="o/r", pr_number=1, head_sha="c" * 40, timeout_seconds=1, proxy=None, identity=TEST_PAT_IDENTITY)

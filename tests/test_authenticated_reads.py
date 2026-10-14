@@ -928,7 +928,12 @@ class SpawnGateTests(unittest.TestCase):
             store = self._store(Path(temporary))
             key = "k"
             gate = store.record_path(key, "spawn-abcd1234")
-            store.write(key, "spawn-abcd1234", orchestrator._spawn_gate_record("abcd1234-full", key, "o/r"))
+            record = orchestrator._spawn_gate_record("abcd1234-full", key, "o/r")
+            self.assertEqual(record["worker_status"], "start_unconfirmed")
+            self.assertEqual(record["status"], "starting")
+            self.assertEqual(record["task_key"], key)
+            self.assertEqual(record["repository"], "o/r")
+            store.write(key, "spawn-abcd1234", record)
             # Real blocking: every launch check refuses while the gate is unresolved.
             with self.assertRaises(RunStateError):
                 store.assert_worker_available()
@@ -965,25 +970,6 @@ class SpawnGateTests(unittest.TestCase):
             with self.assertRaises(RunStateError):
                 store.assert_worker_available()
 
-    def test_single_phase_gate_blocks_every_entry_before_creation(self) -> None:
-        from agent_delivery_loop.store import RunStateError
-
-        with tempfile.TemporaryDirectory() as temporary:
-            store = self._store(Path(temporary))
-            # There is no non-blocking pending phase: the gate written BEFORE the
-            # creation phase blocks every ordinary safety scan immediately, and the
-            # record binds itself to one authorized task and repository.
-            record = orchestrator._spawn_gate_record("abcd1234-full", "k", "o/r")
-            self.assertEqual(record["worker_status"], "start_unconfirmed")
-            self.assertEqual(record["status"], "starting")
-            self.assertEqual(record["task_key"], "k")
-            self.assertEqual(record["repository"], "o/r")
-            store.write("k", "spawn-abcd1234", record)
-            with self.assertRaises(RunStateError):
-                store.assert_worker_available()
-            with self.assertRaises(AgentDeliveryError):
-                orchestrator._preflight_spawn_gates(store)
-
 
 class StrictBudgetTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1013,9 +999,6 @@ class StrictBudgetTests(unittest.TestCase):
                 publish.run_gh_read(["api", "user"], identity=identity, timeout=3.5)
         self.assertTrue(1 <= len(captured) <= 3)
         self.assertLessEqual(max(captured), 3.5)
-        # Attempts never get a longer timeout than the budget that is left,
-        # and never more than the single-call ceiling.
-        self.assertLessEqual(max(captured), 3.5 + 1e-9)
         for value in captured:
             self.assertGreater(value, 0.0)
 
