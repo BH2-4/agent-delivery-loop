@@ -13,15 +13,15 @@ Work Order v1、`agent-run`、`agent-watch` 和 Claude Worker 保持原有权限
 迁移或扩大授权。公共任务与回执不要求任务目标是 Git 仓库或代码 PR。安装/更新本地
 Skill 与 CLI 也是目标的一部分；远端机制更新不能代替本地接入件更新。
 
-当前接续：分支 `feat/autonomous-pull` 基于 clean `main` 的
-`2da14671acc879ba6fa69797cbacba08f8f6973b`。Pull 核心、Skill 和 installer 源码已完成；
-Python compileall、Skill quick_validate、两种已知安装激活中断恢复模拟、空格路径 launcher
-smoke、active receipt/SHA 对齐检查通过，独立代码审查无 P1/P2。隔离 wheel 曾在最终门禁
-修复前构建成功，修复后未重复完整 wheel 构建。
+当前接续：[PR #43](https://github.com/BH2-4/agent-delivery-loop/pull/43) 已将 pull 核心、
+Skill 和 installer 合入 `main`。合并前的 Python compileall、Skill quick_validate、两种已知
+安装激活中断恢复模拟、空格路径 launcher smoke、active receipt/SHA 对齐检查通过，独立代码
+审查无 P1/P2。隔离 wheel 曾在最终门禁修复前构建成功，修复后未重复完整 wheel 构建。
 
-真实 wheel 安装、本机从固定来源/ref 执行安装与更新、GitHub acquire/report 写入，以及用户
-已有 scheduler/harness 的真实轮次都未运行。当前未验证项不得从编译、临时目录模拟或旧路线
-真实运行推断完成；真实轮次只要求一台电脑和一张新授权任务，不强制多端试用。
+接续下一步是从 `main` 完成真实来源安装/更新，再通过用户已有 scheduler/harness 执行一次
+真实本机定时轮次并核对共享回执。真实 wheel 安装、固定来源安装与更新、GitHub 任务领取和
+回执写入、用户已有 scheduler/harness 的真实轮次尚未运行。当前未验证项不得从编译、临时目录
+模拟或旧路线真实运行推断完成；真实轮次只要求一台电脑和一张新授权任务，不强制多端试用。
 
 ## 上一阶段结果（历史证据保留）
 

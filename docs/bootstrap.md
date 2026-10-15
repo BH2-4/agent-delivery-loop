@@ -18,8 +18,9 @@
 
 当前主线接班、审查分支和准确 SHA、独立 bootstrap venv、`agent-pull-install` 的完整
 命令、PAT 文件路径配置、更新后停止规则，以及可复制的原生定时提示词统一维护在
-[自主拉取计划](pull-mode-plan.md)。`agent-pull` 当前未合入 `main`；在该流程实际完成前，
-不要把静态检查、临时目录模拟或 wheel 构建说成真实来源安装、GitHub 写操作或定时轮次已通过。
+[自主拉取计划](pull-mode-plan.md)。PR #43 已将 `agent-pull` 合入 `main`，安装和更新来源使用
+`main`。在真实流程完成前，不要把静态检查、临时目录模拟或 wheel 构建说成真实来源
+安装/更新、GitHub 任务领取与回执写入或本机定时轮次已通过。
 
 ## PAT 阶段补充（2026-10-05）
 
