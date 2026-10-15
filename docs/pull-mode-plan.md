@@ -1,8 +1,8 @@
 # Autonomous Pull 主线计划
 
-**工程状态（2026-10-15）：**pull 核心、Skill 与本地安装/更新入口已实现；定向静态检查
-和代码审查通过。普通 wheel 未在最新门禁修复后重建；真实来源安装/更新、GitHub 写操作
-和用户已有 harness 的定时轮次尚未验证。
+**工程状态（2026-10-15）：**PR #43 已将 pull 核心、Skill 与本地安装/更新入口合入
+`main`；定向静态检查和代码审查通过。普通 wheel 未在最新门禁修复后重建；真实来源安装/更新、
+GitHub 任务领取与回执写入、用户已有 harness 的定时轮次尚未验证。
 
 ## 目标与约束
 
@@ -79,8 +79,8 @@ Agent，也不创建调度器、守护进程或跨电脑唤醒服务。
 
 1. 先用审查过的普通 wheel 在独立 Python 3.11+ bootstrap venv 安装
    `agent-pull-install`。第一次启动不是从浮动 PyPI 包或任意在线 URL 下载。
-2. 安装器只接受固定的 HTTPS GitHub `OWNER/REPO` 和一个 branch ref。首期源码未合入
-   `main` 时显式用 `--ref feat/autonomous-pull`；ref 必须是分支名，不支持 SHA ref。
+2. 安装器只接受固定的 HTTPS GitHub `OWNER/REPO` 和一个 branch ref。PR #43 已将首期源码合入
+   `main`，安装和更新使用 `--ref main`；ref 必须是分支名，不支持 SHA ref。
    安装器 fetch 后解析精确 commit SHA，从该提交构建普通 wheel，校验 wheel 内 Skill
    摘要；版本化 venv 与版本回执放入 managed root，渲染后的 Skill 写入明确指定的
    `--skill-dir`。回执记录
@@ -95,7 +95,8 @@ Agent，也不创建调度器、守护进程或跨电脑唤醒服务。
 
 **验收与已观察项：**`compileall`、Skill quick_validate、空格路径 launcher smoke、两类
 激活中断恢复模拟与 active receipt/SHA 对齐检查通过；隔离 wheel 曾成功构建，但最新门禁
-修复后未重建。没有真实安装该 wheel、从 GitHub 更新实际来源、GitHub 写入或宿主定时验证；
+修复后未重建。没有真实安装该 wheel、从 GitHub 更新实际来源、GitHub 任务领取/回执写入
+或宿主定时验证；
 因此本地安装/更新在真实用户路径上仍标为未验证。远程机制更新不替代本地安装件更新验收。
 
 ### 阶段 3：按真实需求扩展来源和接入
@@ -106,10 +107,10 @@ Agent，也不创建调度器、守护进程或跨电脑唤醒服务。
 
 ## 首次接入和一次定时轮次
 
-当前 pull 代码未合入 `main`。先在受信环境从精确审查 SHA 构建/取得普通 wheel，并在
-独立 bootstrap venv 安装它；安装器首次 fetch 时会用固定分支解析实际 `source_sha`，不
-支持 SHA 作为 `--ref`。必须核对输出 `source_sha` 等于预期审查 SHA；分支已移动、SHA
-不一致或来源不符时停止。审查分支可用时的 POSIX 示例：
+PR #43 已将 pull 代码合入 `main`。先核对 `main` 的准确提交，在受信环境准备 bootstrap
+wheel 并安装到独立 bootstrap venv；安装器首次 fetch 时用 `--ref main` 解析实际
+`source_sha`，不支持 SHA 作为 `--ref`。必须核对输出 `source_sha` 等于事先核对的 `main`
+提交；`main` 已移动、SHA 不一致或来源不符时停止。POSIX 示例：
 
 ```sh
 python3.11 -m venv "$HOME/.local/share/agent-delivery-loop/bootstrap-venv"
@@ -117,7 +118,7 @@ python3.11 -m venv "$HOME/.local/share/agent-delivery-loop/bootstrap-venv"
   "/absolute/path/agent_delivery_loop-<review-sha-wheel>.whl"
 "$HOME/.local/share/agent-delivery-loop/bootstrap-venv/bin/agent-pull-install" \
   --source https://github.com/BH2-4/agent-delivery-loop.git \
-  --ref feat/autonomous-pull \
+  --ref main \
   --root "$HOME/.local/share/agent-delivery-loop/pull" \
   --skill-dir "$HOME/.agents/skills/agent-pull"
 ```
@@ -164,7 +165,7 @@ watcher，不改远程默认分支，不自动合并或部署。
 
 ## 状态与接班
 
-当前状态：core 与 installer 实现、代码审查和定向静态检查已完成；最新源码编译通过，
-installer 的隔离 wheel 未在最后修复后重建。真实来源安装/更新、GitHub 写操作与用户已有
-harness 定时轮次尚未验证。下次更新记录实际 source SHA、任务修订和共享回执，不把模拟或
-编译结果说成真实轮次。
+当前状态：PR #43 已将 core 与 installer 合入 `main`；代码审查和定向静态检查已完成，最新
+源码编译通过，installer 的隔离 wheel 未在最后修复后重建。真实来源安装/更新、GitHub 任务
+领取与回执写入、用户已有 harness 定时轮次尚未验证。下一步从 `main` 完成真实来源安装/更新，
+再由本机定时 harness 执行一次真实轮次并核对共享回执；在此之前不把模拟或编译结果说成真实轮次。

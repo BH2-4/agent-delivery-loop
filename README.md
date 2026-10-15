@@ -19,7 +19,7 @@ Agent。安装的接入件核验任务授权和固定上下文，能力匹配后
 
 后文 Work Order、`agent-run`、Claude Worker 和旧路线图记录的是已实现的 v0 路径与历史
 证据，不是当前产品主线。Pull 核心、Skill 与安装/更新代码已实现；编译、静态验证及代码
-审查通过。实际安装更新来源、GitHub 写操作和真实定时轮次尚未验证。
+审查通过。实际安装/更新来源、GitHub 任务领取与回执写入、真实定时轮次尚未验证。
 
 > [!IMPORTANT]
 > 引导阶段两张真实文档 Work Order 已执行并由人接纳进 `main`：第一张执行命令失败，候选成果后来通过 PR #5 人工接纳；第二张 `agent-run` 正常以退出码 0 完成，再经人工修正文案、独立审查、CI 和 PR #7 人工合并。单机、单 Worker、人工监督的正常交付路径已观察到一次成功，**不代表零人工返修、长期稳定或生产可用**。其后 PAT 试运行工单 `WO-PAT-TRIAL-001-r2` 的编排 R10 终态为 `review_blocked`，候选经人工修正后经 PR #30 人工接纳；PR #31 合并审查交接容量修复并重建普通 wheel 安装（静态核验通过）。安装版真实端到端交付与无人值守能力未验证；GitHub App、`main` 保护和无人值守发布仍未验证。当前交付流程说明见 [PAT 交付 Runbook](docs/pat-delivery-runbook.md)。
@@ -607,7 +607,7 @@ GitHub App 的 `Contents:write` 权限也满足合并 PR 接口的权限要求�
 
 ## English summary
 
-The current direction is a human-authorized pull loop: each user's existing local schedule wakes the current agent, which validates a fixed task revision, acquires shared permission, performs the work with its local tools, and reports a shared receipt. The adapter does not launch another agent or add a central scheduler. The first planned source is a merged GitHub Plan PR; the public task semantics remain source- and deliverable-neutral. Core, Skill, and installer code are implemented and static checks have passed. Actual source installation/update, GitHub writes, and a real scheduled round remain unverified. See [the pull-mode plan](docs/pull-mode-plan.md).
+The current direction is a human-authorized pull loop: each user's existing local schedule wakes the current agent, which validates a fixed task revision, acquires shared permission, performs the work with its local tools, and reports a shared receipt. The adapter does not launch another agent or add a central scheduler. The first planned source is a merged GitHub Plan PR; the public task semantics remain source- and deliverable-neutral. Core, Skill, and installer code are implemented and static checks have passed. Actual source installation/update, GitHub task acquisition and receipt writes, and a real scheduled round remain unverified. See [the pull-mode plan](docs/pull-mode-plan.md).
 
 The existing Python runner is the legacy v0 path: it uses Plan PR and Work Order v1 authorization with a fixed Claude Code worker. Its implementation and run records below remain historical evidence and retain their original authorization semantics.
 
