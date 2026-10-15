@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "task_id": "WO-ADL-HANDOFF-001",
+  "revision": 1,
+  "objective": "为 Agent Delivery Loop 交付一个马上可用的‘一句话接班’入口。新增 .agents/skills/adl/SKILL.md（Codex 仓库级入口）和 .claude/skills/adl/SKILL.md（Claude Code 仓库级入口）；二者具有合法 YAML frontmatter，name 为 adl，description 明确适用于‘接班这个项目’、了解当前进度与下一步，只做接班梳理。两个入口保持简短，均指向仓库根目录 docs/bootstrap.md 中新增的‘一句话接班’节；详细流程只维护在该节，不在 Skill 中重复历史或状态。仅在 README.md 增加易发现的使用入口。接班流程读取适用仓库规则、README 与 docs/consolidated-progress.md，结合当前 Git 分支/工作树/最近提交及可用的相关 PR、安装回执版本信息、已有编排摘要，区分已合入代码、当前安装、真实交付和未知项；有相关编排 ID 且安装入口可用时，复用 agent-delivery report --orchestration-id，不增加状态文件或数据库。优先当前代码与实际记录，历史记录按原状态保留，不把旧 review_blocked 改写为成功；没有网络、安装或运行记录时说明缺口并继续可做的只读梳理，不为接班自动安装或索要凭据。不要通读全部历史日志、完整会话或认证文件；仅按需读取相关摘要与版本字段，不展示凭据、认证值或本机私有路径。最后简短汇报当前完成情况、实际阻塞及一个推荐下一步；接班本身不启动 Worker，不执行 launch/deliver/resume，不推送、合并、安装、部署或清理状态；接班结束后的执行服从用户明确的新指令与现有授权流程。README 说明在目标仓库的新会话中使用：支持 Skill 发现时可说‘接班这个项目’，Codex 可显式调用 $adl，Claude Code 可显式调用 /adl；其他环境的通用后备句为‘读取本仓库 docs/bootstrap.md，按一句话接班流程只读接班。’这些是对话入口，不是终端程序；不宣称能恢复旧会话记忆，也不保证所有 Agent 都自动发现 Skill。保持本轮为短小文档/Skill 变更，不扩建执行平台。",
+  "out_of_scope": [
+    "不修改 Python 源码、测试、CI、打包、工单、协议或 .agents/policies/delivery-skill/SKILL.md",
+    "不新增脚本、状态存储、全局 Skill 安装、定时器、通知、模型路由或多步骤调度框架",
+    "不修改历史运行记录，不重跑旧工单，不把源码合入描述为安装、部署或真实业务成功",
+    "不进行 GitHub 写操作、模型调用、安装、部署或凭据读取；外部控制程序负责本轮交付",
+    "不整篇重写 README 或 bootstrap；仅增加接班入口和必要说明"
+  ],
+  "acceptance_criteria": [
+    "变更仅涉及 README.md、docs/bootstrap.md、.agents/skills/adl/SKILL.md 和 .claude/skills/adl/SKILL.md；两个 Skill 是普通文件，不使用符号链接",
+    "两个 Skill 均有 name: adl 和非空 description 的合法 YAML frontmatter，能据描述匹配接班请求；正文各不超过 40 行，并指向共用接班说明",
+    "docs/bootstrap.md 的新增接班节规定按需只读核对源码、安装、真实运行状态与未知项，复用现有 report，缺少条件时如实汇报，保留失败历史",
+    "接班说明明确不启动任务、不进行写操作、不继承旧执行授权，不读取或展示认证文件、凭据和完整会话，不新增状态副本",
+    "README 提供自然语言、Codex $adl、Claude Code /adl 及通用后备句，并说明须在目标仓库会话中使用、对话入口不等于终端命令",
+    "接班报告保持简短，覆盖当前完成情况、阻塞或未核对项、一个推荐下一步；正文链接有效，示例不含本机私有路径",
+    "没有增加测试或测试框架，不宣称本轮 Skill 已经在全新真实会话中验证或保证自动发现；实际使用问题留待使用反馈"
+  ],
+  "allowed_paths": [
+    "README.md",
+    "docs/bootstrap.md",
+    ".agents/skills/adl/SKILL.md",
+    ".claude/skills/adl/SKILL.md"
+  ],
+  "worker_profile": "claude-code-v1",
+  "skill_ref": ".agents/policies/delivery-skill/SKILL.md",
+  "stop_conditions": [
+    "需要修改允许范围以外的文件或更改现有执行授权机制时停止并报告",
+    "需要读取凭据、写入私有配置或声称不存在的运行结果时停止",
+    "受限工具无法写入允许的新 Skill 文件时报告实际阻塞，不尝试放宽权限或绕过执行器"
+  ],
+  "limits": {"max_turns": 24, "timeout_seconds": 900, "max_budget_usd": 5},
+  "review_evidence": [
+    {"path": "docs/consolidated-progress.md", "ref": "1408cf90ac93b5d97b2fda3b14ca25ab1a3f0bbc", "purpose": "最新合并进度与尚未决定事项；接班应按需引用，不能硬编码成永久状态"},
+    {"path": "docs/launch.md", "ref": "1408cf90ac93b5d97b2fda3b14ca25ab1a3f0bbc", "purpose": "launch 是实际启动交付的终端入口；接班 Skill 不调用或替代它"},
+    {"path": "src/agent_delivery_loop/report.py", "ref": "1408cf90ac93b5d97b2fda3b14ca25ab1a3f0bbc", "purpose": "既有 report 的离线摘要能力、字段白名单和缺失信息语义"},
+    {"path": "src/agent_delivery_loop/cli.py", "ref": "1408cf90ac93b5d97b2fda3b14ca25ab1a3f0bbc", "purpose": "既有 report --orchestration-id 的真实参数和其他交付入口边界"}
+  ]
+}
