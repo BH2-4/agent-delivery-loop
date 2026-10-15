@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "task_id": "PULL-PILOT-001",
+  "revision": 1,
+  "goal": "读取固定项目上下文，生成中文进度简报并通过共享回执返回。",
+  "instructions": "只依据任务包固定上下文和本轮可读到的 agent-pull 命令结果、宿主唤醒元数据，写一段约250—600汉字的中文简报，覆盖当前方向、已实现、实际观察和下一步。两份固定文档来自提交0992511；较新的用户反馈是：外部ZCode已从main构建wheel，经bootstrap venv和agent-pull-install真实fetch安装，source SHA一致；updater返回current；原生每小时任务已保存启用。此前带PAT的discover扫描30个merged PR返回0候选，当时main没有.agents/pull-tasks。PAT配置已存在；运行CLI所需时可从用户既有本机私有配置读取并使用repo、authority_branch、PAT文件路径和expected_login，但不得读取、展示或共享token值，简报不得包含PAT路径或值。扫描周期以本机实际配置及本轮证据为准，无本轮宿主证据不得声称3分钟扫描已生效。任务编写时真实版本升级、自动唤醒和共享acquire/report尚未观察；运行时可依据本轮证据更新，updater返回current仅证明更新检查结果。将固定文档状态与较新反馈并列说明，无法核实处标为未确认；completed仅表示简报已回传。",
+  "scope": {
+    "constraints": [
+      "只读任务包固定上下文、本轮agent-pull命令结果、当前宿主唤醒元数据，以及运行CLI所需的本机既有私有配置项repo、authority_branch、PAT文件路径和expected_login；不外网搜索。",
+      "只有本任务本轮新返回can_execute=true后才开始；先report running，结束时报告completed、blocked或failed。",
+      "若授权或写入结果为pending、unknown或无法确认，按协议只读status后停止；不重领、不重报、不接管、不自动继续。",
+      "共享写入仅限本任务自己的claim、start和receipt；本机私有grant及运行元数据仅限本任务所需。产物放在receipt.summary，artifacts可为空。",
+      "不修改工作仓库或其他文件；本任务所需的私有grant和运行元数据按协议写入除外。不创建PR、issue、Skill，不合并、部署、安装或改调度器。",
+      "不启动第二个Agent或外部模型进程，不读取token值或transcript，不在简报或共享回执中披露PAT文件路径或值。"
+    ]
+  },
+  "acceptance_criteria": [
+    "简报为约250—600汉字，涵盖当前方向、已实现、实际观察和下一步。",
+    "区分固定文档的旧状态、用户报告的真实观察和本轮可验证证据；不把current解释为真实升级。",
+    "只在宿主元数据证实时描述本轮唤醒；扫描周期以本机配置和本轮证据为准，无证据不得声称已生效，有证据则如实说明。",
+    "仅将简报写入本任务共享receipt.summary，并按协议报告最终状态。"
+  ],
+  "required_capabilities": [
+    "repository-read",
+    "shared-receipt-write"
+  ],
+  "context": [
+    {
+      "path": "docs/pull-mode-plan.md",
+      "sha256": "0aa10f868b7cd2068e1d8cf88c18b77db473108041df5b7b82f188dbeab99de6"
+    },
+    {
+      "path": "docs/consolidated-progress.md",
+      "sha256": "da12c6abe28ca1624f549686c02acd88b405be6e2497087eb4912fe793e80d86"
+    }
+  ]
+}
