@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "task_id": "PULL-DOCS-002",
+  "revision": 1,
+  "goal": "依据已固定上下文和可核验的新回执，更新三个项目文档的当前状态，并链接下一迭代提案。",
+  "instructions": "本任务上下文固定于本 Plan PR 合并时，按其中 README.md、docs/pull-mode-plan.md、docs/consolidated-progress.md 与 docs/pull-model-prefilter-plan.md 的 SHA-256 读取。以下是用户报告快照，写入时要区分来源和证据强度，不把用户报告改写成独立验证：Plan PR #43（pull 核心/Skill/installer）和 #44（文档）已合入 main。#45 PULL-PILOT-001-r1 已由 arco-mac-zcode 于 2026-10-15 北京时间约 21:41 完成真实 claim/start/running/completed；可核验回执为 https://github.com/BH2-4/agent-delivery-loop/blob/73b4ae9040da53d7a5645279d9c90a87cceb63ac/receipt.json。该简报不证明长期稳定或代码交付已验证。其后用户报告 ZCode 原生 automation-78f06fd2 已删除，旧排队提示已手动清空，共享接入件、凭据和 grants 保留。用户报告 Claude Code CLI 2.1.300 复用了同一 CLI/updater；Skill 软链接为 ~/.claude/skills/agent-pull→~/.agents/skills/agent-pull，仓库副本在 /Users/arco/agent-delivery-loop；独立 claimant 为 arco-mac-claude-code，harness=claude-code。人工首扫只读核实 #45 completed 后跳过，没有新 acquire/report。用户贴出的 CronList/CronCreate 结果显示任务 dc636fba、cron 为 7,37 * * * *，当时 next run 为 23:20。这证明会话内原生调度创建成功，不证明 23:20 自动唤醒或 Claude 新任务闭环成功。用户还报告退出进程后不再触发、循环七天到期；仅按会话型使用，不推断不落盘或不能 resume。实际记录显示 updater 从 0992511 更新到 dbb9290；current 只证明本次检查无更新。用户观察代理下 discover 通常需 5–10 分钟，匿名 60 次/小时曾被限流；当前 CLI 命令走既有 PAT 路径。不要在任务产物或共享回执中披露任何 PAT 路径或值。执行中可依授权读取本任务关联的共享 status/receipt、仓库 Git 历史及已有 CI 结果，更新当时状态；没有新可核验证据时，不得写成 Claude 自动唤醒或文档交付已成功。按固定上下文更新 README.md、docs/pull-mode-plan.md、docs/consolidated-progress.md 的当前状态区，保留历史证据，并链接 docs/pull-model-prefilter-plan.md；不得替换或抹去既有历史。遵循已安装 agent-pull Skill、本机既有工具权限和连接设置。仅从现有本机连接元数据读取并透传 repo、authority branch、PAT 文件路径、expected login、claimant；不要读取、打印或共享 token 值，不另造或切换凭据。agent-pull 完成本任务必需的任务专属私有 grant、report 意图记录和运行元数据，可按 Skill 写入规定位置；不得修改其他本机设置或凭据。只有本任务本轮 acquire 返回 can_execute=true 才开始，开始先 report running；完成交付后 report completed，不能交付时 report blocked 或 failed，并回读 status。若状态或写入结果 pending、unknown 或无法确认，只读核实后停止，不重领、不重报、不接管、不自动继续。无发布权限时报告 blocked。共享执行记录写入只限本任务自己的 claim/start/receipt；除共享执行记录外，远端操作仅允许将获准的三份文档推送到本任务专用 Delivery 分支并创建对应 Delivery PR，不修改其他远端资源。使用普通交付分支提交并推送，创建 Delivery PR，把 PR 链接和简短结果写入本任务共享回执；completed 只表示候选文档和 Delivery PR 已交付，不代表合并。",
+  "scope": {
+    "constraints": [
+      "仓库文件仅修改 README.md、docs/pull-mode-plan.md、docs/consolidated-progress.md；新提案 docs/pull-model-prefilter-plan.md 仅作为固定上下文和链接目标。另允许 agent-pull 为执行本任务必需而将任务专属私有 grant、report 意图记录和运行元数据写入 Skill 规定位置；不得修改其他本机设置、凭据或其他本地文件。",
+      "任务开始前按 Skill 执行发现、show/status 与能力匹配；只有本轮 acquire 返回 can_execute=true 才执行，先报告 running。",
+      "仅使用本机既有 repo、authority branch、PAT 文件路径、expected login 和 claimant 配置透传身份；禁止读取或输出 token 值，不新建或切换凭据。",
+      "遵守当前宿主实际可用工具和 Skill；只能在授权分支提交、推送并创建 Delivery PR。发布能力不可用时报告 blocked。不得直接改 main、合并、部署、修改调度器、协议源码、安装件或凭据。",
+      "保留三份文档已有历史证据，只更新当前状态区；把用户报告、可核验回执和本轮观察明确区分，不把 Cron 创建写成自动唤醒成功。",
+      "不创建新验证任务、不启动任何其他 Agent、不读私有 transcript、不做外网搜索；可依授权读取关联共享状态/回执、Git 历史和现有 CI 结果。",
+      "共享执行记录仅限本任务自己的 claim/start/receipt；另允许将获准的三份文档推送到本任务专用交付分支并创建对应 Delivery PR，不修改其他远端资源。pending、unknown、写入结果不明或副作用不明时只读核实后停止，绝不重领、重报或接管。结束时回读 status。"
+    ]
+  },
+  "acceptance_criteria": [
+    "三个获准文档均更新了当前状态，准确记录已合并 PR、#45 完成回执和 Claude/Cron 最新报告，并保留既有历史证据。",
+    "文档链接到 docs/pull-model-prefilter-plan.md，所有新增或调整的相对链接均指向存在的目标。",
+    "未将会话内 Cron 创建描述成已观察到的自动唤醒或 Claude 新任务执行成功；未将 #45 简报描述为长期稳定或代码交付验证。",
+    "文档差异与链接/格式完成必要核对；不新增测试，不重复运行已通过检查。",
+    "变更在普通交付分支提交、推送并创建 Delivery PR；共享 receipt 含 PR 链接和简短结果，最终 status 已回读。completed 仅表示候选交付完成。"
+  ],
+  "required_capabilities": [
+    "repository-read",
+    "repository-write",
+    "shared-receipt-write"
+  ],
+  "context": [
+    {
+      "path": "README.md",
+      "sha256": "88c1b37f49c8bcd8c3fb9702151a2ac765ca22d3fe7f0ed97933fe44dfb3a2c7"
+    },
+    {
+      "path": "docs/pull-mode-plan.md",
+      "sha256": "0aa10f868b7cd2068e1d8cf88c18b77db473108041df5b7b82f188dbeab99de6"
+    },
+    {
+      "path": "docs/consolidated-progress.md",
+      "sha256": "da12c6abe28ca1624f549686c02acd88b405be6e2497087eb4912fe793e80d86"
+    },
+    {
+      "path": "docs/pull-model-prefilter-plan.md",
+      "sha256": "5e681692866d6f492bbbac77631fd82c04b61fc59523aa8ceeebc0ef64968630"
+    }
+  ]
+}
