@@ -18,10 +18,25 @@ Skill 和 installer 合入 `main`。合并前的 Python compileall、Skill quick
 安装激活中断恢复模拟、空格路径 launcher smoke、active receipt/SHA 对齐检查通过，独立代码
 审查无 P1/P2。隔离 wheel 曾在最终门禁修复前构建成功，修复后未重复完整 wheel 构建。
 
-接续下一步是从 `main` 完成真实来源安装/更新，再通过用户已有 scheduler/harness 执行一次
-真实本机定时轮次并核对共享回执。真实 wheel 安装、固定来源安装与更新、GitHub 任务领取和
-回执写入、用户已有 scheduler/harness 的真实轮次尚未运行。当前未验证项不得从编译、临时目录
-模拟或旧路线真实运行推断完成；真实轮次只要求一台电脑和一张新授权任务，不强制多端试用。
+真实观察（2026-10-15/16）：本机 ZCode 从 `main` 构建 wheel，经 bootstrap venv 与
+`agent-pull-install` 真实安装，来源 SHA 一致；updater 真实完成版本前移（0992511→dbb9290→
+e8615c41）。[PR #45](https://github.com/BH2-4/agent-delivery-loop/pull/45) 授权的
+`PULL-PILOT-001-r1` 由 `arco-mac-zcode` 完成真实 claim/start/running/completed 并写入
+共享回执——证明任务领取与回执写入真实可用，不证明长期稳定、代码任务或无人值守。其后用户
+删除 ZCode 原生 automation（排队提示已清空，接入件/凭据/grants 保留），Claude Code CLI
+复用同一接入件，以独立 claimant `arco-mac-claude-code` 完成人工只读首扫（无新领取），
+并在会话内创建原生 Cron 轮询（先 30 分钟后按用户指令调整为 12 分钟；创建与参数回读成功，
+进程退出即停、七天到期；仅证明创建，尚未证明 Cron 自动唤醒）。本任务
+`PULL-DOCS-002-r1` 首次 acquire 返回 unknown、status 复查为 absent；按执行端报告，用户额外
+授权同一修订一次人工重试后，Claude 完成真实 claim/start/running/completed。completed 共享
+[回执](https://github.com/BH2-4/agent-delivery-loop/blob/423dbd56f97ff4f25d2af2aea29cf7ce39a841b3/receipt.json)
+对应待审查的 [Delivery PR #47](https://github.com/BH2-4/agent-delivery-loop/pull/47)。status absent
+仅表示查询未见共享执行记录，不证明首次 unknown 没有远端副作用；此例证明一次经人工恢复的 Claude
+文档交付，不证明 Cron 自动唤醒到任务完成的无人干预闭环。
+
+仍待验证：原生 scheduler 自动唤醒并驱动 Claude 完成任务的完整链路、长期稳定性与代码类任务；
+未验证项不得从编译、临时目录模拟或 Cron 创建推断完成。下一迭代
+提案：[模型调用前的本机任务预筛选](pull-model-prefilter-plan.md)。
 
 ## 上一阶段结果（历史证据保留）
 

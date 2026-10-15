@@ -19,7 +19,20 @@ Agent。安装的接入件核验任务授权和固定上下文，能力匹配后
 
 后文 Work Order、`agent-run`、Claude Worker 和旧路线图记录的是已实现的 v0 路径与历史
 证据，不是当前产品主线。Pull 核心、Skill 与安装/更新代码已实现；编译、静态验证及代码
-审查通过。实际安装/更新来源、GitHub 任务领取与回执写入、真实定时轮次尚未验证。
+审查通过。其后的真实观察（2026-10-15/16）：本机 ZCode 从 `main` 构建 wheel，经
+bootstrap venv 与 `agent-pull-install` 真实安装且来源 SHA 核对一致；`PULL-PILOT-001-r1`
+已由 `arco-mac-zcode` 完成一次真实 claim/start/running/completed（[固定回执](https://github.com/BH2-4/agent-delivery-loop/blob/73b4ae9040da53d7a5645279d9c90a87cceb63ac/receipt.json)），
+不证明长期稳定或代码交付已验证。其后用户移除 ZCode 原生 automation，由 Claude Code CLI
+复用同一接入件与凭据通道，以独立 claimant `arco-mac-claude-code` 完成人工只读首扫
+（核实 #45 已完成后跳过，无新领取）；会话内原生 Cron 轮询已创建并按用户指令调整为每
+12 分钟（证据仅限创建与参数回读；进程退出即停、七天到期，尚未证明 Cron 自动唤醒）。
+随后 `PULL-DOCS-002-r1` 首次 acquire 返回 unknown、status 复查为 absent；按执行端报告，
+用户额外授权同一修订一次人工重试后，Claude 完成真实 claim/start/running/completed，候选
+文档交付于待审查的 [Delivery PR #47](https://github.com/BH2-4/agent-delivery-loop/pull/47)，
+[固定 completed 回执](https://github.com/BH2-4/agent-delivery-loop/blob/423dbd56f97ff4f25d2af2aea29cf7ce39a841b3/receipt.json)。
+status absent 仅表示查询未见共享执行记录，不证明首次 unknown 没有远端副作用。此例证明一次经
+人工恢复的 Claude 文档交付，不证明 Cron 自动唤醒到任务完成的无人干预闭环、长期稳定或代码类任务。
+下一迭代提案见[模型调用前的本机任务预筛选](docs/pull-model-prefilter-plan.md)。
 
 > [!IMPORTANT]
 > 引导阶段两张真实文档 Work Order 已执行并由人接纳进 `main`：第一张执行命令失败，候选成果后来通过 PR #5 人工接纳；第二张 `agent-run` 正常以退出码 0 完成，再经人工修正文案、独立审查、CI 和 PR #7 人工合并。单机、单 Worker、人工监督的正常交付路径已观察到一次成功，**不代表零人工返修、长期稳定或生产可用**。其后 PAT 试运行工单 `WO-PAT-TRIAL-001-r2` 的编排 R10 终态为 `review_blocked`，候选经人工修正后经 PR #30 人工接纳；PR #31 合并审查交接容量修复并重建普通 wheel 安装（静态核验通过）。安装版真实端到端交付与无人值守能力未验证；GitHub App、`main` 保护和无人值守发布仍未验证。当前交付流程说明见 [PAT 交付 Runbook](docs/pat-delivery-runbook.md)。
@@ -607,7 +620,7 @@ GitHub App 的 `Contents:write` 权限也满足合并 PR 接口的权限要求�
 
 ## English summary
 
-The current direction is a human-authorized pull loop: each user's existing local schedule wakes the current agent, which validates a fixed task revision, acquires shared permission, performs the work with its local tools, and reports a shared receipt. The adapter does not launch another agent or add a central scheduler. The first planned source is a merged GitHub Plan PR; the public task semantics remain source- and deliverable-neutral. Core, Skill, and installer code are implemented and static checks have passed. Actual source installation/update, GitHub task acquisition and receipt writes, and a real scheduled round remain unverified. See [the pull-mode plan](docs/pull-mode-plan.md).
+The current direction is a human-authorized pull loop: each user's existing local schedule wakes the current agent, which validates a fixed task revision, acquires shared permission, performs the work with its local tools, and reports a shared receipt. The adapter does not launch another agent or add a central scheduler. The first planned source is a merged GitHub Plan PR; the public task semantics remain source- and deliverable-neutral. Core, Skill, and installer code are implemented and static checks have passed. Since then, a real source install/update and task acquisition with receipt write have been observed (PULL-PILOT-001-r1 by arco-mac-zcode). Claude Code also completed PULL-DOCS-002-r1 after the first acquire returned unknown and the user explicitly authorized one manual retry ([completed receipt](https://github.com/BH2-4/agent-delivery-loop/blob/423dbd56f97ff4f25d2af2aea29cf7ce39a841b3/receipt.json); [Delivery PR #47](https://github.com/BH2-4/agent-delivery-loop/pull/47), awaiting review). This verifies one manually recovered Claude document delivery, not a Cron-triggered unattended wake-to-completion loop, long-term stability, or code-task performance. The session-native Cron was created, but automatic wake-up remains unverified. See [the pull-mode plan](docs/pull-mode-plan.md) and the [prefilter proposal](docs/pull-model-prefilter-plan.md).
 
 The existing Python runner is the legacy v0 path: it uses Plan PR and Work Order v1 authorization with a fixed Claude Code worker. Its implementation and run records below remain historical evidence and retain their original authorization semantics.
 
