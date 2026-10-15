@@ -5,7 +5,12 @@ ZCode 从 `main` 构建 wheel 并经 bootstrap venv 与 `agent-pull-install` 真
 SHA 一致）；`PULL-PILOT-001-r1` 由 `arco-mac-zcode` 完成真实 claim/start/running/
 completed 并写入共享回执；用户随后移除 ZCode 原生 automation，Claude Code CLI 以独立
 claimant `arco-mac-claude-code` 复用同一接入件完成人工只读首扫（无新领取）。会话内
-原生 Cron 已创建（仅证明创建，不证明自动唤醒或新任务闭环）。下一迭代提案：
+原生 Cron 已创建（仅证明创建，自动唤醒尚未验证）。随后 `PULL-DOCS-002-r1` 首次 acquire
+返回 unknown、status 复查为 absent；按执行端报告，用户额外授权同一修订一次人工重试后，Claude
+完成真实 claim/start/running/completed；[completed 回执](https://github.com/BH2-4/agent-delivery-loop/blob/423dbd56f97ff4f25d2af2aea29cf7ce39a841b3/receipt.json)
+对应待审查的 [Delivery PR #47](https://github.com/BH2-4/agent-delivery-loop/pull/47)。status absent
+仅表示查询未见共享执行记录，不证明首次 unknown 没有远端副作用。此例证明一次经人工恢复的 Claude
+文档交付，不证明 Cron 自动唤醒到任务完成的无人干预闭环、长期稳定或代码类任务。下一迭代提案：
 [模型调用前的本机任务预筛选](pull-model-prefilter-plan.md)。
 
 ## 目标与约束
@@ -154,7 +159,8 @@ receipt 与 grant 文件包含执行关联信息，grant 文件应放在 managed
 
 静态检查和临时目录恢复模拟不等于首次真实轮次。#45 已由 `arco-mac-zcode` 完成真实
 授权读取、共享 acquire/report 与回执回读，但该轮是否由原生 scheduler 唤醒缺乏宿主
-元数据证据；在被证实的 scheduler 唤醒完成同一链路之前，不记录定时轮次通过。
+元数据证据；`PULL-DOCS-002-r1` 则是用户授权一次人工重试后由 Claude 完成的真实文档任务，
+没有证据表明它由 Cron 唤醒。在被证实的 scheduler 唤醒并完成同一链路之前，不记录定时轮次通过。
 
 ## 首个切片边界与暂不做
 
@@ -171,8 +177,10 @@ watcher，不改远程默认分支，不自动合并或部署。
 
 当前状态：真实来源安装/更新与一次真实任务领取/回执写入已观察（#45，`arco-mac-zcode`，
 回执见共享记录，不证明长期稳定）。Claude Code 已以独立 claimant `arco-mac-claude-code`
-接入并完成人工只读首扫；本任务 `PULL-DOCS-002-r1`（PR #46）由其领取，交付见对应
-Delivery PR 与共享回执。会话内原生 Cron 创建成功仅为创建证据。仍未验证：原生 scheduler
-真实唤醒的宿主元数据、Claude 新任务执行闭环、长期稳定性与代码类任务。下一步按
+接入并完成人工只读首扫；随后 `PULL-DOCS-002-r1` 首次 acquire unknown、status 复查 absent，
+按执行端报告由用户额外授权一次人工重试后完成 claim/start/running/completed（[completed 回执](https://github.com/BH2-4/agent-delivery-loop/blob/423dbd56f97ff4f25d2af2aea29cf7ce39a841b3/receipt.json)），
+候选交付于待审查的 [Delivery PR #47](https://github.com/BH2-4/agent-delivery-loop/pull/47)。status absent
+不证明首次 unknown 没有远端副作用。会话内原生 Cron 创建成功仅为创建证据。仍未验证：Cron
+自动唤醒并驱动 Claude 完成任务的完整链路、长期稳定性与代码类任务。下一步按
 [预筛选提案](pull-model-prefilter-plan.md)研究模型调用前的本机筛选；在此之前不把
 Cron 创建或模拟结果说成真实定时轮次。

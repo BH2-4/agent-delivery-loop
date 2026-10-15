@@ -26,12 +26,16 @@ e8615c41）。[PR #45](https://github.com/BH2-4/agent-delivery-loop/pull/45) 授
 删除 ZCode 原生 automation（排队提示已清空，接入件/凭据/grants 保留），Claude Code CLI
 复用同一接入件，以独立 claimant `arco-mac-claude-code` 完成人工只读首扫（无新领取），
 并在会话内创建原生 Cron 轮询（先 30 分钟后按用户指令调整为 12 分钟；创建与参数回读成功，
-进程退出即停、七天到期；不据此声称自动唤醒或新任务闭环已验证）。本任务
-`PULL-DOCS-002-r1`（[PR #46](https://github.com/BH2-4/agent-delivery-loop/pull/46)）由
-`arco-mac-claude-code` 领取，交付见其 Delivery PR 与共享回执。
+进程退出即停、七天到期；仅证明创建，尚未证明 Cron 自动唤醒）。本任务
+`PULL-DOCS-002-r1` 首次 acquire 返回 unknown、status 复查为 absent；按执行端报告，用户额外
+授权同一修订一次人工重试后，Claude 完成真实 claim/start/running/completed。completed 共享
+[回执](https://github.com/BH2-4/agent-delivery-loop/blob/423dbd56f97ff4f25d2af2aea29cf7ce39a841b3/receipt.json)
+对应待审查的 [Delivery PR #47](https://github.com/BH2-4/agent-delivery-loop/pull/47)。status absent
+仅表示查询未见共享执行记录，不证明首次 unknown 没有远端副作用；此例证明一次经人工恢复的 Claude
+文档交付，不证明 Cron 自动唤醒到任务完成的无人干预闭环。
 
-仍待验证：原生 scheduler 真实唤醒的宿主元数据证据、Claude 新任务执行闭环的完整链路、
-长期稳定性与代码类任务；未验证项不得从编译、临时目录模拟或 Cron 创建推断完成。下一迭代
+仍待验证：原生 scheduler 自动唤醒并驱动 Claude 完成任务的完整链路、长期稳定性与代码类任务；
+未验证项不得从编译、临时目录模拟或 Cron 创建推断完成。下一迭代
 提案：[模型调用前的本机任务预筛选](pull-model-prefilter-plan.md)。
 
 ## 上一阶段结果（历史证据保留）
