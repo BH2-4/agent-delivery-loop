@@ -1,8 +1,12 @@
 # Autonomous Pull 主线计划
 
-**工程状态（2026-10-15）：**PR #43 已将 pull 核心、Skill 与本地安装/更新入口合入
-`main`；定向静态检查和代码审查通过。普通 wheel 未在最新门禁修复后重建；真实来源安装/更新、
-GitHub 任务领取与回执写入、用户已有 harness 的定时轮次尚未验证。
+**工程状态（2026-10-16）：**PR #43/#44/#46 已先后合入 `main`。其后的真实观察：本机
+ZCode 从 `main` 构建 wheel 并经 bootstrap venv 与 `agent-pull-install` 真实安装（来源
+SHA 一致）；`PULL-PILOT-001-r1` 由 `arco-mac-zcode` 完成真实 claim/start/running/
+completed 并写入共享回执；用户随后移除 ZCode 原生 automation，Claude Code CLI 以独立
+claimant `arco-mac-claude-code` 复用同一接入件完成人工只读首扫（无新领取）。会话内
+原生 Cron 已创建（仅证明创建，不证明自动唤醒或新任务闭环）。下一迭代提案：
+[模型调用前的本机任务预筛选](pull-model-prefilter-plan.md)。
 
 ## 目标与约束
 
@@ -148,9 +152,9 @@ receipt 与 grant 文件包含执行关联信息，grant 文件应放在 managed
 目录。模式主要信任当前 OS 用户、已配置 GitHub PAT 与其权限；同一 UID 下可读写文件的进程，
 以及持有同一 PAT 的主体，都在信任边界内，不承诺隔离恶意同 UID 进程或恶意同凭据用户。
 
-静态检查和临时目录恢复模拟不等于首次真实轮次。只有在用户已有的原生 scheduler 确实唤醒
-当前 Agent、对真实 GitHub 完成授权读取与共享 acquire/report、并回读 receipt 后，才能记录
-一次定时轮次通过；当前尚未运行。
+静态检查和临时目录恢复模拟不等于首次真实轮次。#45 已由 `arco-mac-zcode` 完成真实
+授权读取、共享 acquire/report 与回执回读，但该轮是否由原生 scheduler 唤醒缺乏宿主
+元数据证据；在被证实的 scheduler 唤醒完成同一链路之前，不记录定时轮次通过。
 
 ## 首个切片边界与暂不做
 
@@ -165,7 +169,10 @@ watcher，不改远程默认分支，不自动合并或部署。
 
 ## 状态与接班
 
-当前状态：PR #43 已将 core 与 installer 合入 `main`；代码审查和定向静态检查已完成，最新
-源码编译通过，installer 的隔离 wheel 未在最后修复后重建。真实来源安装/更新、GitHub 任务
-领取与回执写入、用户已有 harness 定时轮次尚未验证。下一步从 `main` 完成真实来源安装/更新，
-再由本机定时 harness 执行一次真实轮次并核对共享回执；在此之前不把模拟或编译结果说成真实轮次。
+当前状态：真实来源安装/更新与一次真实任务领取/回执写入已观察（#45，`arco-mac-zcode`，
+回执见共享记录，不证明长期稳定）。Claude Code 已以独立 claimant `arco-mac-claude-code`
+接入并完成人工只读首扫；本任务 `PULL-DOCS-002-r1`（PR #46）由其领取，交付见对应
+Delivery PR 与共享回执。会话内原生 Cron 创建成功仅为创建证据。仍未验证：原生 scheduler
+真实唤醒的宿主元数据、Claude 新任务执行闭环、长期稳定性与代码类任务。下一步按
+[预筛选提案](pull-model-prefilter-plan.md)研究模型调用前的本机筛选；在此之前不把
+Cron 创建或模拟结果说成真实定时轮次。
