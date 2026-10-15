@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "task_id": "DOCS-014",
+  "revision": 1,
+  "goal": "Document the local current-session pull workflow.",
+  "instructions": "Write a concise guide explaining how an already-active harness discovers, verifies, acquires, executes, and reports a generic pull task. Include the one-time start permission rule and explain that the active Agent itself performs the work.",
+  "scope": {
+    "constraints": [
+      "Edit only the documentation page named in target.",
+      "Do not start another Agent or model process.",
+      "Do not publish, merge, or change repository settings."
+    ]
+  },
+  "acceptance_criteria": [
+    "The guide gives exact discover, show, acquire, report, and status command examples.",
+    "The guide explains that only a newly confirmed start grant allows the current Agent to begin work.",
+    "The guide explains how to handle a pending confirmation without automatic retry."
+  ],
+  "required_capabilities": [
+    "repository-read",
+    "repository-write"
+  ],
+  "context": [],
+  "target": "docs/local-pull-workflow.md"
+}

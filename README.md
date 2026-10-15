@@ -1,8 +1,25 @@
 # Agent Delivery Loop
 
-> 一个 GitHub-native、由人类明确授权的 CLI Coding Agent 持续交付闭环。
+> 一个由用户已有的本机定时任务唤醒、由当前 Agent 自行领取已授权任务并共享回执的持续交付闭环。
 
-**English summary:** A GitHub-native, human-authorized delivery loop for CLI coding agents.
+**English summary:** A human-authorized task pull and delivery loop for locally scheduled agents.
+
+## 当前主线：本机唤醒，当前 Agent 自行接单
+
+用户已有的定时任务负责唤醒各电脑上的当前 Claude Code、Codex、ZCode 或其他 CLI/桌面
+Agent。安装的接入件核验任务授权和固定上下文，能力匹配后确定性领取；当前 Agent 使用
+本端工具与凭据执行，并回写共享结果。接入件不启动第二个 Agent，也不增加新的中央调度器、
+守护进程或跨电脑唤醒机制。
+
+方向、首期命令和阶段验收见[自主拉取计划](docs/pull-mode-plan.md)。新通用任务使用
+独立 `pull-task-v1` 和 `.agents/pull-tasks/`；首期由已合并 Plan PR 提供可核验授权。旧
+`.agents/work-orders/`、Work Order v1 和 Claude Worker 保持原授权与执行语义，不能因新
+入口而静默扩展为所有 Agent 均可执行。计划中的自动更新须更新本地 Skill/CLI 接入件；
+远程协议服务更新不算本地接入件升级。
+
+后文 Work Order、`agent-run`、Claude Worker 和旧路线图记录的是已实现的 v0 路径与历史
+证据，不是当前产品主线。Pull 核心、Skill 与安装/更新代码已实现；编译、静态验证及代码
+审查通过。实际安装更新来源、GitHub 写操作和真实定时轮次尚未验证。
 
 > [!IMPORTANT]
 > 引导阶段两张真实文档 Work Order 已执行并由人接纳进 `main`：第一张执行命令失败，候选成果后来通过 PR #5 人工接纳；第二张 `agent-run` 正常以退出码 0 完成，再经人工修正文案、独立审查、CI 和 PR #7 人工合并。单机、单 Worker、人工监督的正常交付路径已观察到一次成功，**不代表零人工返修、长期稳定或生产可用**。其后 PAT 试运行工单 `WO-PAT-TRIAL-001-r2` 的编排 R10 终态为 `review_blocked`，候选经人工修正后经 PR #30 人工接纳；PR #31 合并审查交接容量修复并重建普通 wheel 安装（静态核验通过）。安装版真实端到端交付与无人值守能力未验证；GitHub App、`main` 保护和无人值守发布仍未验证。当前交付流程说明见 [PAT 交付 Runbook](docs/pat-delivery-runbook.md)。
@@ -11,7 +28,7 @@
 
 在目标仓库的新会话中即可接班本项目：支持 Skill 发现时直接说「接班这个项目」；Codex 可显式调用 `$adl`，Claude Code 可显式调用 `/adl`；其他环境的通用后备句为「读取本仓库 docs/bootstrap.md，按一句话接班流程只读接班。」这些是对话入口，不是终端程序，不能恢复旧会话记忆，也不保证所有 Agent 都自动发现 Skill。完整只读流程见 [docs/bootstrap.md 的一句话接班一节](docs/bootstrap.md#一句话接班)，实际使用问题留待使用反馈。
 
-## 当前实现状态
+## 旧交付路径：当前已实现状态
 
 共享防重复启动已迁入源码：普通程序先取得 GitHub 原子启动资格，才进入
 Claude CLI；完成记录保留，启动未知时进入待确认，禁止自动重启。
@@ -59,7 +76,7 @@ Claude CLI；完成记录保留，启动未知时进入待确认，禁止自动�
 
 **后续阶段**：基于这两次文档试运行另行讨论可重复性和代码任务验证、GitHub App/仓库规则验证、Issue 进度讨论、Hermes 手机通知、Steward 自动审查，以及跨主机或自动恢复；当前不自动进入这些阶段。
 
-## 为什么要做这个项目
+## 初始 v0 背景（历史路线）
 
 Coding Agent 已经可以完成大量开发工作，但“能够写代码”并不等于“可以长期、无人值守地交付代码”。真正困难的问题包括：
 
@@ -518,7 +535,7 @@ GitHub App 的 `Contents:write` 权限也满足合并 PR 接口的权限要求�
 - 公开日志的脱敏和保留期限；
 - 开源许可证。
 
-## 当前状态
+## 旧 v0 实现状态
 
 ```text
 阶段：两张引导文档工单已人工接纳；PAT 编排 R10 终态 review_blocked，其候选经 PR #30 人工接纳；PR #31 容量修复已合并并重建安装 wheel
@@ -530,7 +547,7 @@ GitHub App 的 `Contents:write` 权限也满足合并 PR 接口的权限要求�
 
 第一次执行的失败记录保留；第二次执行正常结束。两张引导文档成果均经人工修正、独立审查、CI 和人工合并进入 `main`；其后的 Runbook 候选（PR #30）与容量修复（PR #31）同样经独立审查后由人工授权合并。以上均未部署，也不代表无人值守能力已验证。GitHub App 发布、`main` 保护和无人值守流程仍需另行配置与验证。
 
-## 路线图
+## 旧 v0 路线图记录
 
 ### 阶段 0：协议设计
 
@@ -590,10 +607,12 @@ GitHub App 的 `Contents:write` 权限也满足合并 PR 接口的权限要求�
 
 ## English summary
 
-Agent Delivery Loop is a GitHub-native, human-authorized delivery loop for CLI coding agents. Its local Python runner and manual discovery command are implemented.
+The current direction is a human-authorized pull loop: each user's existing local schedule wakes the current agent, which validates a fixed task revision, acquires shared permission, performs the work with its local tools, and reports a shared receipt. The adapter does not launch another agent or add a central scheduler. The first planned source is a merged GitHub Plan PR; the public task semantics remain source- and deliverable-neutral. Core, Skill, and installer code are implemented and static checks have passed. Actual source installation/update, GitHub writes, and a real scheduled round remain unverified. See [the pull-mode plan](docs/pull-mode-plan.md).
 
-The initial version focuses on one problem: turning an already-approved requirement into a reviewable pull request through a fixed local Claude Code worker.
+The existing Python runner is the legacy v0 path: it uses Plan PR and Work Order v1 authorization with a fixed Claude Code worker. Its implementation and run records below remain historical evidence and retain their original authorization semantics.
 
-GitHub is the source of truth. Merging a Plan PR authorizes execution; merging a separate Delivery PR accepts the implementation. Agents cannot approve their own work, merge changes, or deploy automatically.
+Legacy v0 focused on turning an approved requirement into a reviewable pull request through a fixed local Claude Code worker.
+
+In legacy v0, GitHub is the source of truth: merging a Plan PR authorizes the fixed Worker, and a separate Delivery PR accepts its implementation. That authorization remains unchanged for Work Order v1.
 
 Two real documentation Work Orders have run and their deliverables were manually accepted into main. The first invocation exited with code 2 after a tuple/list run-record read-back mismatch; its candidate was later manually revised and accepted through Delivery PR #5, without rerunning the task or rewriting its record. After PR #4 fixed the mismatch, the second invocation exited with code 0 and recorded local_ready / stopped. Its document was manually revised, independently reviewed, checked by CI, and accepted through Delivery PR #7. The original run records still reference the Worker commits, not the revised PR heads. This demonstrates one successful, human-supervised normal documentation delivery path, not zero-touch operation, repeatability, or production readiness. After that, the PAT trial orchestration R10 (WO-PAT-TRIAL-001-r2) ended review_blocked: its first independent review returned blocked and the orchestration stopped by mechanism. The candidate was manually revised into commit bd61689 (docs/pat-delivery-runbook.md only), received an independent pass review receipt bound to that head, and was merged under human authorization through PR #30; PR #31 then merged a review-handoff capacity fix (touched-content cap raised from 64 KiB to 192 KiB, Skill cap unchanged at 64 KiB), after which a normal wheel was rebuilt from the merge commit and installed with static verification passing. These were human acceptances and fixes, not an original-run success and not a verification of unattended capability. GitHub App publishing, main branch protection, real abnormal shutdown, and unattended delivery remain unverified.
